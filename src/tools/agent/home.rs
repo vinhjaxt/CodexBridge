@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::platform::user_home_dir;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentEcosystem {
     Agents,
@@ -15,7 +17,7 @@ pub struct AgentHome {
 
 impl AgentHome {
     pub fn discover() -> Option<Self> {
-        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let home = user_home_dir()?;
         [
             (".agents", AgentEcosystem::Agents),
             (".codex", AgentEcosystem::Codex),

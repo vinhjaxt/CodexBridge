@@ -109,8 +109,10 @@ pub struct WriteStdinArgs {
     pub rows: Option<u16>,
     #[serde(default)]
     pub cols: Option<u16>,
-    /// Deliver a bounded process-control signal. `interrupt` maps to Ctrl-C/SIGINT,
-    /// `terminate` requests graceful termination, and `kill` forcefully ends the tree.
+    /// Deliver a bounded process-control signal. `interrupt` sends Ctrl-C to a PTY,
+    /// SIGINT on Unix, or Ctrl-Break to a dedicated non-TTY Windows process group.
+    /// `terminate` requests SIGTERM on Unix or non-forced taskkill tree termination on
+    /// Windows; `kill` forcefully ends the process tree.
     #[serde(default)]
     pub signal: Option<ProcessSignal>,
     /// Explicitly wait this long for terminal process completion after any
@@ -165,6 +167,22 @@ pub enum ProcessSignal {
     Interrupt,
     Terminate,
     Kill,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSignalAction {
+    ConsoleBreak,
+    Taskkill { force: bool },
+}
+
+#[cfg(any(windows, test))]
+fn windows_signal_action(signal: ProcessSignal) -> WindowsSignalAction {
+    match signal {
+        ProcessSignal::Interrupt => WindowsSignalAction::ConsoleBreak,
+        ProcessSignal::Terminate => WindowsSignalAction::Taskkill { force: false },
+        ProcessSignal::Kill => WindowsSignalAction::Taskkill { force: true },
+    }
 }
 
 impl ProcessSignal {
@@ -537,6 +555,8 @@ impl ProcessRegistry {
                 )
                 .await;
         }
+        #[cfg(windows)]
+        crate::platform::configure_windows_process_group(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
@@ -946,11 +966,7 @@ fn kill_tree(pid: Option<u32>) {
     }
     #[cfg(windows)]
     if let Some(pid) = pid {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = crate::platform::windows_taskkill(pid, true);
     }
 }
 
@@ -974,19 +990,27 @@ fn signal_tree(pid: Option<u32>, signal: ProcessSignal) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        let mut command = std::process::Command::new("taskkill");
-        command.args(["/T", "/PID", &pid.to_string()]);
-        if matches!(signal, ProcessSignal::Kill) {
-            command.arg("/F");
+        match windows_signal_action(signal) {
+            WindowsSignalAction::ConsoleBreak => crate::platform::windows_send_interrupt(pid)
+                .map_err(|error| {
+                    AppError::new(
+                        "PROCESS_FAILED",
+                        format!(
+                            "unable to send Ctrl-Break to Windows process group {pid}: {error}; use terminate or kill when console signaling is unavailable"
+                        ),
+                    )
+                }),
+            WindowsSignalAction::Taskkill { force } => {
+                let status = crate::platform::windows_taskkill(pid, force)?;
+                if status.success() {
+                    return Ok(());
+                }
+                Err(AppError::new(
+                    "PROCESS_FAILED",
+                    format!("taskkill failed for process tree {pid} with status {status}"),
+                ))
+            }
         }
-        let status = command
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(AppError::new("PROCESS_FAILED", "taskkill failed"));
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1181,7 +1205,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill; combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
+        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY, SIGINT on Unix, or Ctrl-Break to a dedicated non-TTY Windows process group; terminate uses SIGTERM on Unix or non-forced taskkill tree termination on Windows; kill forcefully ends the tree. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
     )]
     async fn write_stdin(
         &self,
@@ -2024,6 +2048,63 @@ mod tests {
             json!("kill")
         );
         assert!(serde_json::from_value::<ProcessSignal>(json!("unknown")).is_err());
+    }
+
+    #[test]
+    fn process_signal_schema_documents_platform_specific_semantics() {
+        let rendered = serde_json::to_string(&schemars::schema_for!(WriteStdinArgs)).unwrap();
+        assert!(rendered.contains("Ctrl-Break"), "{rendered}");
+        assert!(rendered.contains("non-forced taskkill"), "{rendered}");
+    }
+
+    #[test]
+    fn windows_signal_contract_keeps_interrupt_distinct_from_termination() {
+        assert_eq!(
+            windows_signal_action(ProcessSignal::Interrupt),
+            WindowsSignalAction::ConsoleBreak
+        );
+        assert_eq!(
+            windows_signal_action(ProcessSignal::Terminate),
+            WindowsSignalAction::Taskkill { force: false }
+        );
+        assert_eq!(
+            windows_signal_action(ProcessSignal::Kill),
+            WindowsSignalAction::Taskkill { force: true }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_taskkill_does_not_depend_on_path() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::process::tests::windows_taskkill_does_not_depend_on_path_child",
+                "--nocapture",
+            ])
+            .env("PATH", "")
+            .env("CODEXBRIDGE_TASKKILL_PATH_PROBE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_taskkill_does_not_depend_on_path_child() {
+        if std::env::var_os("CODEXBRIDGE_TASKKILL_PATH_PROBE").is_none() {
+            return;
+        }
+        let error = signal_tree(Some(u32::MAX), ProcessSignal::Kill).unwrap_err();
+        assert!(
+            error.message().contains("taskkill failed for process tree"),
+            "taskkill executable resolution failed before launch: {error}"
+        );
     }
 
     #[test]

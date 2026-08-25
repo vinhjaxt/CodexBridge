@@ -30,7 +30,7 @@ pub const PLAN_ITEM_MAX_BYTES: usize = 4096;
 pub const PLAN_EXPLANATION_MAX_BYTES: usize = 16 * 1024;
 pub const PLAN_MAX_TOTAL_BYTES: usize = 256 * 1024;
 const PLAN_STORAGE_MAX_BYTES: usize = 512 * 1024;
-const STORAGE_SCHEMA_VERSION: i64 = 3;
+const STORAGE_SCHEMA_VERSION: i64 = 4;
 const STORAGE_READ_CONNECTIONS: usize = 4;
 const STORAGE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -299,7 +299,7 @@ impl Storage {
         match schema_version {
             0 => writer_connection.execute_batch(
                 "BEGIN IMMEDIATE;
-                 CREATE TABLE aliases(alias TEXT PRIMARY KEY, effective_key TEXT NOT NULL);
+                 CREATE TABLE aliases(alias TEXT PRIMARY KEY COLLATE NOCASE, effective_key TEXT NOT NULL);
                  CREATE TABLE bindings(native_key TEXT PRIMARY KEY, effective_key TEXT NOT NULL);
                  CREATE TABLE memories(project_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_key,key));
                  CREATE TABLE plans(project_key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -307,7 +307,7 @@ impl Storage {
                  CREATE TABLE turn_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, turn_ref TEXT NOT NULL UNIQUE, native_key TEXT NOT NULL, effective_key TEXT NOT NULL, subject_key TEXT NOT NULL, parent_turn_ref TEXT, instruction_hash TEXT NOT NULL, state_hash TEXT NOT NULL, brief_snapshot TEXT, state_snapshot TEXT, created_at TEXT NOT NULL);
                  CREATE INDEX turn_refs_native_id ON turn_refs(native_key,id DESC);
                  CREATE UNIQUE INDEX turn_refs_native_parent_unique ON turn_refs(native_key,parent_turn_ref) WHERE parent_turn_ref IS NOT NULL;
-                 PRAGMA user_version=3;
+                 PRAGMA user_version=4;
                  COMMIT;",
             )?,
             STORAGE_SCHEMA_VERSION => {}
@@ -320,7 +320,7 @@ impl Storage {
                 ));
             }
         }
-        validate_schema_v3(&writer_connection)?;
+        validate_schema_v4(&writer_connection)?;
 
         let mut readers = Vec::with_capacity(STORAGE_READ_CONNECTIONS);
         for _ in 0..STORAGE_READ_CONNECTIONS {
@@ -609,7 +609,8 @@ impl Storage {
                 ));
             }
 
-            if let Some(alias) = alias.as_deref() {
+            let mut alias_needs_insert = false;
+            let joining_existing_alias = if let Some(alias) = alias.as_deref() {
                 let current_alias: Option<String> = transaction
                     .query_row(
                         "SELECT effective_key FROM aliases WHERE alias=?1",
@@ -623,12 +624,43 @@ impl Storage {
                         "project alias changed concurrently; retry initialization",
                     ));
                 }
-                if current_alias.is_none() {
-                    transaction.execute(
-                        "INSERT INTO aliases(alias,effective_key) VALUES(?1,?2)",
-                        params![alias, &effective_key],
-                    )?;
+                alias_needs_insert = current_alias.is_none();
+                current_alias.is_some()
+            } else {
+                false
+            };
+
+            let inherited_existing_project = turn_ref
+                .as_ref()
+                .is_some_and(|(_, parent_turn_ref, _, _, _, _, _)| parent_turn_ref.is_some());
+            if current_binding.is_none()
+                && !joining_existing_alias
+                && !inherited_existing_project
+            {
+                let colliding_effective: Option<String> = transaction
+                    .query_row(
+                        "SELECT effective_key FROM (SELECT effective_key FROM bindings UNION ALL SELECT effective_key FROM aliases) WHERE effective_key=?1 COLLATE NOCASE LIMIT 1",
+                        [&effective_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = colliding_effective {
+                    return Err(AppError::new(
+                        "PROJECT_PATH_COLLISION",
+                        format!(
+                            "new project key `{effective_key}` collides with existing project key `{existing}` on case-insensitive filesystems"
+                        ),
+                    ));
                 }
+            }
+
+            if alias_needs_insert
+                && let Some(alias) = alias.as_deref()
+            {
+                transaction.execute(
+                    "INSERT INTO aliases(alias,effective_key) VALUES(?1,?2)",
+                    params![alias, &effective_key],
+                )?;
             }
 
             transaction.execute(
@@ -1369,7 +1401,7 @@ impl Storage {
     }
 }
 
-fn validate_schema_v3(connection: &Connection) -> Result<()> {
+fn validate_schema_v4(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(turn_refs)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1390,10 +1422,24 @@ fn validate_schema_v3(connection: &Connection) -> Result<()> {
             return Err(AppError::new(
                 "STORAGE_SCHEMA_UNSUPPORTED",
                 format!(
-                    "database reports schema version {STORAGE_SCHEMA_VERSION} but is missing required v3 column `{required}`; recreate the development database"
+                    "database reports schema version 4 but is missing required column `{required}`; recreate the development database"
                 ),
             ));
         }
+    }
+    let aliases_schema: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='aliases'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !aliases_schema
+        .to_ascii_uppercase()
+        .contains("COLLATE NOCASE")
+    {
+        return Err(AppError::new(
+            "STORAGE_SCHEMA_UNSUPPORTED",
+            "database reports schema version 4 but aliases are not case-insensitive",
+        ));
     }
     Ok(())
 }
@@ -1474,6 +1520,20 @@ mod tests {
         assert!(turn_ref_schema.contains("state_hash TEXT NOT NULL"));
         assert!(turn_ref_schema.contains("brief_snapshot TEXT"));
         assert!(turn_ref_schema.contains("state_snapshot TEXT"));
+        let aliases_schema = storage
+            .with_read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='aliases'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert!(
+            aliases_schema
+                .to_ascii_uppercase()
+                .contains("COLLATE NOCASE")
+        );
         let journal_mode = storage
             .with_read(|connection| {
                 Ok(connection
@@ -1487,7 +1547,7 @@ mod tests {
 
     #[test]
     fn old_schema_versions_are_rejected_instead_of_migrated() {
-        for version in [1_i64, 2_i64] {
+        for version in [1_i64, 2_i64, 3_i64] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("state.sqlite3");
             let connection = Connection::open(&path).unwrap();
@@ -1498,26 +1558,38 @@ mod tests {
 
             let error = Storage::open(&path).err().unwrap();
             assert_eq!(error.code(), "STORAGE_SCHEMA_UNSUPPORTED");
-            assert!(error.message().contains("fresh schema version 3"));
+            assert!(error.message().contains("fresh schema version 4"));
         }
     }
 
     #[test]
-    fn stale_schema_v3_layout_is_rejected_instead_of_migrated() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("state.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE turn_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, turn_ref TEXT NOT NULL UNIQUE, native_key TEXT NOT NULL, effective_key TEXT NOT NULL, subject_key TEXT NOT NULL, parent_turn_ref TEXT, context_hash TEXT NOT NULL, created_at TEXT NOT NULL);
-                 PRAGMA user_version=3;",
-            )
+    fn new_project_cannot_claim_an_existing_effective_key_as_an_alias() {
+        let (_directory, storage) = storage();
+        storage
+            .commit_initialization("native-private", "OpaquePrivateKey", None, None, None)
             .unwrap();
-        drop(connection);
 
-        let error = Storage::open(&path).err().unwrap();
-        assert_eq!(error.code(), "STORAGE_SCHEMA_UNSUPPORTED");
-        assert!(error.message().contains("instruction_hash"));
+        for alias in ["OpaquePrivateKey", "opaqueprivatekey"] {
+            let error = storage
+                .commit_initialization("native-named", alias, Some(alias), None, None)
+                .unwrap_err();
+            assert_eq!(error.code(), "PROJECT_PATH_COLLISION");
+            assert_eq!(storage.effective_binding("native-named").unwrap(), None);
+            assert_eq!(storage.effective_for_alias(alias).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn new_private_effective_keys_are_case_insensitively_unique() {
+        let (_directory, storage) = storage();
+        storage
+            .commit_initialization("native-one", "OpaquePrivateKey", None, None, None)
+            .unwrap();
+        let error = storage
+            .commit_initialization("native-two", "opaqueprivatekey", None, None, None)
+            .unwrap_err();
+        assert_eq!(error.code(), "PROJECT_PATH_COLLISION");
+        assert_eq!(storage.effective_binding("native-two").unwrap(), None);
     }
 
     #[test]

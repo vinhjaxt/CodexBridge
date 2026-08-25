@@ -902,6 +902,7 @@ static PODMAN_INVOCATION: OnceLock<PodmanInvocation> = OnceLock::new();
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) enum PodmanInvocation {
     Direct,
+    DirectWithSudoFallback,
     Sudo,
     Unavailable,
 }
@@ -910,13 +911,16 @@ impl PodmanInvocation {
     pub(crate) fn agent_advice(self) -> &'static str {
         match self {
             Self::Direct => {
-                "Podman is available directly; invoke it explicitly as `podman ...`. For interactive `podman run -it`, use exec_command with tty=true."
+                "Linux Podman is available directly; invoke it explicitly as `podman ...`. No passwordless sudo fallback was detected, so do not invent `sudo podman` if a direct command fails. For interactive `podman run -it`, use exec_command with tty=true."
+            }
+            Self::DirectWithSudoFallback => {
+                "Linux Podman is available directly and a passwordless rootful fallback is verified. Start with `podman ...`; if that direct Podman operation fails with a rootless runtime error such as `crun`, mount/`/proc`, `Operation not permitted`, permission, or user-namespace failure, retry the same Podman operation once as `sudo -n podman ...` before changing flags, images, or sandbox settings. Explicit `sudo -n podman ...` runs outside Bubblewrap. For interactive `podman run -it`, use exec_command with tty=true."
             }
             Self::Sudo => {
-                "Podman requires rootful execution in this runtime; invoke it explicitly as `sudo -n podman ...` and do not rely on shell aliases. For interactive `podman run -it`, use exec_command with tty=true."
+                "Linux Podman requires rootful execution in this runtime; invoke it explicitly as `sudo -n podman ...` and do not rely on shell aliases. Explicit `sudo -n podman ...` runs outside Bubblewrap. For interactive `podman run -it`, use exec_command with tty=true."
             }
             Self::Unavailable => {
-                "No usable local Podman invocation was detected; do not assume `podman` or `sudo podman` is available."
+                "Podman is only probed and enabled by CodexBridge on Linux, and no usable Linux Podman invocation was detected for this runtime; do not assume `podman` or `sudo podman` is available."
             }
         }
     }
@@ -949,11 +953,16 @@ fn command_probe(program: &str, args: &[&str]) -> bool {
 }
 
 fn select_podman_invocation(
+    is_linux: bool,
     running_as_root: bool,
     direct_usable: bool,
     sudo_usable: bool,
 ) -> PodmanInvocation {
-    if direct_usable {
+    if !is_linux {
+        PodmanInvocation::Unavailable
+    } else if direct_usable && !running_as_root && sudo_usable {
+        PodmanInvocation::DirectWithSudoFallback
+    } else if direct_usable {
         PodmanInvocation::Direct
     } else if !running_as_root && sudo_usable {
         PodmanInvocation::Sudo
@@ -963,7 +972,10 @@ fn select_podman_invocation(
 }
 
 fn probe_direct_podman_runtime(running_as_root: bool) -> bool {
-    if running_as_root || !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    if running_as_root {
         return command_probe("podman", &["info", "--format", "json"]);
     }
 
@@ -981,10 +993,13 @@ fn probe_direct_podman_runtime(running_as_root: bool) -> bool {
 }
 
 fn probe_podman_invocation() -> PodmanInvocation {
+    if !cfg!(target_os = "linux") {
+        return PodmanInvocation::Unavailable;
+    }
     let root = running_as_root();
     let direct_usable = probe_direct_podman_runtime(root);
     let sudo_usable = !root && command_probe("sudo", &["-n", "podman", "info", "--format", "json"]);
-    select_podman_invocation(root, direct_usable, sudo_usable)
+    select_podman_invocation(true, root, direct_usable, sudo_usable)
 }
 
 pub(crate) fn podman_invocation() -> PodmanInvocation {
@@ -1023,10 +1038,16 @@ pub(crate) fn bwrap_usable() -> bool {
 fn invokes_podman(command: &str) -> bool {
     command
         .split(|character: char| "|&;()<>".contains(character))
-        .any(segment_invokes_podman)
+        .any(|segment| segment_podman_invocation(segment).is_some())
 }
 
-fn segment_invokes_podman(segment: &str) -> bool {
+fn invokes_sudo_podman(command: &str) -> bool {
+    command
+        .split(|character: char| "|&;()<>".contains(character))
+        .any(|segment| segment_podman_invocation(segment) == Some(true))
+}
+
+fn segment_podman_invocation(segment: &str) -> Option<bool> {
     let tokens = segment
         .split_whitespace()
         .map(|token| token.trim_matches(['\'', '"']))
@@ -1047,9 +1068,9 @@ fn segment_invokes_podman(segment: &str) -> bool {
         if matches!(base, "env" | "command" | "exec" | "nohup") {
             continue;
         }
-        return base == "podman";
+        return (base == "podman").then_some(saw_sudo);
     }
-    false
+    None
 }
 
 fn wait_probe(mut child: std::process::Child, timeout: Duration) -> bool {
@@ -1110,15 +1131,20 @@ fn should_use_bwrap(
     sandbox_backend: &str,
     bwrap_ok: bool,
     podman_command: bool,
+    sudo_podman_command: bool,
     podman_in_bwrap_ok: bool,
 ) -> bool {
     matches!(sandbox_backend, "auto" | "bwrap")
         && bwrap_ok
+        && !sudo_podman_command
         && (!podman_command || podman_in_bwrap_ok)
 }
 
 fn podman_can_use_bwrap(invocation: PodmanInvocation, probe_ok: bool) -> bool {
-    matches!(invocation, PodmanInvocation::Direct) && probe_ok
+    matches!(
+        invocation,
+        PodmanInvocation::Direct | PodmanInvocation::DirectWithSudoFallback
+    ) && probe_ok
 }
 
 fn use_bwrap(config: &Config, project: &ProjectContext, command: Option<&str>) -> bool {
@@ -1130,6 +1156,7 @@ fn use_bwrap(config: &Config, project: &ProjectContext, command: Option<&str>) -
         return false;
     }
     let podman_command = command.is_some_and(invokes_podman);
+    let sudo_podman_command = command.is_some_and(invokes_sudo_podman);
     let podman_in_bwrap_ok = !podman_command
         || podman_can_use_bwrap(
             podman_invocation(),
@@ -1139,6 +1166,7 @@ fn use_bwrap(config: &Config, project: &ProjectContext, command: Option<&str>) -
         &config.sandbox_backend,
         bwrap_ok,
         podman_command,
+        sudo_podman_command,
         podman_in_bwrap_ok,
     )
 }
@@ -1531,11 +1559,7 @@ async fn execute_prepared(
             }
             #[cfg(windows)]
             if let Some(process_id) = process_id {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/T", "/F", "/PID", &process_id.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                let _ = crate::platform::windows_taskkill(process_id, true);
             }
             let _ = child.kill().await;
             let status = child.wait().await.ok();
@@ -1949,7 +1973,11 @@ mod tests {
     #[test]
     fn powershell_invocation_propagates_native_exit_code() {
         let (shell, args, script) = shell_command(Some("pwsh"), "native-command").unwrap();
-        assert_eq!(shell, "pwsh");
+        if cfg!(windows) {
+            assert_eq!(shell, "pwsh.exe");
+        } else {
+            assert_eq!(shell, "pwsh");
+        }
         assert_eq!(args.last().map(String::as_str), Some("-Command"));
         assert!(script.contains("$LASTEXITCODE"));
         assert!(script.contains("exit $LASTEXITCODE"));
@@ -2161,6 +2189,20 @@ mod tests {
             assert!(invokes_podman(command), "{command}");
         }
         for command in [
+            "sudo -n podman run --rm alpine true",
+            "sudo --non-interactive /usr/bin/podman ps",
+            "env FOO=1 sudo -n podman build .",
+        ] {
+            assert!(invokes_sudo_podman(command), "{command}");
+        }
+        for command in [
+            "podman run --rm alpine true",
+            "/usr/bin/podman ps",
+            "FOO=1 podman build .",
+        ] {
+            assert!(!invokes_sudo_podman(command), "{command}");
+        }
+        for command in [
             "printf podman-image",
             "echo podman",
             "FOO=1 docker build .",
@@ -2172,43 +2214,67 @@ mod tests {
 
     #[test]
     fn podman_falls_back_only_when_its_bwrap_probe_fails() {
-        assert!(should_use_bwrap("auto", true, false, false));
-        assert!(should_use_bwrap("auto", true, true, true));
-        assert!(!should_use_bwrap("auto", true, true, false));
-        assert!(!should_use_bwrap("auto", false, false, false));
-        assert!(!should_use_bwrap("none", true, false, true));
+        assert!(should_use_bwrap("auto", true, false, false, false));
+        assert!(should_use_bwrap("auto", true, true, false, true));
+        assert!(!should_use_bwrap("auto", true, true, false, false));
+        assert!(!should_use_bwrap("auto", false, false, false, false));
+        assert!(!should_use_bwrap("none", true, false, false, true));
     }
 
     #[test]
-    fn podman_invocation_uses_sudo_only_when_direct_runtime_is_unusable() {
+    fn podman_invocation_is_linux_only_and_tracks_verified_sudo_fallback() {
         assert_eq!(
-            select_podman_invocation(false, true, true),
-            PodmanInvocation::Direct
+            select_podman_invocation(false, false, true, true),
+            PodmanInvocation::Unavailable
         );
         assert_eq!(
-            select_podman_invocation(false, false, true),
+            select_podman_invocation(true, false, true, true),
+            PodmanInvocation::DirectWithSudoFallback
+        );
+        assert_eq!(
+            select_podman_invocation(true, false, false, true),
             PodmanInvocation::Sudo
         );
         assert_eq!(
-            select_podman_invocation(false, true, false),
+            select_podman_invocation(true, false, true, false),
             PodmanInvocation::Direct
         );
         assert_eq!(
-            select_podman_invocation(true, true, true),
+            select_podman_invocation(true, true, true, true),
             PodmanInvocation::Direct
         );
         assert_eq!(
-            select_podman_invocation(false, false, false),
+            select_podman_invocation(true, false, false, false),
             PodmanInvocation::Unavailable
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn podman_runtime_probe_is_disabled_outside_linux() {
+        assert_eq!(probe_podman_invocation(), PodmanInvocation::Unavailable);
+    }
+
+    #[test]
+    fn direct_podman_with_sudo_fallback_tells_agent_to_retry_rootless_crun_failures() {
+        let advice = PodmanInvocation::DirectWithSudoFallback.agent_advice();
+        assert!(advice.contains("crun"));
+        assert!(advice.contains("Operation not permitted"));
+        assert!(advice.contains("retry the same Podman operation once"));
+        assert!(advice.contains("sudo -n podman"));
     }
 
     #[test]
     fn sudo_podman_never_stays_inside_bwrap() {
         assert!(podman_can_use_bwrap(PodmanInvocation::Direct, true));
+        assert!(podman_can_use_bwrap(
+            PodmanInvocation::DirectWithSudoFallback,
+            true
+        ));
         assert!(!podman_can_use_bwrap(PodmanInvocation::Direct, false));
         assert!(!podman_can_use_bwrap(PodmanInvocation::Sudo, true));
         assert!(!podman_can_use_bwrap(PodmanInvocation::Unavailable, true));
+        assert!(!should_use_bwrap("auto", true, true, true, true));
     }
 
     #[test]

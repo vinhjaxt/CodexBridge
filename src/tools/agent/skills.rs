@@ -293,7 +293,7 @@ pub(super) fn parse_frontmatter(contents: &str, fallback: &str) -> AppResult<(St
 
 fn home_plugin_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    if let Some(home) = crate::platform::user_home_dir()
         && home.join(".claude").exists()
     {
         roots.push(home.join(".claude/plugins/cache"));
@@ -495,7 +495,7 @@ pub(super) fn skill_catalog_from_sources(
 }
 
 fn user_skill_roots() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::platform::user_home_dir() else {
         return Vec::new();
     };
     let mut roots = vec![home.join(".agents/skills")];

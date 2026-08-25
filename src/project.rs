@@ -142,10 +142,11 @@ impl ProjectResolver {
             || matches!(alias, "." | "..")
             || alias.contains('/')
             || alias.contains('\\')
+            || is_windows_reserved_alias(alias)
         {
             return Err(AppError::new(
                 "INVALID_PROJECT_ALIAS",
-                "alias must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and cannot be . or ..",
+                "alias must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$, cannot be . or .., and must be portable to Windows filesystems",
             ));
         }
         Ok(())
@@ -261,7 +262,9 @@ impl ProjectResolver {
             .unwrap_or_else(|| native.as_str().to_owned());
         let reused_existing_binding = expected_binding.as_deref() == Some(effective.as_str());
         let mut project = self.context(native, ProjectKey::new(effective)?, identity)?;
-        if let Some(alias) = requested_alias.as_ref() {
+        if expected_alias_binding.is_none()
+            && let Some(alias) = requested_alias.as_ref()
+        {
             project.project_alias = Some(alias.clone());
         }
         Ok(PreparedProjectInitialization {
@@ -433,6 +436,25 @@ impl ProjectResolver {
     }
 }
 
+fn is_windows_reserved_alias(alias: &str) -> bool {
+    // Windows strips trailing dots/spaces during Win32 path normalization, so
+    // allowing those names would make two distinct logical aliases share one
+    // filesystem entry. Spaces are already excluded by the alias regex, but
+    // keep the check here with the device-name rules for portability.
+    if alias.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = alias.split('.').next().unwrap_or(alias);
+    let stem = stem.to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || stem.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+}
+
 struct CreatedProjectLayout {
     project_root_created: bool,
     metadata_root_created: bool,
@@ -582,6 +604,34 @@ mod tests {
             std::fs::read_to_string(restored.project_root.join("shared.txt")).unwrap(),
             "shared"
         );
+    }
+
+    #[test]
+    fn aliases_are_case_insensitive_so_windows_paths_cannot_collide() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+
+        let (first, joined) = resolver
+            .initialize(&identity("usr-a", "conv-a", None), Some("ReleaseProject"))
+            .unwrap();
+        assert!(!joined);
+        let (second, joined) = resolver
+            .initialize(&identity("usr-b", "conv-b", None), Some("releaseproject"))
+            .unwrap();
+        assert!(joined);
+        assert_eq!(second.project_alias.as_deref(), Some("ReleaseProject"));
+        assert_eq!(first.effective_project_key, second.effective_project_key);
+        assert_eq!(first.project_root, second.project_root);
+        assert_eq!(first.metadata_root, second.metadata_root);
+        assert_eq!(first.effective_project_key.as_str(), "ReleaseProject");
+
+        let (isolated, joined) = resolver
+            .initialize(&identity("usr-c", "conv-c", None), None)
+            .unwrap();
+        assert!(!joined);
+        assert_ne!(isolated.effective_project_key, first.effective_project_key);
+        assert_ne!(isolated.project_root, first.project_root);
     }
 
     #[test]
@@ -999,8 +1049,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
         let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
-        for alias in ["../foo", "/foo", "foo/bar", r"foo\bar", ".", ".."] {
+        for alias in [
+            "../foo", "/foo", "foo/bar", r"foo\bar", ".", "..", "demo.", "CON", "con.txt", "NUL",
+            "COM1", "com9.log", "LPT1", "lpt9.txt",
+        ] {
             assert!(resolver.validate_alias(alias).is_err(), "{alias}");
+        }
+        for alias in ["COM0", "COM10", "LPT0", "LPT10", "console", "demo.txt"] {
+            assert!(resolver.validate_alias(alias).is_ok(), "{alias}");
         }
     }
 }

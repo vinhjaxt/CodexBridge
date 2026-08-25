@@ -2,6 +2,7 @@ pub mod audit;
 pub mod config;
 pub mod error;
 pub mod ignore_rules;
+pub(crate) mod platform;
 pub mod project;
 pub mod request_context;
 pub mod runtime_environment;

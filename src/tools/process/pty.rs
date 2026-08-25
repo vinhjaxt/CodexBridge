@@ -28,6 +28,8 @@ pub(super) fn wait_pty_process(
     mut child: Box<dyn portable_pty::Child + Send>,
     pid: Option<u32>,
 ) -> AppResult<PtyExitStatus> {
+    #[cfg(not(unix))]
+    let _ = pid;
     #[cfg(unix)]
     if let Some(pid) = pid {
         let mut status = 0_i32;
@@ -91,6 +93,8 @@ pub(super) fn pty_size(rows: u16, cols: u16) -> PtySize {
 }
 
 fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsString> {
+    #[cfg(not(unix))]
+    let _ = timeout;
     let command = command.as_std();
     let original: Vec<OsString> = std::iter::once(command.get_program().to_os_string())
         .chain(command.get_args().map(ToOwned::to_owned))

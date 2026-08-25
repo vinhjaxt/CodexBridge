@@ -8,7 +8,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  linux:
+    name: Linux test and smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,3 +32,25 @@ jobs:
         run: git diff --check
       - name: MCP smoke test
         run: scripts/mcp_smoke.sh
+
+  platform:
+    name: Native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.os }}
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features
+      - name: Build bins and examples
+        run: cargo build --bins --examples

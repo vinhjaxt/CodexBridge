@@ -32,6 +32,14 @@ use crate::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TOOLS_PER_UPSTREAM: usize = 512;
 
+fn stdio_upstream_command(command_path: &str, spec: &crate::config::UpstreamSpec) -> Command {
+    let mut command = Command::new(command_path);
+    command.args(&spec.args);
+    crate::platform::configure_upstream_stdio_environment(&mut command);
+    command.envs(&spec.env);
+    command
+}
+
 #[derive(Clone)]
 struct UpstreamTool {
     server: String,
@@ -540,12 +548,7 @@ pub async fn connect_upstreams(config: &Config) -> ConnectedUpstreams {
                     report.push(format!("{server} -> missing stdio command"));
                     continue;
                 };
-                let mut command = Command::new(command_path);
-                command.args(&spec.args).env_clear().envs([
-                    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                    ("LANG", "C.UTF-8"),
-                ]);
-                command.envs(&spec.env);
+                let command = stdio_upstream_command(command_path, spec);
                 let transport = match TokioChildProcess::new(command) {
                     Ok(transport) => transport,
                     Err(error) => {
@@ -828,6 +831,66 @@ mod tests {
         )]))
         .build()
         .unwrap()
+    }
+
+    #[test]
+    fn stdio_upstream_command_uses_native_baseline_and_operator_overrides() {
+        use std::ffi::OsStr;
+
+        let spec = crate::config::UpstreamSpec {
+            command: Some("placeholder".to_owned()),
+            args: vec!["--stdio".to_owned()],
+            env: BTreeMap::new(),
+            disabled: false,
+            transport: Some("stdio".to_owned()),
+            url: None,
+            bearer_token_env_var: None,
+            env_http_headers: BTreeMap::new(),
+            tools: None,
+            mode: UpstreamMode::Gateway,
+        };
+        let command = stdio_upstream_command("placeholder", &spec);
+        let path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OsStr::new("PATH")))
+            .and_then(|(_, value)| value)
+            .expect("PATH baseline")
+            .to_string_lossy();
+        if cfg!(windows) {
+            assert_ne!(path, "/usr/local/bin:/usr/bin:/bin");
+        } else {
+            assert_eq!(path, "/usr/local/bin:/usr/bin:/bin");
+        }
+
+        let mut overridden = spec;
+        overridden
+            .env
+            .insert("PATH".to_owned(), "operator-path".to_owned());
+        overridden
+            .env
+            .insert("CODEXBRIDGE_TEST_ENV".to_owned(), "present".to_owned());
+        let command = stdio_upstream_command("placeholder", &overridden);
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .and_then(|(_, value)| value.as_deref()),
+            Some("operator-path")
+        );
+        assert_eq!(
+            env.get("CODEXBRIDGE_TEST_ENV").and_then(Option::as_deref),
+            Some("present")
+        );
     }
 
     #[tokio::test]
