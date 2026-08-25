@@ -1330,6 +1330,89 @@ mod tests {
         assert_eq!(completion.signal, Some(libc::SIGTERM));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_bare_cmd_spawns_through_conpty() {
+        use crate::config::ConfigBuilder;
+        use crate::project::ProjectKey;
+        use crate::request_context::TransportMode;
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let args = ExecCommandArgs {
+            command: "echo codexbridge-conpty-cmd".to_owned(),
+            workdir: None,
+            shell: Some("cmd".to_owned()),
+            timeout_ms: Some(5_000),
+            yield_time_ms: None,
+            env: BTreeMap::new(),
+            max_output_tokens: None,
+            stdin: None,
+            close_stdin: false,
+            tty: true,
+            rows: Some(24),
+            cols: Some(80),
+            extensions: BTreeMap::new(),
+        };
+        let command = build_command_with_options(
+            &config,
+            &project,
+            &args.command,
+            true,
+            Duration::from_secs(5),
+            &BTreeMap::new(),
+            project_dir.path(),
+            args.shell.as_deref(),
+        )
+        .unwrap();
+
+        let registry = ProcessRegistry::new(4, Duration::from_secs(60), 4096);
+        let registry_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, session) = registry
+            .start_pty(
+                &project,
+                &args,
+                command,
+                Duration::from_secs(5),
+                registry_permit,
+                global_permit,
+                project_permit,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !session.is_finished() {
+                session.changed.notified().await;
+            }
+        })
+        .await
+        .expect("ConPTY cmd process did not publish completion");
+        assert!(wait_for_drains(&session, Duration::from_secs(1)).await);
+
+        let completion = session.completion().expect("ConPTY completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0));
+        assert!(output.contains("codexbridge-conpty-cmd"), "{output:?}");
+    }
+
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
     }

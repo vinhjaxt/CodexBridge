@@ -768,10 +768,11 @@ fn shell_command(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(default_shell);
-    if shell.len() > 4096 || shell.contains(['\0', '\n', '\r']) {
+    if !valid_shell_executable(&shell) {
         return Err(AppError::new("INVALID_INPUT", "invalid shell executable"));
     }
     let kind = shell_kind(&shell);
+    let shell = resolve_shell_executable(shell, kind);
     let (args, command_text) = match kind {
         ShellKind::PowerShell => (
             vec![
@@ -788,6 +789,60 @@ fn shell_command(
         ShellKind::Posix => (vec!["-c".to_owned()], command_text.to_owned()),
     };
     Ok((shell, args, command_text))
+}
+
+fn valid_shell_executable(shell: &str) -> bool {
+    !shell.is_empty() && shell.len() <= 4096 && !shell.contains(['\0', '\n', '\r'])
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_executable(shell: &str, kind: ShellKind, comspec: Option<&str>) -> String {
+    if shell.contains(['/', '\\', ':']) {
+        return shell.to_owned();
+    }
+
+    match kind {
+        ShellKind::Cmd => comspec
+            .filter(|value| is_cmd_executable(value))
+            .map(str::to_owned)
+            .unwrap_or_else(|| "cmd.exe".to_owned()),
+        ShellKind::PowerShell
+            if shell.eq_ignore_ascii_case("powershell")
+                || shell.eq_ignore_ascii_case("powershell.exe") =>
+        {
+            "powershell.exe".to_owned()
+        }
+        ShellKind::PowerShell
+            if shell.eq_ignore_ascii_case("pwsh") || shell.eq_ignore_ascii_case("pwsh.exe") =>
+        {
+            "pwsh.exe".to_owned()
+        }
+        _ => shell.to_owned(),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_cmd_executable(shell: &str) -> bool {
+    if !valid_shell_executable(shell) {
+        return false;
+    }
+    shell
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|base| base.eq_ignore_ascii_case("cmd.exe"))
+}
+
+fn resolve_shell_executable(shell: String, kind: ShellKind) -> String {
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("ComSpec").ok();
+        windows_shell_executable(&shell, kind, comspec.as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = kind;
+        shell
+    }
 }
 
 fn default_shell() -> String {
@@ -1898,6 +1953,111 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("-Command"));
         assert!(script.contains("$LASTEXITCODE"));
         assert!(script.contains("exit $LASTEXITCODE"));
+    }
+
+    #[test]
+    fn windows_shell_resolution_canonicalizes_bare_names_and_preserves_paths() {
+        let comspec = r"D:\Custom Windows\System32\cmd.exe";
+        for shell in ["cmd", "cmd.exe", "CMD.EXE"] {
+            assert_eq!(
+                windows_shell_executable(shell, ShellKind::Cmd, Some(comspec)),
+                comspec
+            );
+        }
+        assert_eq!(
+            windows_shell_executable("cmd", ShellKind::Cmd, None),
+            "cmd.exe"
+        );
+        assert_eq!(
+            windows_shell_executable("cmd.exe", ShellKind::Cmd, Some("powershell.exe")),
+            "cmd.exe"
+        );
+        assert_eq!(
+            windows_shell_executable("cmd", ShellKind::Cmd, Some("cmd")),
+            "cmd.exe"
+        );
+        assert_eq!(
+            windows_shell_executable("powershell", ShellKind::PowerShell, None),
+            "powershell.exe"
+        );
+        assert_eq!(
+            windows_shell_executable("pwsh", ShellKind::PowerShell, None),
+            "pwsh.exe"
+        );
+
+        let explicit_cmd = r"C:\Windows\System32\cmd.exe";
+        assert_eq!(
+            windows_shell_executable(explicit_cmd, ShellKind::Cmd, Some(comspec)),
+            explicit_cmd
+        );
+        let relative_cmd = r"tools\cmd.exe";
+        assert_eq!(
+            windows_shell_executable(relative_cmd, ShellKind::Cmd, Some(comspec)),
+            relative_cmd
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_command_never_returns_bare_cmd() {
+        let (shell, args, script) = shell_command(Some("cmd"), "echo ok").unwrap();
+        assert!(!shell.eq_ignore_ascii_case("cmd"));
+        assert_eq!(shell_kind(&shell), ShellKind::Cmd);
+        if let Ok(comspec) = std::env::var("ComSpec")
+            && is_cmd_executable(&comspec)
+        {
+            assert_eq!(shell, comspec);
+        }
+        assert_eq!(args, ["/d", "/s", "/c"]);
+        assert_eq!(script, "echo ok");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_remains_powershell() {
+        assert_eq!(default_shell(), "powershell.exe");
+        let (shell, args, _) = shell_command(None, "echo ok").unwrap();
+        assert_eq!(shell, "powershell.exe");
+        assert_eq!(args, ["-NoLogo", "-NoProfile", "-Command"]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_bare_cmd_spawns_through_native_exec() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(std::collections::BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let mut command = build_command_with_options(
+            &config,
+            &project,
+            "echo codexbridge-native-cmd",
+            false,
+            Duration::from_secs(5),
+            &BTreeMap::new(),
+            project_dir.path(),
+            Some("cmd"),
+        )
+        .unwrap();
+
+        let output = command.output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("codexbridge-native-cmd"),
+            "{output:?}"
+        );
     }
 
     #[test]

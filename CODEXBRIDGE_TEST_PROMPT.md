@@ -1,6 +1,8 @@
-# Prompt kiểm thử CodexBridge end-to-end
+Use CodexBridge for project `test`.
 
-Bạn đang kiểm thử một CodexBridge đang chạy thực tế. Mục tiêu là kiểm tra behavior của public tool contract, không audit source code và không sửa production source. Hãy thực hiện các kiểm thử bên dưới bằng chính các public tools mà CodexBridge cung cấp, tự xác minh kết quả sau mỗi mutation, và báo cáo PASS/FAIL theo từng case.
+Before doing any project work, initialize/join that project with `chatgpt_turn_init` and follow the brief and project instructions it returns. On later turns, follow the CodexBridge turn protocol and use the previous turn reference automatically.
+
+Task: Bạn đang kiểm thử một CodexBridge đang chạy thực tế. Mục tiêu là kiểm tra behavior của public tool contract, không audit source code và không sửa production source. Hãy thực hiện các kiểm thử bên dưới bằng chính các public tools mà CodexBridge cung cấp, tự xác minh kết quả sau mỗi mutation, và báo cáo PASS/FAIL theo từng case.
 
 ## Nguyên tắc bắt buộc
 
@@ -256,3 +258,4 @@ Sau bảng, có 3 mục ngắn:
 - `Cleanup status`
 
 Nếu C6 có partial mutation, phải đặt nó đầu tiên trong `Critical findings` và ghi rõ rằng đây là regression tương tự bug `Codex1 apply_patch duplicate same-path partial-apply`.
+Về skills, nếu không có file thì bạn tự tạo ra để test.
