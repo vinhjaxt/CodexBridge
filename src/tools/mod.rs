@@ -503,6 +503,68 @@ pub(crate) fn error_result(error: &AppError) -> CallToolResult {
     ))])
 }
 
+fn is_turn_init_soft_stop_error(error: &AppError) -> bool {
+    matches!(
+        error.code(),
+        "PREVIOUS_TURN_REF_REQUIRED"
+            | "STALE_TURN_REF"
+            | "TURN_REF_NOT_FOUND"
+            | "TURN_PROJECT_MISMATCH"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn turn_init_soft_stop_result(
+    identity: &RequestIdentity,
+    requested_project_key: Option<&str>,
+    project: Option<&ProjectContext>,
+    previous_turn_ref: Option<&str>,
+    instruction_hash: Option<&str>,
+    state_hash: Option<&str>,
+    reused_existing_binding: bool,
+    joined_existing_alias: bool,
+    error: &AppError,
+) -> CallToolResult {
+    let message = format!(
+        "STOP_CURRENT_TURN: CodexBridge did not synchronize this user turn ({}: {}). Do not send any more tool calls to CodexBridge during this user turn, including `chatgpt_turn_init`. Do not guess, fabricate, or substitute a turn reference. Tell the user that project synchronization could not be completed, then stop immediately and wait for the next user message. On the next project-bearing user turn, call `chatgpt_turn_init` exactly once with the exact `previous_turn_ref` from the nearest preceding CodexBridge `[ref:...]` marker.",
+        error.code(),
+        error.message()
+    );
+    let project_key = project
+        .and_then(|project| project.project_alias.clone())
+        .or_else(|| requested_project_key.map(str::to_owned))
+        .or_else(|| project.map(|project| project.effective_project_key.as_str().to_owned()));
+    let value = json!({
+        "status": "soft_error",
+        "agent_action": "stop_current_turn",
+        "soft_error": {
+            "code": error.code(),
+            "message": error.message(),
+            "retry_on_next_user_turn": true,
+        },
+        "identity_mode": "chatgpt",
+        "transport_mode": serde_json::to_value(identity.transport_mode).unwrap_or(json!("stateless")),
+        "project_key": project_key,
+        "native_project_key": project.map(|project| project.native_project_key.as_str()),
+        "effective_project_key": project.map(|project| project.effective_project_key.as_str()),
+        "alias": project.and_then(|project| project.project_alias.as_deref()),
+        "initialized": false,
+        "turn_ref": Value::Null,
+        "previous_turn_ref": previous_turn_ref,
+        "instruction_hash": instruction_hash,
+        "state_hash": state_hash,
+        "instructions_changed": false,
+        "state_changed": false,
+        "turn_reused": false,
+        "workspace_state": Value::Null,
+        "reused_existing_binding": reused_existing_binding,
+        "joined_existing_alias": joined_existing_alias,
+        "brief": Value::Null,
+        "state_update": Value::Null,
+    });
+    structured_result_with_text(value, message)
+}
+
 fn new_turn_ref() -> String {
     format!("r_{}", URL_SAFE_NO_PAD.encode(Uuid::now_v7().as_bytes()))
 }
@@ -670,7 +732,7 @@ where
 #[tool_router(router = core_router, vis = "pub(crate)")]
 impl AgentHandler {
     #[tool(
-        description = "Synchronize the active ChatGPT user turn with its project. Call exactly once at the beginning of each user turn that needs project state, before other project tools. On the first project turn, project_key may explicitly create/join a human alias. On later turns, pass previous_turn_ref from the nearest preceding CodexBridge [ref:...] marker; a branched conversation can use that reference to inherit the same effective project. Duplicate calls with the same previous_turn_ref are idempotent and return the same turn_ref. Instruction context and saved state are hashed separately: full brief refreshes are reserved for instruction changes/new branches, while memory/plan-only changes return state_update."
+        description = "Synchronize the active ChatGPT user turn with its project. Call exactly once at the beginning of each user turn that needs project state, before other project tools. On the first project turn, project_key may explicitly create/join a human alias. On later turns, pass previous_turn_ref from the nearest preceding CodexBridge [ref:...] marker; a branched conversation can use that reference to inherit the same effective project. Duplicate calls with the same previous_turn_ref are idempotent and return the same turn_ref. Instruction context and saved state are hashed separately: full brief refreshes are reserved for instruction changes/new branches, while memory/plan-only changes return state_update. If the result has status=soft_error or agent_action=stop_current_turn, stop immediately: do not send any more tool calls to CodexBridge in the same user turn; report the synchronization failure and wait for the next user message."
     )]
     async fn chatgpt_turn_init(
         &self,
@@ -706,6 +768,31 @@ impl AgentHandler {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
+                if is_turn_init_soft_stop_error(&error) {
+                    let result = turn_init_soft_stop_result(
+                        &identity,
+                        args.project_key.as_deref(),
+                        None,
+                        args.previous_turn_ref.as_deref(),
+                        None,
+                        None,
+                        false,
+                        false,
+                        &error,
+                    );
+                    let audit_result = result
+                        .structured_content
+                        .clone()
+                        .unwrap_or_else(|| json!({"status":"soft_error"}));
+                    shared.audit.tool_attempt_finished(
+                        None,
+                        &audit_request_id,
+                        "chatgpt_turn_init",
+                        audit_started,
+                        &audit_result,
+                    );
+                    return Ok(result);
+                }
                 shared.audit.tool_attempt_failed(
                     None,
                     &audit_request_id,
@@ -732,7 +819,7 @@ impl AgentHandler {
             let candidate_turn_ref = new_turn_ref();
             let candidate_brief_snapshot =
                 full_turn_brief(&candidate_full_context, &candidate_turn_ref);
-            let outcome = shared.resolver.commit_initialize_with_turn_ref(
+            let outcome = match shared.resolver.commit_initialize_with_turn_ref(
                 &prepared,
                 &candidate_turn_ref,
                 args.previous_turn_ref.as_deref(),
@@ -740,7 +827,23 @@ impl AgentHandler {
                 &computed_state_hash,
                 &candidate_brief_snapshot,
                 state_snapshot.as_deref(),
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) if is_turn_init_soft_stop_error(&error) => {
+                    return Ok(turn_init_soft_stop_result(
+                        &identity,
+                        args.project_key.as_deref(),
+                        Some(&prepared.project),
+                        args.previous_turn_ref.as_deref(),
+                        Some(&computed_instruction_hash),
+                        Some(&computed_state_hash),
+                        prepared.reused_existing_binding,
+                        prepared.joined,
+                        &error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
             let turn_ref = outcome.turn_ref.clone();
             let branched = outcome
                 .parent_native_key
@@ -779,6 +882,9 @@ impl AgentHandler {
                 .clone()
                 .unwrap_or_else(|| prepared.project.effective_project_key.as_str().to_owned());
             let value = json!({
+                "status": "synchronized",
+                "agent_action": "continue",
+                "soft_error": Value::Null,
                 "alias": prepared.project.project_alias,
                 "brief": brief,
                 "effective_project_key": prepared.project.effective_project_key,
@@ -1452,18 +1558,85 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .unwrap();
-        assert_eq!(output["turn_ref"]["type"], json!("string"));
+        assert_eq!(
+            output["status"]["enum"],
+            json!(["synchronized", "soft_error"])
+        );
+        assert_eq!(
+            output["agent_action"]["enum"],
+            json!(["continue", "stop_current_turn"])
+        );
+        assert_eq!(output["turn_ref"]["type"], json!(["string", "null"]));
         assert_eq!(
             output["previous_turn_ref"]["type"],
             json!(["string", "null"])
         );
-        assert_eq!(output["instruction_hash"]["type"], json!("string"));
-        assert_eq!(output["state_hash"]["type"], json!("string"));
+        assert_eq!(
+            output["instruction_hash"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(output["state_hash"]["type"], json!(["string", "null"]));
         assert_eq!(output["instructions_changed"]["type"], json!("boolean"));
         assert_eq!(output["state_changed"]["type"], json!("boolean"));
         assert_eq!(output["turn_reused"]["type"], json!("boolean"));
         assert_eq!(output["brief"]["type"], json!(["string", "null"]));
         assert_eq!(output["state_update"]["type"], json!(["string", "null"]));
+    }
+
+    #[test]
+    fn turn_init_continuity_failures_are_soft_stop_candidates() {
+        for code in [
+            "PREVIOUS_TURN_REF_REQUIRED",
+            "STALE_TURN_REF",
+            "TURN_REF_NOT_FOUND",
+            "TURN_PROJECT_MISMATCH",
+        ] {
+            assert!(is_turn_init_soft_stop_error(&AppError::new(code, "stop")));
+        }
+        assert!(!is_turn_init_soft_stop_error(&AppError::new(
+            "SERVER_BUSY",
+            "retry"
+        )));
+        assert!(!is_turn_init_soft_stop_error(&AppError::new(
+            "STORAGE_ERROR",
+            "broken"
+        )));
+    }
+
+    #[test]
+    fn turn_init_soft_stop_is_mcp_success_with_explicit_agent_control() {
+        let identity = RequestIdentity {
+            openai_subject: "usr".to_owned(),
+            openai_conversation_id: "conv".to_owned(),
+            mcp_session_id: None,
+            transport_mode: crate::request_context::TransportMode::Stateless,
+        };
+        let result = turn_init_soft_stop_result(
+            &identity,
+            Some("demo"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &AppError::new("PREVIOUS_TURN_REF_REQUIRED", "missing previous turn"),
+        );
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.as_ref().unwrap();
+        assert_eq!(value["status"], json!("soft_error"));
+        assert_eq!(value["agent_action"], json!("stop_current_turn"));
+        assert_eq!(value["initialized"], json!(false));
+        assert_eq!(value["turn_ref"], Value::Null);
+        assert_eq!(
+            value["soft_error"]["code"],
+            json!("PREVIOUS_TURN_REF_REQUIRED")
+        );
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("STOP_CURRENT_TURN"));
+        assert!(text.contains("Do not send any more tool calls to CodexBridge"));
+        assert!(text.contains("stop immediately"));
+        assert!(text.contains("wait for the next user message"));
     }
 
     #[test]

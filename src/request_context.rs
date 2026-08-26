@@ -80,10 +80,10 @@ fn identity_from_meta(
 
 impl<S> FromContextPart<ToolCallContext<'_, S>> for InitializationRequestContext {
     fn from_context_part(context: &mut ToolCallContext<'_, S>) -> Result<Self, rmcp::ErrorData> {
-        // Tool-call clients should receive initialization failures as a normal
-        // CallToolResult with isError=true. Escaping an MCP ErrorData from this
-        // extractor makes some clients tear down their task group and surface
-        // only an opaque ExceptionGroup instead of the actionable error code.
+        // Keep request-context failures inside the tool handler instead of
+        // escaping MCP ErrorData from this extractor. The handler can then
+        // distinguish hard execution failures from recoverable continuity
+        // failures that intentionally return an MCP-success soft stop.
         Ok(Self(identity_from_request(&context.request_context)))
     }
 }
