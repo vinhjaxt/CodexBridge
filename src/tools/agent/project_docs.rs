@@ -235,11 +235,12 @@ mod tests {
     use crate::{project::ProjectKey, request_context::TransportMode};
 
     fn project(root: &std::path::Path) -> ProjectContext {
+        let root = root.canonicalize().expect("test project root must exist");
         ProjectContext {
             native_project_key: ProjectKey::new("native_key".to_owned()).unwrap(),
             effective_project_key: ProjectKey::new("effective_key".to_owned()).unwrap(),
             project_alias: None,
-            project_root: root.to_path_buf(),
+            project_root: root.clone(),
             metadata_root: root.join(".metadata"),
             transport_mode: TransportMode::Stateless,
             mcp_session_present: false,

@@ -588,7 +588,10 @@ mod tests {
             let resolver = ProjectResolver::new(workspace.clone(), storage).unwrap();
             let (a, joined) = resolver.initialize(&identity_a, Some("rust-demo")).unwrap();
             assert!(!joined);
-            assert_eq!(a.project_root, workspace.join("rust-demo"));
+            assert_eq!(
+                a.project_root,
+                workspace.canonicalize().unwrap().join("rust-demo")
+            );
             let (b, joined) = resolver.initialize(&identity_b, Some("rust-demo")).unwrap();
             assert!(joined);
             assert_eq!(a.effective_project_key, b.effective_project_key);
@@ -945,7 +948,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             prepared.project.project_root,
-            workspace.join("production-stress-test")
+            workspace
+                .canonicalize()
+                .unwrap()
+                .join("production-stress-test")
         );
         resolver.commit_initialize(&prepared).unwrap();
         assert_eq!(

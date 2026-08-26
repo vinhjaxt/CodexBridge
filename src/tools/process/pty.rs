@@ -92,6 +92,17 @@ pub(super) fn pty_size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
+fn pty_bootstrap_input_for_platform(windows: bool) -> &'static [u8] {
+    if windows {
+        // portable-pty 0.9 creates ConPTY with PSEUDOCONSOLE_INHERIT_CURSOR.
+        // A headless host must answer ConPTY's initial cursor-position query or
+        // cmd.exe/PowerShell can remain blocked waiting for the terminal reply.
+        b"\x1b[1;1R"
+    } else {
+        &[]
+    }
+}
+
 fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsString> {
     #[cfg(not(unix))]
     let _ = timeout;
@@ -153,6 +164,25 @@ pub(super) fn spawn_pty_process(
     let pair = native_pty_system()
         .openpty(pty_size(rows, cols))
         .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
+    let bootstrap = pty_bootstrap_input_for_platform(cfg!(windows));
+    if !bootstrap.is_empty() {
+        writer
+            .write_all(bootstrap)
+            .and_then(|_| writer.flush())
+            .map_err(|error| {
+                AppError::new(
+                    "PROCESS_FAILED",
+                    format!("failed to initialize PTY input: {error}"),
+                )
+            })?;
+    }
+    // Seed the ConPTY cursor response before spawning the child. On Windows the
+    // inherited-cursor handshake can otherwise block shell startup inside
+    // spawn_command, which is too early for a post-spawn writer to recover it.
     let child = pair
         .slave
         .spawn_command(builder)
@@ -163,10 +193,6 @@ pub(super) fn spawn_pty_process(
     let reader = pair
         .master
         .try_clone_reader()
-        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
-    let writer = pair
-        .master
-        .take_writer()
         .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
     Ok(PtyProcess {
         child,
@@ -194,5 +220,11 @@ mod tests {
             .join(" ");
         assert!(!rendered.contains("--nproc"));
         assert!(!rendered.contains("ulimit -u"));
+    }
+
+    #[test]
+    fn windows_conpty_bootstrap_answers_inherited_cursor_query() {
+        assert_eq!(pty_bootstrap_input_for_platform(true), b"\x1b[1;1R");
+        assert!(pty_bootstrap_input_for_platform(false).is_empty());
     }
 }

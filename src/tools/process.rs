@@ -1355,8 +1355,43 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn windows_bare_cmd_spawns_through_conpty() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::process::tests::windows_bare_cmd_spawns_through_conpty_child",
+                "--nocapture",
+            ])
+            .env("CODEXBRIDGE_CONPTY_CMD_PROBE", "1")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "ConPTY child probe failed: {status}");
+                    break;
+                }
+                None if started.elapsed() < Duration::from_secs(15) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                None => {
+                    let _ = crate::platform::windows_taskkill(child.id(), true);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("ConPTY cmd probe hung during startup or completion");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
-    async fn windows_bare_cmd_spawns_through_conpty() {
+    async fn windows_bare_cmd_spawns_through_conpty_child() {
+        if std::env::var_os("CODEXBRIDGE_CONPTY_CMD_PROBE").is_none() {
+            return;
+        }
         use crate::config::ConfigBuilder;
         use crate::project::ProjectKey;
         use crate::request_context::TransportMode;

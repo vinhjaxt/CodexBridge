@@ -1155,6 +1155,7 @@ mod tests {
         let workspace = directory.path().join("workspace");
         let project_root = workspace.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
         let agents = project_root.join("AGENTS.md");
         std::fs::write(&agents, "RULE_VERSION_A").unwrap();
 
