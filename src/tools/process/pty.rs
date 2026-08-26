@@ -9,12 +9,14 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use crate::error::{AppError, Result as AppResult};
 
+pub(super) type SharedPtyMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+
 pub(super) struct PtyProcess {
     pub child: Box<dyn portable_pty::Child + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
-    pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub master: SharedPtyMaster,
     pub pid: Option<u32>,
 }
 
@@ -199,7 +201,7 @@ pub(super) fn spawn_pty_process(
         killer,
         reader,
         writer,
-        master: Arc::new(Mutex::new(pair.master)),
+        master: Arc::new(Mutex::new(Some(pair.master))),
         pid,
     })
 }

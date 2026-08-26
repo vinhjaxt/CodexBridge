@@ -9,7 +9,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use portable_pty::MasterPty;
 use rmcp::{
     ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
 };
@@ -28,7 +27,9 @@ use uuid::Uuid;
 mod output;
 mod pty;
 use output::{OutputBuffer, token_window};
-use pty::{PtyProcess, pty_size, spawn_pty_process, terminal_dimensions, wait_pty_process};
+use pty::{
+    PtyProcess, SharedPtyMaster, pty_size, spawn_pty_process, terminal_dimensions, wait_pty_process,
+};
 
 use super::AgentHandler;
 use crate::{
@@ -258,7 +259,7 @@ struct InteractiveSession {
     project_key: String,
     stdin: AsyncMutex<Option<ChildStdin>>,
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    pty_master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    pty_master: Option<SharedPtyMaster>,
     tty: bool,
     terminal: Option<Mutex<vt100::Parser>>,
     output: Mutex<OutputBuffer>,
@@ -351,9 +352,12 @@ impl InteractiveSession {
             .cloned()
             .ok_or_else(|| AppError::new("INVALID_INPUT", "session is not using a PTY"))?;
         tokio::task::spawn_blocking(move || {
-            master
+            let mut master = master
                 .lock()
-                .map_err(|_| AppError::new("PROCESS_FAILED", "PTY master lock poisoned"))?
+                .map_err(|_| AppError::new("PROCESS_FAILED", "PTY master lock poisoned"))?;
+            master
+                .as_mut()
+                .ok_or_else(|| AppError::new("PROCESS_FAILED", "PTY is closed"))?
                 .resize(pty_size(rows, cols))
                 .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
         })
@@ -366,6 +370,31 @@ impl InteractiveSession {
                 .set_size(rows, cols);
         }
         Ok(())
+    }
+
+    async fn close_pty_handles_after_exit(&self) {
+        if !self.tty {
+            return;
+        }
+        let writer = self.pty_writer.clone();
+        let master = self.pty_master.as_ref().cloned();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut writer) = writer.lock() {
+                writer.take();
+            }
+            if let Some(master) = master
+                && let Ok(mut master) = master.lock()
+            {
+                // On Windows portable-pty keeps the ConPTY handle inside
+                // MasterPty. The output pipe is not guaranteed to reach EOF
+                // until this value is dropped and ClosePseudoConsole runs.
+                // Dropping it on a blocking worker lets the concurrent drain
+                // thread consume any final console bytes while Windows closes
+                // the pseudo console.
+                master.take();
+            }
+        })
+        .await;
     }
 
     async fn signal(&self, signal: ProcessSignal) -> AppResult<()> {
@@ -790,6 +819,7 @@ impl ProcessRegistry {
                     }
                 }
             };
+            waiter_session.close_pty_handles_after_exit().await;
             wait_for_drains(&waiter_session, Duration::from_secs(5)).await;
             if let Ok(mut completion) = waiter_session.completion.lock() {
                 let exit_code = status.as_ref().and_then(|value| value.exit_code);
@@ -1464,6 +1494,20 @@ mod tests {
         .await
         .expect("ConPTY cmd process did not publish completion");
         assert!(wait_for_drains(&session, Duration::from_secs(1)).await);
+        assert!(
+            session.pty_writer.lock().unwrap().is_none(),
+            "finished ConPTY session retained its input writer"
+        );
+        assert!(
+            session
+                .pty_master
+                .as_ref()
+                .expect("ConPTY master handle")
+                .lock()
+                .unwrap()
+                .is_none(),
+            "finished ConPTY session retained its master handle"
+        );
 
         let completion = session.completion().expect("ConPTY completion");
         assert_eq!(completion.reason, CompletionReason::Exited);

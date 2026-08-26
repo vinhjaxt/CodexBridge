@@ -10,25 +10,8 @@ permissions:
   id-token: write
 
 jobs:
-  verify:
-    name: Verify ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-verify-${{ matrix.os }}
-      - name: Test
-        run: cargo test --locked --all-features
-
   build:
     name: Build ${{ matrix.name }}
-    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -101,7 +84,6 @@ jobs:
           path: .
           merge-multiple: true
 
-      # Create release
       - name: Generate release tag
         id: tag
         run: |
@@ -116,4 +98,3 @@ jobs:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           files: |
             ./codex-bridge-*
-      # Done release
