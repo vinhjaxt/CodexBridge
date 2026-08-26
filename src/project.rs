@@ -330,7 +330,10 @@ impl ProjectResolver {
                 return Err(error);
             }
         };
-        self.cache_initialized(&prepared.project);
+        let mut committed_project = prepared.project.clone();
+        committed_project.effective_project_key = ProjectKey(outcome.effective_key.clone());
+        committed_project.project_alias = outcome.project_alias.clone();
+        self.cache_initialized(&committed_project);
         Ok(outcome)
     }
 
@@ -784,6 +787,77 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code(), "PREVIOUS_TURN_REF_REQUIRED");
+    }
+
+    #[test]
+    fn regression_duplicate_parent_uses_committed_alias_in_outcome_and_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let request = identity("usr", "conv", None);
+
+        let root = resolver
+            .prepare_turn_initialize(&request, Some("demo-project"), None)
+            .unwrap();
+        resolver
+            .commit_initialize_with_turn_ref(&root, "r_root", None, "I1", "S1", "brief-root", None)
+            .unwrap();
+
+        let child = resolver
+            .prepare_turn_initialize(&request, None, Some("r_root"))
+            .unwrap();
+        resolver
+            .commit_initialize_with_turn_ref(
+                &child,
+                "r_child",
+                Some("r_root"),
+                "I1",
+                "S1",
+                "brief-child",
+                None,
+            )
+            .unwrap();
+
+        let duplicate = resolver
+            .prepare_turn_initialize(&request, Some("late-alias"), Some("r_root"))
+            .unwrap();
+        assert_eq!(
+            duplicate.project.project_alias.as_deref(),
+            Some("late-alias")
+        );
+        let outcome = resolver
+            .commit_initialize_with_turn_ref(
+                &duplicate,
+                "r_discarded_candidate",
+                Some("r_root"),
+                "I2",
+                "S2",
+                "brief-discarded",
+                None,
+            )
+            .unwrap();
+
+        assert!(outcome.reused_existing_turn);
+        assert_eq!(outcome.turn_ref, "r_child");
+        assert_eq!(outcome.effective_key, "demo-project");
+        assert_eq!(outcome.project_alias.as_deref(), Some("demo-project"));
+        assert_eq!(
+            resolver
+                .storage()
+                .effective_for_alias("late-alias")
+                .unwrap(),
+            None,
+            "duplicate continuation must not persist a late alias"
+        );
+        assert_eq!(
+            resolver
+                .resolve_initialized(&request)
+                .unwrap()
+                .project_alias
+                .as_deref(),
+            Some("demo-project"),
+            "resolver cache must reflect committed storage state, not prepared alias metadata"
+        );
     }
 
     #[test]

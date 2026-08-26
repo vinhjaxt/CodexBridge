@@ -265,6 +265,17 @@ fn render_console(inner: &AuditInner, event: &Value) {
     }
 }
 
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_GRAY: &str = "\x1b[90m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BLUE: &str = "\x1b[34m";
+
+fn console_color(value: &str, color: &str) -> String {
+    format!("{color}{value}{ANSI_RESET}")
+}
+
 fn console_project(event: &Value) -> &str {
     event
         .get("project")
@@ -292,14 +303,41 @@ fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
             let params = bound_event(params, inner.config.console_param_bytes.saturating_mul(4));
             let rendered = serde_json::to_string(&params)
                 .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
-            Some(format!("[{project}] {tool} {rendered}"))
+            Some(format!(
+                "{} [{}] {} {rendered}",
+                console_color("=>>", ANSI_GRAY),
+                console_color(project, ANSI_GREEN),
+                console_color(tool, ANSI_RED)
+            ))
+        }
+        "tool_result" => {
+            let result = event.get("result").cloned().unwrap_or(Value::Null);
+            let result = scrub(
+                &result,
+                &inner.auth_token,
+                inner.config.console_result_bytes,
+            );
+            let result = bound_event(result, inner.config.console_result_bytes.saturating_mul(4));
+            let rendered = serde_json::to_string(&result)
+                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            Some(format!(
+                "{} [{}] {} {rendered}",
+                console_color("<<=", ANSI_GRAY),
+                console_color(project, ANSI_BLUE),
+                console_color(tool, ANSI_YELLOW)
+            ))
         }
         "tool_error" | "tool_timeout" => {
             let error = event.get("error").cloned().unwrap_or(Value::Null);
             let error = scrub(&error, &inner.auth_token, inner.config.console_result_bytes);
             let rendered = serde_json::to_string(&error)
                 .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
-            Some(format!("[{project}] {tool} {event_name}: {rendered}"))
+            Some(format!(
+                "{} [{}] {} {event_name}: {rendered}",
+                console_color("<<=", ANSI_GRAY),
+                console_color(project, ANSI_BLUE),
+                console_color(tool, ANSI_YELLOW)
+            ))
         }
         _ => None,
     }
@@ -795,9 +833,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "[demo] grep {\"query\":\"needle\",\"token\":\"[REDACTED]\"}"
+            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mgrep\u{1b}[0m {\"query\":\"needle\",\"token\":\"[REDACTED]\"}"
         );
-        assert!(console_line(&inner, &json!({"event":"tool_result"})).is_none());
+
+        let result = console_line(
+            &inner,
+            &json!({
+                "event":"tool_result",
+                "tool":"grep",
+                "project":{"alias":"demo","effective_key":"opaque"},
+                "result":{"matches":3,"token":"bridge-secret"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mgrep\u{1b}[0m {\"matches\":3,\"token\":\"[REDACTED]\"}"
+        );
 
         let fallback = console_line(
             &inner,
@@ -811,7 +863,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fallback,
-            "[effective-project] read_file {\"path\":\"src/lib.rs\"}"
+            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32meffective-project\u{1b}[0m] \u{1b}[31mread_file\u{1b}[0m {\"path\":\"src/lib.rs\"}"
         );
 
         let error = console_line(
@@ -826,7 +878,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             error,
-            "[demo] exec_command tool_error: {\"code\":\"PROCESS_FAILED\",\"message\":\"[REDACTED] failed\"}"
+            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mexec_command\u{1b}[0m tool_error: {\"code\":\"PROCESS_FAILED\",\"message\":\"[REDACTED] failed\"}"
         );
     }
 

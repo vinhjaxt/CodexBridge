@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use codex_bridge::{config::ConfigBuilder, server};
 
+const DEFAULT_RUST_LOG_FILTER: &str = "warn";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-bridge",
@@ -32,7 +34,8 @@ fn main() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| DEFAULT_RUST_LOG_FILTER.into()),
         )
         .try_init();
 
@@ -53,5 +56,15 @@ fn main() {
     if let Err(error) = outcome {
         eprintln!("server failed: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_log_defaults_to_warning() {
+        assert_eq!(DEFAULT_RUST_LOG_FILTER, "warn");
     }
 }

@@ -280,7 +280,9 @@ struct InteractiveSession {
     changed: Notify,
     drains_remaining: AtomicUsize,
     drains_finished: Notify,
-    _registry_permit: Mutex<Option<OwnedSemaphorePermit>>,
+    /// Limits concurrently executing processes only. Finished sessions may remain
+    /// in `ProcessRegistry::entries` for output replay after this permit is released.
+    execution_capacity_permit: Mutex<Option<OwnedSemaphorePermit>>,
     process_permits: Mutex<Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>>,
     cancellation: CancellationToken,
 }
@@ -297,6 +299,15 @@ impl InteractiveSession {
     fn touch(&self) {
         if let Ok(mut value) = self.last_activity.lock() {
             *value = Instant::now();
+        }
+    }
+
+    fn release_execution_permits(&self) {
+        if let Ok(mut permit) = self.execution_capacity_permit.lock() {
+            permit.take();
+        }
+        if let Ok(mut permits) = self.process_permits.lock() {
+            permits.take();
         }
     }
 
@@ -456,6 +467,21 @@ impl ProcessRegistry {
         self.tracked_tasks.load(Ordering::Relaxed)
     }
 
+    fn make_room_for_session(&self) {
+        while self.entries.len() >= self.maximum {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|entry| entry.is_finished())
+                .min_by_key(|entry| (entry.replay_pending.load(Ordering::Relaxed), entry.started))
+                .map(|entry| entry.key().clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
     /// Stop every live session and wait for the process waiters and output
     /// drains to publish their terminal state. This is intentionally bounded:
     /// a broken descendant that keeps a pipe open must not block daemon
@@ -544,18 +570,7 @@ impl ProcessRegistry {
         project_process_permit: OwnedSemaphorePermit,
     ) -> AppResult<(String, Arc<InteractiveSession>)> {
         self.cleanup();
-        if self.entries.len() >= self.maximum
-            && let Some(oldest_finished) = self
-                .entries
-                .iter()
-                .filter(|entry| {
-                    entry.is_finished() && !entry.replay_pending.load(Ordering::Relaxed)
-                })
-                .min_by_key(|entry| entry.started)
-                .map(|entry| entry.key().clone())
-        {
-            self.entries.remove(&oldest_finished);
-        }
+        self.make_room_for_session();
         let registry_permit = self.capacity.clone().try_acquire_owned().map_err(|_| {
             AppError::new(
                 "SERVER_BUSY",
@@ -639,7 +654,7 @@ impl ProcessRegistry {
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(2),
             drains_finished: Notify::new(),
-            _registry_permit: Mutex::new(Some(registry_permit)),
+            execution_capacity_permit: Mutex::new(Some(registry_permit)),
             process_permits: Mutex::new(Some((global_process_permit, project_process_permit))),
             cancellation: CancellationToken::new(),
         });
@@ -719,9 +734,7 @@ impl ProcessRegistry {
                     wait_error,
                 ));
             }
-            if let Ok(mut permits) = waiter_session.process_permits.lock() {
-                permits.take();
-            }
+            waiter_session.release_execution_permits();
             active.fetch_sub(1, Ordering::Relaxed);
             waiter_session.changed.notify_waiters();
         });
@@ -773,7 +786,7 @@ impl ProcessRegistry {
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(1),
             drains_finished: Notify::new(),
-            _registry_permit: Mutex::new(Some(registry_permit)),
+            execution_capacity_permit: Mutex::new(Some(registry_permit)),
             process_permits: Mutex::new(Some((global_process_permit, project_process_permit))),
             cancellation: CancellationToken::new(),
         });
@@ -866,9 +879,7 @@ impl ProcessRegistry {
                     error: wait_error,
                 });
             }
-            if let Ok(mut permits) = waiter_session.process_permits.lock() {
-                permits.take();
-            }
+            waiter_session.release_execution_permits();
             active.fetch_sub(1, Ordering::Relaxed);
             waiter_session.changed.notify_waiters();
         });
@@ -1173,9 +1184,9 @@ async fn yield_result(
         "terminal_snapshot": terminal_snapshot,
         "wall_time_seconds": session.started.elapsed().as_secs_f64(),
         "continuation": if finished && response_truncated {
-            Some("The process finished, but this response was truncated. Call write_stdin with this session_id and since_output_offset to replay retained final output before considering a rerun.")
+              Some("The process finished, but this response was truncated. Call write_stdin with this session_id and since_output_offset to replay retained final output promptly; retained finished sessions can be evicted under bounded registry pressure.")
         } else if replay_pending {
-            Some("A previous finished response was truncated. This session remains retained for replay; call write_stdin with this session_id and since_output_offset before considering a rerun.")
+              Some("A previous finished response was truncated. This session remains retained for replay for now; call write_stdin with this session_id and since_output_offset promptly because retained finished sessions can be evicted under bounded registry pressure.")
         } else if finished {
             None
         } else {
@@ -1595,7 +1606,7 @@ mod tests {
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(0),
             drains_finished: Notify::new(),
-            _registry_permit: Mutex::new(None),
+            execution_capacity_permit: Mutex::new(None),
             process_permits: Mutex::new(None),
             cancellation: CancellationToken::new(),
         })
@@ -1639,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_pressure_never_evicts_finished_session_with_pending_replay() {
+    fn capacity_pressure_prefers_finished_session_without_pending_replay() {
         let registry = ProcessRegistry::new(2, Duration::from_secs(900), 1024);
         let replay = test_session(Some(0));
         replay.replay_pending.store(true, Ordering::Relaxed);
@@ -1647,17 +1658,63 @@ mod tests {
         registry.entries.insert("replay".to_owned(), replay);
         registry.entries.insert("ordinary".to_owned(), ordinary);
 
-        let oldest_finished = registry
-            .entries
-            .iter()
-            .filter(|entry| entry.is_finished() && !entry.replay_pending.load(Ordering::Relaxed))
-            .min_by_key(|entry| entry.started)
-            .map(|entry| entry.key().clone())
-            .unwrap();
-        registry.entries.remove(&oldest_finished);
+        registry.make_room_for_session();
 
         assert!(registry.entries.contains_key("replay"));
         assert!(!registry.entries.contains_key("ordinary"));
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_finished_replay_before_blocking_new_execution() {
+        let registry = ProcessRegistry::new(1, Duration::from_secs(900), 1024);
+        let replay = test_session(Some(0));
+        replay.replay_pending.store(true, Ordering::Relaxed);
+        registry.entries.insert("replay".to_owned(), replay);
+
+        registry.make_room_for_session();
+
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.capacity.available_permits(), 1);
+    }
+
+    #[test]
+    fn regression_finished_replays_do_not_consume_execution_capacity() {
+        const DEFAULT_MAX_INTERACTIVE_PROCESSES: usize = 32;
+        let registry = ProcessRegistry::new(
+            DEFAULT_MAX_INTERACTIVE_PROCESSES,
+            Duration::from_secs(900),
+            1024,
+        );
+
+        for index in 0..DEFAULT_MAX_INTERACTIVE_PROCESSES {
+            let registry_permit = registry.capacity.clone().try_acquire_owned().unwrap();
+            let replay = test_session(Some(0));
+            replay.replay_pending.store(true, Ordering::Relaxed);
+            *replay.execution_capacity_permit.lock().unwrap() = Some(registry_permit);
+            *replay.finished_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(899));
+            replay.release_execution_permits();
+            registry.entries.insert(format!("replay-{index}"), replay);
+        }
+
+        registry.cleanup();
+        assert_eq!(
+            registry.active(),
+            0,
+            "all replay sessions are already finished"
+        );
+        assert_eq!(registry.entries.len(), DEFAULT_MAX_INTERACTIVE_PROCESSES);
+        assert_eq!(
+            registry.capacity.available_permits(),
+            DEFAULT_MAX_INTERACTIVE_PROCESSES,
+            "finished replay sessions must retain output without retaining execution capacity"
+        );
+        let permit = registry
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .expect("a new process must be able to acquire execution capacity");
+        drop(permit);
+        assert_eq!(registry.entries.len(), DEFAULT_MAX_INTERACTIVE_PROCESSES);
     }
 
     #[test]
@@ -2048,7 +2105,7 @@ mod tests {
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(1),
             drains_finished: Notify::new(),
-            _registry_permit: Mutex::new(None),
+            execution_capacity_permit: Mutex::new(None),
             process_permits: Mutex::new(None),
             cancellation: CancellationToken::new(),
         });

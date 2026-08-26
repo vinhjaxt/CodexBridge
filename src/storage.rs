@@ -63,6 +63,8 @@ pub(crate) struct TurnRefCommitOutcome {
     pub turn_ref: String,
     pub parent_turn_ref: Option<String>,
     pub parent_native_key: Option<String>,
+    pub effective_key: String,
+    pub project_alias: Option<String>,
     pub parent_instruction_hash: Option<String>,
     pub parent_state_hash: Option<String>,
     pub instruction_hash: String,
@@ -569,11 +571,20 @@ impl Storage {
                         "previous_turn_ref is not available to this ChatGPT subject",
                     ));
                 }
+                  let project_alias = transaction
+                      .query_row(
+                          "SELECT alias FROM aliases WHERE effective_key=?1 ORDER BY alias LIMIT 1",
+                          [&existing.1],
+                          |row| row.get::<_, String>(0),
+                      )
+                      .optional()?;
                 transaction.commit()?;
                 return Ok(Some(TurnRefCommitOutcome {
                     turn_ref: existing.0,
                     parent_turn_ref: Some(parent_turn_ref.clone()),
                     parent_native_key: Some(parent.0),
+                      effective_key: existing.1,
+                      project_alias,
                     parent_instruction_hash: Some(parent.3),
                     parent_state_hash: Some(parent.4),
                     instruction_hash: existing.2,
@@ -667,6 +678,13 @@ impl Storage {
                 "INSERT INTO bindings(native_key,effective_key) VALUES(?1,?2) ON CONFLICT(native_key) DO UPDATE SET effective_key=excluded.effective_key",
                 params![&native_key, &effective_key],
             )?;
+              let project_alias = transaction
+                  .query_row(
+                      "SELECT alias FROM aliases WHERE effective_key=?1 ORDER BY alias LIMIT 1",
+                      [&effective_key],
+                      |row| row.get::<_, String>(0),
+                  )
+                  .optional()?;
             let turn_outcome = if let Some((turn_ref, parent_turn_ref, instruction_hash, state_hash, subject_key, brief_snapshot, state_snapshot)) = turn_ref.as_ref() {
                 let (parent_native_key, parent_instruction_hash, parent_state_hash) = if let Some(parent_turn_ref) = parent_turn_ref.as_ref() {
                     let parent = transaction
@@ -754,6 +772,8 @@ impl Storage {
                     turn_ref: turn_ref.clone(),
                     parent_turn_ref: parent_turn_ref.clone(),
                     parent_native_key,
+                      effective_key: effective_key.clone(),
+                      project_alias: project_alias.clone(),
                     parent_instruction_hash,
                     parent_state_hash,
                     instruction_hash: instruction_hash.clone(),

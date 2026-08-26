@@ -451,9 +451,7 @@ impl AgentHandler {
                 self.shared
                     .audit
                     .tool_finished(&project, &request_id, tool, started, &value);
-                let text =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-                Ok(structured_result_with_text(value, text))
+                Ok(structured_result(value))
             }
             Err(error) => {
                 self.shared
@@ -511,6 +509,14 @@ impl AgentHandler {
             }
         }
     }
+}
+
+pub(crate) fn structured_result(value: Value) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "Structured result is available in structuredContent.",
+    )]);
+    result.structured_content = Some(value);
+    result
 }
 
 pub(crate) fn structured_result_with_text(value: Value, text: String) -> CallToolResult {
@@ -905,18 +911,17 @@ impl AgentHandler {
             } else {
                 None
             };
-            let project_key = prepared
-                .project
-                .project_alias
+              let project_key = outcome
+                  .project_alias
                 .clone()
-                .unwrap_or_else(|| prepared.project.effective_project_key.as_str().to_owned());
+                  .unwrap_or_else(|| outcome.effective_key.clone());
             let value = json!({
                 "status": "synchronized",
                 "agent_action": "continue",
                 "soft_error": Value::Null,
-                "alias": prepared.project.project_alias,
+                  "alias": outcome.project_alias,
                 "brief": brief,
-                "effective_project_key": prepared.project.effective_project_key,
+                  "effective_project_key": outcome.effective_key,
                 "identity_mode": "chatgpt",
                 "initialized": true,
                 "turn_ref": turn_ref.clone(),
@@ -1820,6 +1825,166 @@ mod tests {
         let result = structured_result_with_text(json!({"ok":true}), "compact".to_owned());
         assert_eq!(result.structured_content, Some(json!({"ok":true})));
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn regression_large_process_result_is_not_mirrored_in_text() {
+        use std::collections::BTreeMap;
+
+        // Match the default MAX_PROCESS_OUTPUT_BYTES budget and use a character
+        // that JSON must escape. The generic native result path should keep the
+        // payload only in structuredContent instead of pretty-serializing a second
+        // full copy into the MCP text content.
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let project_root = workspace.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let config = Arc::new(
+            crate::config::ConfigBuilder::from_map(BTreeMap::from([
+                ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+                ("WORKSPACE_ROOT".to_owned(), workspace.display().to_string()),
+            ]))
+            .build()
+            .unwrap(),
+        );
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage.clone()).unwrap();
+        let audit = AuditLogger::new(config.logs.clone(), config.auth_token.clone())
+            .await
+            .unwrap();
+        let shared = SharedState::new(
+            config,
+            resolver,
+            storage,
+            audit,
+            crate::upstream::Aggregator::default(),
+        );
+        let handler = AgentHandler::new(shared);
+        let project = ProjectContext {
+            native_project_key: crate::project::ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: crate::project::ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root,
+            metadata_root: directory.path().join("metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let retained_bytes = 4 * 1024 * 1024;
+        let output = "\\".repeat(retained_bytes);
+        let result = handler
+            .run(
+                Ok(project),
+                "exec_command",
+                json!({}),
+                move |_| async move { Ok(json!({"output": output})) },
+            )
+            .await
+            .unwrap();
+        let wire = serde_json::to_vec(&result).unwrap();
+
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["output"]
+                .as_str()
+                .unwrap()
+                .len(),
+            retained_bytes
+        );
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.len() < 128);
+        assert!(!text.contains("\\\\\\\\"));
+        assert!(
+            wire.len() < retained_bytes * 3,
+            "a {retained_bytes}-byte process result still amplified beyond the JSON-escaping budget: {} wire bytes",
+            wire.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_duplicate_turn_response_uses_persisted_alias() {
+        use std::collections::BTreeMap;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let config = Arc::new(
+            crate::config::ConfigBuilder::from_map(BTreeMap::from([
+                ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+                ("WORKSPACE_ROOT".to_owned(), workspace.display().to_string()),
+            ]))
+            .build()
+            .unwrap(),
+        );
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage.clone()).unwrap();
+        let audit = AuditLogger::new(config.logs.clone(), config.auth_token.clone())
+            .await
+            .unwrap();
+        let shared = SharedState::new(
+            config,
+            resolver,
+            storage.clone(),
+            audit,
+            crate::upstream::Aggregator::default(),
+        );
+        let handler = AgentHandler::new(shared);
+        let identity = RequestIdentity {
+            openai_subject: "usr".to_owned(),
+            openai_conversation_id: "conv".to_owned(),
+            mcp_session_id: None,
+            transport_mode: crate::request_context::TransportMode::Stateless,
+        };
+
+        let root = handler
+            .chatgpt_turn_init(
+                InitializationRequestContext(Ok(identity.clone())),
+                Parameters(InitArgs {
+                    project_key: Some("demo-project".to_owned()),
+                    previous_turn_ref: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let root_ref = root.structured_content.as_ref().unwrap()["turn_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let child = handler
+            .chatgpt_turn_init(
+                InitializationRequestContext(Ok(identity.clone())),
+                Parameters(InitArgs {
+                    project_key: None,
+                    previous_turn_ref: Some(root_ref.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let child_ref = child.structured_content.as_ref().unwrap()["turn_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let duplicate = handler
+            .chatgpt_turn_init(
+                InitializationRequestContext(Ok(identity)),
+                Parameters(InitArgs {
+                    project_key: Some("late-alias".to_owned()),
+                    previous_turn_ref: Some(root_ref),
+                }),
+            )
+            .await
+            .unwrap();
+        let value = duplicate.structured_content.as_ref().unwrap();
+
+        assert_eq!(value["turn_reused"], json!(true));
+        assert_eq!(value["turn_ref"], json!(child_ref));
+        assert_eq!(value["alias"], json!("demo-project"));
+        assert_eq!(value["project_key"], json!("demo-project"));
+        assert_eq!(value["effective_project_key"], json!("demo-project"));
+        assert_eq!(
+            storage.effective_for_alias("late-alias").unwrap(),
+            None,
+            "duplicate continuation must not persist a late alias"
+        );
     }
 
     #[test]
