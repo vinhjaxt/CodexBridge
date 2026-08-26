@@ -654,7 +654,7 @@ fn unsafe_podman_create_invocation(tokens: &[&str]) -> Option<&'static str> {
                             path_overridden |= tokens.get(index + 1).copied() == Some("PATH");
                             index = index.saturating_add(2);
                         }
-                        option if option == "--unset=PATH" => {
+                        "--unset=PATH" => {
                             path_overridden = true;
                             index += 1;
                         }
