@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::{Read, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::ChildStdin,
+    process::{ChildStdin, Command as TokioCommand},
     sync::{Mutex as AsyncMutex, Notify},
 };
 use tokio_util::sync::CancellationToken;
@@ -36,8 +38,14 @@ use crate::{
     error::{AppError, Result as AppResult},
     project::ProjectContext,
     request_context::ProjectRequestContext,
-    sandbox::{PathOperation, build_command_with_options},
+    sandbox::{
+        PathOperation, build_command_with_options_and_runtime_bind, invokes_direct_podman,
+        invokes_podman, invokes_sudo_podman,
+    },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const MIN_YIELD_MS: u64 = 250;
 const MAX_YIELD_MS: u64 = 30_000;
@@ -47,6 +55,9 @@ const MAX_YIELD_MS: u64 = 30_000;
 const MAX_INITIAL_YIELD_MS: u64 = 20_000;
 const MAX_POLL_YIELD_MS: u64 = 300_000;
 const TIMEOUT_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+const PODMAN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const PODMAN_CIDFILE_PREFIX: &str = "cid.";
+const PODMAN_EXECUTION_LABEL_KEY: &str = "io.codexbridge.execution";
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ExecCommandArgs {
@@ -255,6 +266,534 @@ fn completion_from_exit_status(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PodmanCleanupMode {
+    Direct,
+    Sudo,
+}
+
+struct PodmanExecutionTracker {
+    host_dir: PathBuf,
+    sandbox_dir: PathBuf,
+    cleanup_modes: Vec<PodmanCleanupMode>,
+    execution_label: String,
+    configured_host: Option<String>,
+    container_host: Option<String>,
+    docker_host: Option<String>,
+}
+
+impl PodmanExecutionTracker {
+    fn prepare(
+        config: &crate::config::Config,
+        project: &ProjectContext,
+        command: &str,
+    ) -> AppResult<Option<Self>> {
+        if !cfg!(target_os = "linux") {
+            return Ok(None);
+        }
+        validate_podman_tracking_command(command)?;
+        if !invokes_podman(command) {
+            return Ok(None);
+        }
+
+        let id = Uuid::now_v7().simple().to_string();
+        let execution_label = format!("{PODMAN_EXECUTION_LABEL_KEY}={id}");
+        let host_dir = project
+            .metadata_root
+            .join("tmp")
+            .join(format!("podman-exec-{id}"));
+        fs::create_dir(&host_dir)?;
+        let setup = (|| -> AppResult<(PathBuf, PathBuf)> {
+            #[cfg(unix)]
+            fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o700))?;
+
+            let podman_wrapper = host_dir.join("podman");
+            fs::write(
+                &podman_wrapper,
+                r#"#!/bin/sh
+track=$CODEXBRIDGE_PODMAN_TRACK_DIR
+label=$CODEXBRIDGE_PODMAN_EXEC_LABEL
+PATH=$CODEXBRIDGE_PODMAN_REAL_PATH
+export PATH
+case "${1-}" in
+  run|create)
+    subcommand=$1
+    shift
+    has_cidfile=0
+    for arg in "$@"; do
+      case "$arg" in
+        --cidfile|--cidfile=*) has_cidfile=1 ;;
+      esac
+    done
+    if [ "$has_cidfile" -eq 1 ]; then
+      exec podman "$subcommand" --label "$label" "$@"
+    fi
+    exec podman "$subcommand" --label "$label" --cidfile "$track/cid.$$.txt" "$@"
+    ;;
+  *) exec podman "$@" ;;
+esac
+"#,
+            )?;
+            let sudo_wrapper = host_dir.join("sudo");
+            fs::write(
+                &sudo_wrapper,
+                r#"#!/bin/sh
+track=$CODEXBRIDGE_PODMAN_TRACK_DIR
+label=$CODEXBRIDGE_PODMAN_EXEC_LABEL
+container_host=${CONTAINER_HOST-}
+docker_host=${DOCKER_HOST-}
+PATH=$CODEXBRIDGE_PODMAN_REAL_PATH
+export PATH
+run_sudo() {
+  sudo_opt=$1
+  shift
+  if [ -n "$sudo_opt" ]; then
+    if [ -n "$container_host" ] && [ -n "$docker_host" ]; then
+      exec sudo "$sudo_opt" env "CONTAINER_HOST=$container_host" "DOCKER_HOST=$docker_host" "$@"
+    elif [ -n "$container_host" ]; then
+      exec sudo "$sudo_opt" env "CONTAINER_HOST=$container_host" "$@"
+    elif [ -n "$docker_host" ]; then
+      exec sudo "$sudo_opt" env "DOCKER_HOST=$docker_host" "$@"
+    else
+      exec sudo "$sudo_opt" "$@"
+    fi
+  else
+    if [ -n "$container_host" ] && [ -n "$docker_host" ]; then
+      exec sudo env "CONTAINER_HOST=$container_host" "DOCKER_HOST=$docker_host" "$@"
+    elif [ -n "$container_host" ]; then
+      exec sudo env "CONTAINER_HOST=$container_host" "$@"
+    elif [ -n "$docker_host" ]; then
+      exec sudo env "DOCKER_HOST=$docker_host" "$@"
+    else
+      exec sudo "$@"
+    fi
+  fi
+}
+run_podman() {
+  sudo_opt=$1
+  podman=$2
+  shift 2
+  case "${1-}" in
+    run|create)
+      subcommand=$1
+      shift
+        has_cidfile=0
+      for arg in "$@"; do
+        case "$arg" in
+            --cidfile|--cidfile=*) has_cidfile=1 ;;
+        esac
+      done
+      cidfile="$track/cid.$$.txt"
+        if [ "$has_cidfile" -eq 1 ]; then
+      run_sudo "$sudo_opt" "$podman" "$subcommand" --label "$label" "$@"
+        fi
+    run_sudo "$sudo_opt" "$podman" "$subcommand" --label "$label" --cidfile "$cidfile" "$@"
+      ;;
+  *) run_sudo "$sudo_opt" "$podman" "$@" ;;
+  esac
+}
+case "${1-}" in
+  -n|--non-interactive)
+    opt=$1
+    shift
+    case "${1-}" in
+      podman|*/podman)
+        podman=$1
+        shift
+        run_podman "$opt" "$podman" "$@"
+        ;;
+    esac
+    exec sudo "$opt" "$@"
+    ;;
+  podman|*/podman)
+    podman=$1
+    shift
+    run_podman "" "$podman" "$@"
+    ;;
+  *) exec sudo "$@" ;;
+esac
+"#,
+            )?;
+            #[cfg(unix)]
+            for wrapper in [&podman_wrapper, &sudo_wrapper] {
+                fs::set_permissions(wrapper, fs::Permissions::from_mode(0o700))?;
+            }
+            Ok((podman_wrapper, sudo_wrapper))
+        })();
+        if let Err(error) = setup {
+            let _ = fs::remove_dir_all(&host_dir);
+            return Err(error);
+        }
+
+        let mut cleanup_modes = Vec::with_capacity(2);
+        if invokes_direct_podman(command) {
+            cleanup_modes.push(PodmanCleanupMode::Direct);
+        }
+        if invokes_sudo_podman(command) {
+            cleanup_modes.push(PodmanCleanupMode::Sudo);
+        }
+        let sandbox_dir = PathBuf::from(format!("/run/codexbridge-podman-{id}"));
+        let configured_host = config
+            .container_socket
+            .as_ref()
+            .map(|socket| format!("unix://{}", socket.to_string_lossy()));
+        Ok(Some(Self {
+            host_dir,
+            sandbox_dir,
+            cleanup_modes,
+            execution_label,
+            configured_host: configured_host.clone(),
+            container_host: configured_host.clone(),
+            docker_host: configured_host,
+        }))
+    }
+
+    fn runtime_bind(&self) -> (&Path, &Path) {
+        (&self.host_dir, &self.sandbox_dir)
+    }
+
+    fn configure_command(
+        &mut self,
+        command: &mut tokio::process::Command,
+        use_bwrap: bool,
+        environment: &BTreeMap<String, String>,
+    ) {
+        let runtime_dir = if use_bwrap {
+            &self.sandbox_dir
+        } else {
+            &self.host_dir
+        };
+        let base_path = environment.get("PATH").cloned().unwrap_or_else(|| {
+            if use_bwrap {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+            } else {
+                std::env::var("PATH").unwrap_or_else(|_| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+                })
+            }
+        });
+        command.env("CODEXBRIDGE_PODMAN_TRACK_DIR", runtime_dir);
+        command.env("CODEXBRIDGE_PODMAN_EXEC_LABEL", &self.execution_label);
+        command.env("CODEXBRIDGE_PODMAN_REAL_PATH", &base_path);
+        command.env("PATH", format!("{}:{base_path}", runtime_dir.display()));
+        self.container_host = cleanup_podman_host(
+            environment.get("CONTAINER_HOST"),
+            self.configured_host.as_ref(),
+            use_bwrap,
+        );
+        self.docker_host = cleanup_podman_host(
+            environment.get("DOCKER_HOST"),
+            self.configured_host.as_ref(),
+            use_bwrap,
+        );
+    }
+
+    async fn cleanup(&self) -> AppResult<()> {
+        let mut failures = Vec::new();
+        for mode in &self.cleanup_modes {
+            if let Err(error) = self.cleanup_mode(*mode).await {
+                failures.push(error.message().to_owned());
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "PROCESS_FAILED",
+                format!("Podman forced-exit cleanup failed: {}", failures.join("; ")),
+            ))
+        }
+    }
+
+    async fn cleanup_mode(&self, mode: PodmanCleanupMode) -> AppResult<()> {
+        let mut owned = podman_container_ids_from_cidfiles(&self.host_dir)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let filter = format!("label={}", self.execution_label);
+        let listed = self
+            .podman_output(mode, &["ps", "-aq", "--filter", &filter])
+            .await?;
+        if !listed.status.success() {
+            return Err(AppError::new(
+                "PROCESS_FAILED",
+                format!(
+                    "Podman ownership lookup failed: {}",
+                    String::from_utf8_lossy(&listed.stderr).trim()
+                ),
+            ));
+        }
+        owned.extend(podman_container_ids_from_bytes(&listed.stdout));
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let mut remove_args = vec![
+            "rm".to_owned(),
+            "-f".to_owned(),
+            "--time".to_owned(),
+            "0".to_owned(),
+            "--ignore".to_owned(),
+        ];
+        remove_args.extend(owned);
+        let remove_refs = remove_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let removed = self.podman_output(mode, &remove_refs).await?;
+        if removed.status.success() {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "PROCESS_FAILED",
+                format!(
+                    "Podman container removal failed: {}",
+                    String::from_utf8_lossy(&removed.stderr).trim()
+                ),
+            ))
+        }
+    }
+
+    async fn podman_output(
+        &self,
+        mode: PodmanCleanupMode,
+        args: &[&str],
+    ) -> AppResult<std::process::Output> {
+        let mut command = match mode {
+            PodmanCleanupMode::Direct => TokioCommand::new("podman"),
+            PodmanCleanupMode::Sudo => {
+                let mut command = TokioCommand::new("sudo");
+                command.args(["-n", "env"]);
+                if let Some(host) = &self.container_host {
+                    command.arg(format!("CONTAINER_HOST={host}"));
+                }
+                if let Some(host) = &self.docker_host {
+                    command.arg(format!("DOCKER_HOST={host}"));
+                }
+                command.arg("podman");
+                command
+            }
+        };
+        command.args(args);
+        if matches!(mode, PodmanCleanupMode::Direct) {
+            command.env_clear();
+            command.env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+                }),
+            );
+            if let Some(host) = &self.container_host {
+                command.env("CONTAINER_HOST", host);
+            }
+            if let Some(host) = &self.docker_host {
+                command.env("DOCKER_HOST", host);
+            }
+        }
+        tokio::time::timeout(PODMAN_CLEANUP_TIMEOUT, command.output())
+            .await
+            .map_err(|_| AppError::new("PROCESS_TIMEOUT", "Podman cleanup command timed out"))?
+            .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
+    }
+}
+
+fn cleanup_podman_host(
+    override_value: Option<&String>,
+    configured_host: Option<&String>,
+    use_bwrap: bool,
+) -> Option<String> {
+    match override_value {
+        Some(value) if use_bwrap && value == "unix:///run/podman.sock" => configured_host.cloned(),
+        Some(value) => Some(value.clone()),
+        None => configured_host.cloned(),
+    }
+}
+
+fn validate_podman_tracking_command(command: &str) -> AppResult<()> {
+    for segment in command.split(|character: char| "|&;()<>".contains(character)) {
+        let tokens = segment
+            .split_whitespace()
+            .map(|token| token.trim_matches(['\'', '"']))
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        if let Some(reason) = unsafe_podman_create_invocation(&tokens) {
+            return Err(AppError::new(
+                "INVALID_INPUT",
+                format!(
+                    "Podman run/create invocation cannot be safely tracked for timeout/cancel cleanup: {reason}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_podman_create_invocation(tokens: &[&str]) -> Option<&'static str> {
+    let mut index = 0usize;
+    let mut path_overridden = false;
+    let mut sudo = false;
+    let mut sudo_absolute = false;
+    let mut unsupported_sudo_option = false;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        if let Some((name, _)) = token.split_once('=')
+            && !name.is_empty()
+            && !name.starts_with('-')
+        {
+            path_overridden |= name == "PATH";
+            index += 1;
+            continue;
+        }
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        match base {
+            "env" => {
+                index += 1;
+                while index < tokens.len() && tokens[index].starts_with('-') {
+                    match tokens[index] {
+                        "-i" | "--ignore-environment" => {
+                            path_overridden = true;
+                            index += 1;
+                        }
+                        "-u" | "--unset" => {
+                            path_overridden |= tokens.get(index + 1).copied() == Some("PATH");
+                            index = index.saturating_add(2);
+                        }
+                        option if option == "--unset=PATH" => {
+                            path_overridden = true;
+                            index += 1;
+                        }
+                        _ => {
+                            // Unknown env options can alter command lookup. Treat
+                            // them as an unsafe PATH context if this segment later
+                            // resolves to a Podman run/create invocation.
+                            path_overridden = true;
+                            index += 1;
+                        }
+                    }
+                }
+            }
+            "command" => {
+                index += 1;
+                while index < tokens.len() && tokens[index].starts_with('-') {
+                    path_overridden = true;
+                    index += 1;
+                }
+            }
+            "exec" | "nohup" => index += 1,
+            "sudo" => {
+                sudo = true;
+                sudo_absolute = token.contains(['/', '\\']);
+                index += 1;
+                while index < tokens.len() && tokens[index].starts_with('-') {
+                    if !matches!(tokens[index], "-n" | "--non-interactive") {
+                        unsupported_sudo_option = true;
+                    }
+                    if matches!(tokens[index], "-u" | "--user" | "-g" | "--group") {
+                        index = index.saturating_add(2);
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if (index >= tokens.len()
+        || tokens[index]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(tokens[index])
+            != "podman")
+        && (path_overridden || unsupported_sudo_option)
+        && let Some(relative) = tokens[index.min(tokens.len())..]
+            .iter()
+            .position(|token| token.rsplit(['/', '\\']).next().unwrap_or(token) == "podman")
+    {
+        index = index.min(tokens.len()).saturating_add(relative);
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    let podman_token = tokens[index];
+    let podman_base = podman_token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(podman_token);
+    if podman_base != "podman" {
+        return None;
+    }
+    let args = &tokens[index + 1..];
+    let direct_subcommand = args.first().copied();
+    let directly_creates = matches!(direct_subcommand, Some("run" | "create"));
+    let nested_creates = matches!(
+        (args.first().copied(), args.get(1).copied()),
+        (Some("container"), Some("run" | "create"))
+    );
+    let later_creates = args.iter().any(|token| matches!(*token, "run" | "create"));
+    if !directly_creates && !nested_creates && !later_creates {
+        return None;
+    }
+    if !directly_creates {
+        return Some(
+            "run/create must be the direct Podman subcommand; global/container aliases bypass the cidfile wrapper",
+        );
+    }
+    if args
+        .iter()
+        .any(|token| token.contains(PODMAN_EXECUTION_LABEL_KEY))
+    {
+        return Some("the Bridge-owned Podman execution label may not be overridden");
+    }
+    if path_overridden {
+        return Some("PATH is overridden before Podman, which can bypass the Bridge wrapper");
+    }
+    if unsupported_sudo_option {
+        return Some("unsupported sudo options can bypass the Bridge sudo wrapper");
+    }
+    if sudo_absolute {
+        return Some("an absolute sudo path bypasses the Bridge sudo wrapper");
+    }
+    if !sudo && podman_token.contains(['/', '\\']) {
+        return Some("an absolute Podman path bypasses the Bridge podman wrapper");
+    }
+    None
+}
+
+fn podman_container_ids_from_cidfiles(directory: &Path) -> AppResult<Vec<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(PODMAN_CIDFILE_PREFIX) || !name.ends_with(".txt") {
+            continue;
+        }
+        let value = fs::read_to_string(entry.path())?;
+        let id = value.trim();
+        if (12..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            ids.insert(id.to_owned());
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn podman_container_ids_from_bytes(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|byte| *byte == b'\n' || *byte == b'\r')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .map(str::trim)
+        .filter(|id| {
+            (12..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+impl Drop for PodmanExecutionTracker {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.host_dir);
+    }
+}
+
 struct InteractiveSession {
     project_key: String,
     stdin: AsyncMutex<Option<ChildStdin>>,
@@ -284,6 +823,8 @@ struct InteractiveSession {
     /// in `ProcessRegistry::entries` for output replay after this permit is released.
     execution_capacity_permit: Mutex<Option<OwnedSemaphorePermit>>,
     process_permits: Mutex<Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>>,
+    podman_tracker: Mutex<Option<PodmanExecutionTracker>>,
+    podman_cleanup_requested: AtomicBool,
     cancellation: CancellationToken,
 }
 
@@ -412,6 +953,9 @@ impl InteractiveSession {
     }
 
     async fn signal(&self, signal: ProcessSignal) -> AppResult<()> {
+        if matches!(signal, ProcessSignal::Terminate | ProcessSignal::Kill) {
+            self.podman_cleanup_requested.store(true, Ordering::Release);
+        }
         if matches!(signal, ProcessSignal::Interrupt) && self.tty {
             self.write_input(vec![0x03]).await?;
         } else if let Err(error) = signal_tree(self.pid, signal)
@@ -596,7 +1140,11 @@ impl ProcessRegistry {
                 .min(config.exec_max_timeout.as_millis() as u64),
         );
         let workdir = config_path(project, args.workdir.as_deref())?;
-        let mut command = build_command_with_options(
+        let mut podman_tracker = PodmanExecutionTracker::prepare(config, project, &args.command)?;
+        let runtime_bind = podman_tracker
+            .as_ref()
+            .map(PodmanExecutionTracker::runtime_bind);
+        let (mut command, use_bwrap) = build_command_with_options_and_runtime_bind(
             config,
             project,
             &args.command,
@@ -605,7 +1153,11 @@ impl ProcessRegistry {
             &args.env,
             &workdir,
             args.shell.as_deref(),
+            runtime_bind,
         )?;
+        if let Some(tracker) = podman_tracker.as_mut() {
+            tracker.configure_command(&mut command, use_bwrap, &args.env);
+        }
         if args.tty {
             return self
                 .start_pty(
@@ -616,6 +1168,7 @@ impl ProcessRegistry {
                     registry_permit,
                     global_process_permit,
                     project_process_permit,
+                    podman_tracker,
                 )
                 .await;
         }
@@ -656,6 +1209,8 @@ impl ProcessRegistry {
             drains_finished: Notify::new(),
             execution_capacity_permit: Mutex::new(Some(registry_permit)),
             process_permits: Mutex::new(Some((global_process_permit, project_process_permit))),
+            podman_tracker: Mutex::new(podman_tracker),
+            podman_cleanup_requested: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
         });
         self.entries.insert(id.clone(), session.clone());
@@ -680,7 +1235,7 @@ impl ProcessRegistry {
         tasks.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _task = TaskGuard(tasks);
-            let (status, forced_reason, wait_error) = tokio::select! {
+            let (status, forced_reason, mut wait_error) = tokio::select! {
                 wait = child.wait() => match wait {
                     Ok(status) => (Some(status), None, None),
                     Err(error) => (None, None, Some(error.to_string())),
@@ -718,6 +1273,7 @@ impl ProcessRegistry {
                     }
                 }
             };
+            cleanup_podman_after_forced_exit(&waiter_session, forced_reason, &mut wait_error).await;
             // A child may exit before Tokio's pipe readers have consumed the final
             // kernel-buffered bytes. Do not publish completion (which makes the
             // registry eligible for removal) until both drains reach EOF. A
@@ -751,6 +1307,7 @@ impl ProcessRegistry {
         registry_permit: OwnedSemaphorePermit,
         global_process_permit: OwnedSemaphorePermit,
         project_process_permit: OwnedSemaphorePermit,
+        podman_tracker: Option<PodmanExecutionTracker>,
     ) -> AppResult<(String, Arc<InteractiveSession>)> {
         let (rows, cols) = terminal_dimensions(args.rows, args.cols)?;
         let pty =
@@ -788,6 +1345,8 @@ impl ProcessRegistry {
             drains_finished: Notify::new(),
             execution_capacity_permit: Mutex::new(Some(registry_permit)),
             process_permits: Mutex::new(Some((global_process_permit, project_process_permit))),
+            podman_tracker: Mutex::new(podman_tracker),
+            podman_cleanup_requested: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
         });
         self.entries.insert(id.clone(), session.clone());
@@ -805,7 +1364,7 @@ impl ProcessRegistry {
         tokio::spawn(async move {
             let _task = TaskGuard(tasks);
             let mut wait = tokio::task::spawn_blocking(move || wait_pty_process(child, pid));
-            let (status, forced_reason, wait_error) = tokio::select! {
+            let (status, forced_reason, mut wait_error) = tokio::select! {
                 result = &mut wait => match result {
                     Ok(Ok(status)) => (Some(status), None, None),
                     Ok(Err(error)) => (None, None, Some(error.to_string())),
@@ -857,6 +1416,7 @@ impl ProcessRegistry {
                     }
                 }
             };
+            cleanup_podman_after_forced_exit(&waiter_session, forced_reason, &mut wait_error).await;
             waiter_session.close_pty_handles_after_exit().await;
             wait_for_drains(&waiter_session, Duration::from_secs(5)).await;
             if let Ok(mut finished_at) = waiter_session.finished_at.lock() {
@@ -1018,6 +1578,42 @@ async fn wait_for_drains(session: &InteractiveSession, maximum: Duration) -> boo
     tokio::time::timeout(maximum, wait).await.is_ok()
 }
 
+async fn cleanup_podman_after_forced_exit(
+    session: &InteractiveSession,
+    forced_reason: Option<CompletionReason>,
+    wait_error: &mut Option<String>,
+) {
+    let explicit_cleanup = session
+        .podman_cleanup_requested
+        .swap(false, Ordering::AcqRel);
+    let tracker = session
+        .podman_tracker
+        .lock()
+        .ok()
+        .and_then(|mut tracker| tracker.take());
+    let Some(tracker) = tracker else {
+        return;
+    };
+    if !explicit_cleanup
+        && !matches!(
+            forced_reason,
+            Some(CompletionReason::TimedOut | CompletionReason::Cancelled)
+        )
+    {
+        return;
+    }
+    if let Err(error) = tracker.cleanup().await {
+        let cleanup_error = error.message().to_owned();
+        match wait_error {
+            Some(existing) => {
+                existing.push_str("; ");
+                existing.push_str(&cleanup_error);
+            }
+            None => *wait_error = Some(cleanup_error),
+        }
+    }
+}
+
 struct TaskGuard(Arc<AtomicUsize>);
 
 impl Drop for TaskGuard {
@@ -1127,12 +1723,13 @@ async fn yield_result(
             break;
         }
     }
+    let completion = session.completion();
+    let finished = completion.is_some();
     let (output, output_offset, output_next_offset, byte_truncated) = session
         .output
         .lock()
-        .map(|mut output| output.render_window(since_output_offset))
+        .map(|mut output| output.render_window(since_output_offset, finished))
         .unwrap_or_else(|_| (String::new(), 0, 0, false));
-    let completion = session.completion();
     let exit_code = completion.as_ref().and_then(|value| value.exit_code);
     let completion_reason = completion
         .as_ref()
@@ -1144,7 +1741,6 @@ async fn yield_result(
         .lock()
         .ok()
         .and_then(|value| value.map(ProcessSignal::as_str));
-    let finished = completion.is_some();
     let (output, original_token_count) = token_window(output, max_output_tokens);
     let response_truncated = byte_truncated || original_token_count.is_some();
     if finished && response_truncated {
@@ -1406,6 +2002,7 @@ mod tests {
                 registry_permit,
                 global_permit,
                 project_permit,
+                None,
             )
             .await
             .unwrap();
@@ -1496,7 +2093,7 @@ mod tests {
             cols: Some(80),
             extensions: BTreeMap::new(),
         };
-        let command = build_command_with_options(
+        let command = crate::sandbox::build_command_with_options(
             &config,
             &project,
             &args.command,
@@ -1521,6 +2118,7 @@ mod tests {
                 registry_permit,
                 global_permit,
                 project_permit,
+                None,
             )
             .await
             .unwrap();
@@ -1551,7 +2149,7 @@ mod tests {
         let completion = session.completion().expect("ConPTY completion");
         assert_eq!(completion.reason, CompletionReason::Exited);
         assert_eq!(completion.exit_code, Some(0));
-        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
         assert!(output.contains("codexbridge-conpty-cmd"), "{output:?}");
     }
 
@@ -1608,8 +2206,474 @@ mod tests {
             drains_finished: Notify::new(),
             execution_capacity_permit: Mutex::new(None),
             process_permits: Mutex::new(None),
+            podman_tracker: Mutex::new(None),
+            podman_cleanup_requested: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn podman_tracker_prepares_cidfile_wrappers() {
+        use crate::{config::ConfigBuilder, project::ProjectKey, request_context::TransportMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let project_root = directory.path().join("project");
+        let metadata_root = directory.path().join("metadata");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(metadata_root.join("tmp")).unwrap();
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root,
+            metadata_root,
+            transport_mode: TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+
+        let tracker = PodmanExecutionTracker::prepare(
+            &config,
+            &project,
+            "sudo -n podman run --rm alpine true",
+        )
+        .unwrap()
+        .expect("Podman command should allocate an execution tracker");
+        let host_dir = tracker.host_dir.clone();
+        assert!(
+            std::fs::read_to_string(host_dir.join("podman"))
+                .unwrap()
+                .contains("--cidfile \"$track/cid.$$.txt\""),
+        );
+        assert!(
+            std::fs::read_to_string(host_dir.join("podman"))
+                .unwrap()
+                .contains("--label \"$label\""),
+        );
+        assert!(
+            std::fs::read_to_string(host_dir.join("sudo"))
+                .unwrap()
+                .contains("--cidfile \"$cidfile\""),
+        );
+        let sudo_wrapper = std::fs::read_to_string(host_dir.join("sudo")).unwrap();
+        assert!(
+            sudo_wrapper.contains("CONTAINER_HOST=$container_host"),
+            "sudo wrapper must preserve the effective Podman daemon context"
+        );
+        assert!(
+            sudo_wrapper.contains("DOCKER_HOST=$docker_host"),
+            "sudo wrapper must preserve the effective Docker-compatible daemon context"
+        );
+        assert_eq!(tracker.cleanup_modes.len(), 1);
+        assert!(matches!(tracker.cleanup_modes[0], PodmanCleanupMode::Sudo));
+        drop(tracker);
+        assert!(
+            !host_dir.exists(),
+            "tracker temp directory leaked after drop"
+        );
+    }
+
+    #[test]
+    fn podman_tracking_rejects_wrapper_bypass_forms_but_accepts_managed_forms() {
+        for command in [
+            "podman run --rm alpine true",
+            "podman create alpine true",
+            "sudo -n podman run --rm alpine true",
+            "sudo --non-interactive /usr/bin/podman create alpine true",
+            "env FOO=1 podman run --rm alpine true",
+            "podman run --cidfile /tmp/user.cid alpine true",
+            "podman run --cidfile=/tmp/user.cid alpine true",
+        ] {
+            assert!(
+                validate_podman_tracking_command(command).is_ok(),
+                "managed form rejected: {command}"
+            );
+        }
+        for command in [
+            "/usr/bin/podman run --rm alpine true",
+            "PATH=/usr/bin podman run --rm alpine true",
+            "env PATH=/usr/bin podman run --rm alpine true",
+            "env -i podman run --rm alpine true",
+            "env -u PATH podman run --rm alpine true",
+            "command -p podman run --rm alpine true",
+            "/usr/bin/sudo -n podman run --rm alpine true",
+            "sudo -E podman run --rm alpine true",
+            "sudo -u root podman run --rm alpine true",
+            "podman --remote run --rm alpine true",
+            "podman container run --rm alpine true",
+            "podman run --label io.codexbridge.execution=spoof alpine true",
+        ] {
+            let error = match validate_podman_tracking_command(command) {
+                Ok(()) => panic!("unsafe form accepted: {command}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "INVALID_INPUT", "{command}");
+        }
+    }
+
+    #[test]
+    fn podman_cleanup_context_preserves_effective_daemon_overrides() {
+        let configured = "unix:///run/user/configured.sock".to_owned();
+        let override_host = "tcp://127.0.0.1:18888".to_owned();
+        assert_eq!(
+            cleanup_podman_host(Some(&override_host), Some(&configured), false).as_deref(),
+            Some("tcp://127.0.0.1:18888")
+        );
+        assert_eq!(
+            cleanup_podman_host(None, Some(&configured), false).as_deref(),
+            Some("unix:///run/user/configured.sock")
+        );
+        let sandbox_socket = "unix:///run/podman.sock".to_owned();
+        assert_eq!(
+            cleanup_podman_host(Some(&sandbox_socket), Some(&configured), true).as_deref(),
+            Some("unix:///run/user/configured.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_terminate_or_kill_requests_owned_podman_cleanup() {
+        for signal in [ProcessSignal::Terminate, ProcessSignal::Kill] {
+            let session = test_session(None);
+            let root = tempfile::tempdir().unwrap();
+            let host_dir = root.path().join(format!("tracker-{}", signal.as_str()));
+            std::fs::create_dir(&host_dir).unwrap();
+            *session.podman_tracker.lock().unwrap() = Some(PodmanExecutionTracker {
+                host_dir: host_dir.clone(),
+                sandbox_dir: PathBuf::from("/run/unused"),
+                cleanup_modes: Vec::new(),
+                execution_label: format!("{PODMAN_EXECUTION_LABEL_KEY}=test"),
+                configured_host: None,
+                container_host: None,
+                docker_host: None,
+            });
+            session
+                .podman_cleanup_requested
+                .store(true, Ordering::Release);
+            let mut wait_error = None;
+            cleanup_podman_after_forced_exit(&session, None, &mut wait_error).await;
+            assert!(wait_error.is_none());
+            assert!(session.podman_tracker.lock().unwrap().is_none());
+            assert!(
+                !host_dir.exists(),
+                "tracker survived {} cleanup",
+                signal.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn podman_cleanup_reads_only_valid_execution_cidfiles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("cid.10.txt"), "0123456789abcdef\n").unwrap();
+        std::fs::write(directory.path().join("cid.11.txt"), "fedcba9876543210\n").unwrap();
+        std::fs::write(directory.path().join("cid.12.txt"), "not-a-container-id\n").unwrap();
+        std::fs::write(directory.path().join("other.txt"), "aaaaaaaaaaaa\n").unwrap();
+        assert_eq!(
+            podman_container_ids_from_cidfiles(directory.path()).unwrap(),
+            ["0123456789abcdef".to_owned(), "fedcba9876543210".to_owned()]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn podman_container_ids(config: &crate::config::Config, name: &str) -> String {
+        let mut command = TokioCommand::new("podman");
+        command.args(["ps", "-aq", "--filter", &format!("name=^{name}$")]);
+        if let Some(socket) = config.container_socket.as_ref() {
+            command.env("CONTAINER_HOST", format!("unix://{}", socket.display()));
+        }
+        let output = command.output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a live Podman daemon; run explicitly with CODEXBRIDGE_PODMAN_TIMEOUT_PROBE=1"]
+    async fn regression_podman_timeout_and_cancel_remove_daemon_managed_containers() {
+        if std::env::var_os("CODEXBRIDGE_PODMAN_TIMEOUT_PROBE").is_none() {
+            return;
+        }
+        use crate::{config::ConfigBuilder, project::ProjectKey, request_context::TransportMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let project_root = workspace.join("effective");
+        let metadata_root = workspace.join(".metadata/projects/effective");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(metadata_root.join("tmp")).unwrap();
+        let socket = std::env::var("CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET")
+            .unwrap_or_else(|_| "/run/podman/podman.sock".to_owned());
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+            ("MCP_CONTAINER_SOCKET".to_owned(), socket),
+            ("EXEC_DEFAULT_TIMEOUT_MS".to_owned(), "5000".to_owned()),
+            ("EXEC_MAX_TIMEOUT_MS".to_owned(), "5000".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root,
+            metadata_root,
+            transport_mode: TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let name = format!("tmp-codexbridge-timeout-{}", Uuid::now_v7().simple());
+        let image = std::env::var("CODEXBRIDGE_PODMAN_TEST_IMAGE")
+            .unwrap_or_else(|_| "docker.io/library/alpine:latest".to_owned());
+        let args = ExecCommandArgs {
+            command: format!("podman run --rm --name {name} {image} sleep 30"),
+            workdir: None,
+            shell: None,
+            timeout_ms: Some(500),
+            yield_time_ms: Some(250),
+            env: BTreeMap::new(),
+            max_output_tokens: None,
+            stdin: None,
+            close_stdin: false,
+            tty: false,
+            rows: None,
+            cols: None,
+            extensions: BTreeMap::new(),
+        };
+        let registry = ProcessRegistry::new(4, Duration::from_secs(60), 4096);
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, session) = registry
+            .start(&config, &project, &args, global_permit, project_permit)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !session.is_finished() {
+                session.changed.notified().await;
+            }
+        })
+        .await
+        .expect("timed-out Podman session never published completion");
+        assert_eq!(
+            session.completion().unwrap().reason,
+            CompletionReason::TimedOut
+        );
+
+        assert!(
+            podman_container_ids(&config, &name).await.is_empty(),
+            "daemon-managed container survived bridge timeout: {name}"
+        );
+
+        let cancel_name = format!("tmp-codexbridge-cancel-{}", Uuid::now_v7().simple());
+        let cancel_args = ExecCommandArgs {
+            command: format!("podman run --rm --name {cancel_name} {image} sleep 30"),
+            timeout_ms: Some(5_000),
+            ..args
+        };
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, cancel_session) = registry
+            .start(
+                &config,
+                &project,
+                &cancel_args,
+                global_permit,
+                project_permit,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while podman_container_ids(&config, &cancel_name).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Podman cancel probe container was never created");
+        cancel_session.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !cancel_session.is_finished() {
+                cancel_session.changed.notified().await;
+            }
+        })
+        .await
+        .expect("cancelled Podman session never published completion");
+        assert_eq!(
+            cancel_session.completion().unwrap().reason,
+            CompletionReason::Cancelled
+        );
+        assert!(
+            podman_container_ids(&config, &cancel_name).await.is_empty(),
+            "daemon-managed container survived bridge cancellation: {cancel_name}"
+        );
+
+        let terminate_name = format!("tmp-codexbridge-terminate-{}", Uuid::now_v7().simple());
+        let terminate_args = ExecCommandArgs {
+            command: format!("podman run --rm --name {terminate_name} {image} sleep 30"),
+            timeout_ms: Some(5_000),
+            ..cancel_args
+        };
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, terminate_session) = registry
+            .start(
+                &config,
+                &project,
+                &terminate_args,
+                global_permit,
+                project_permit,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while podman_container_ids(&config, &terminate_name)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Podman terminate probe container was never created");
+        terminate_session
+            .signal(ProcessSignal::Terminate)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !terminate_session.is_finished() {
+                terminate_session.changed.notified().await;
+            }
+        })
+        .await
+        .expect("terminated Podman session never published completion");
+        assert!(
+            podman_container_ids(&config, &terminate_name)
+                .await
+                .is_empty(),
+            "daemon-managed container survived explicit terminate: {terminate_name}"
+        );
+
+        let shutdown_name = format!("tmp-codexbridge-shutdown-{}", Uuid::now_v7().simple());
+        let shutdown_args = ExecCommandArgs {
+            command: format!("podman run --rm --name {shutdown_name} {image} sleep 30"),
+            timeout_ms: Some(5_000),
+            ..terminate_args
+        };
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, _shutdown_session) = registry
+            .start(
+                &config,
+                &project,
+                &shutdown_args,
+                global_permit,
+                project_permit,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while podman_container_ids(&config, &shutdown_name)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Podman shutdown probe container was never created");
+        let (_, remaining) = registry.shutdown_and_wait(Duration::from_millis(500)).await;
+        assert_eq!(remaining, 0, "shutdown left active process sessions");
+        assert!(
+            podman_container_ids(&config, &shutdown_name)
+                .await
+                .is_empty(),
+            "daemon-managed container survived graceful registry shutdown: {shutdown_name}"
+        );
+
+        let user_cid_name = format!("tmp-codexbridge-usercid-{}", Uuid::now_v7().simple());
+        let user_cid = directory.path().join("user-provided.cid");
+        let user_cid_args = ExecCommandArgs {
+            command: format!(
+                "podman run --rm --cidfile {} --name {user_cid_name} {image} sleep 30",
+                user_cid.display()
+            ),
+            workdir: None,
+            shell: None,
+            timeout_ms: Some(500),
+            yield_time_ms: Some(250),
+            env: BTreeMap::new(),
+            max_output_tokens: None,
+            stdin: None,
+            close_stdin: false,
+            tty: false,
+            rows: None,
+            cols: None,
+            extensions: BTreeMap::new(),
+        };
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, user_cid_session) = registry
+            .start(
+                &config,
+                &project,
+                &user_cid_args,
+                global_permit,
+                project_permit,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !user_cid_session.is_finished() {
+                user_cid_session.changed.notified().await;
+            }
+        })
+        .await
+        .expect("user-cidfile Podman session never published completion");
+        assert_eq!(
+            user_cid_session.completion().unwrap().reason,
+            CompletionReason::TimedOut
+        );
+        assert!(user_cid.exists(), "Podman did not honor the user cidfile");
+        assert!(
+            podman_container_ids(&config, &user_cid_name)
+                .await
+                .is_empty(),
+            "label-based cleanup failed when no Bridge-owned cidfile was injected: {user_cid_name}"
+        );
+        if std::env::var_os("CODEXBRIDGE_PODMAN_SUDO_PROBE").is_some() {
+            let sudo_name = format!("tmp-codexbridge-sudo-{}", Uuid::now_v7().simple());
+            let sudo_args = ExecCommandArgs {
+                command: format!("sudo -n podman run --rm --name {sudo_name} {image} sleep 30"),
+                timeout_ms: Some(500),
+                ..user_cid_args
+            };
+            let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+            let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+            let (_id, sudo_session) = registry
+                .start(&config, &project, &sudo_args, global_permit, project_permit)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !sudo_session.is_finished() {
+                    sudo_session.changed.notified().await;
+                }
+            })
+            .await
+            .expect("sudo Podman session never published completion");
+            assert_eq!(
+                sudo_session.completion().unwrap().reason,
+                CompletionReason::TimedOut
+            );
+            assert!(
+                podman_container_ids(&config, &sudo_name).await.is_empty(),
+                "sudo Podman workload survived timeout or used a mismatched daemon context: {sudo_name}"
+            );
+        }
     }
 
     #[test]
@@ -1722,7 +2786,7 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         buffer.append(b"12345", 6);
         buffer.append(b"67890", 6);
-        let (output, start, next, truncated) = buffer.render_window(None);
+        let (output, start, next, truncated) = buffer.render_window(None, true);
         assert!(output.starts_with("123"));
         assert!(output.ends_with("890"));
         assert!(output.contains("bytes omitted"));
@@ -1731,7 +2795,7 @@ mod tests {
         assert_eq!((start, next), (0, 10));
         assert!(truncated);
         // Rendering is non-destructive: the same cursor replays the window.
-        let (replayed, replay_start, replay_next, _) = buffer.render_window(Some(0));
+        let (replayed, replay_start, replay_next, _) = buffer.render_window(Some(0), true);
         assert_eq!(replayed, output);
         assert_eq!((replay_start, replay_next), (start, next));
     }
@@ -1746,7 +2810,7 @@ mod tests {
         // retained bytes are 0..3 (`123`) and 7..10 (`890`). A replay from 6
         // must therefore disclose one omitted byte and resume at byte 7. It
         // must never map the cursor back into the retained head.
-        let (output, start, next, truncated) = buffer.render_window(Some(6));
+        let (output, start, next, truncated) = buffer.render_window(Some(6), true);
         assert_eq!(start, 7);
         assert_eq!(next, 10);
         assert!(truncated);
@@ -1811,7 +2875,7 @@ mod tests {
 
         spawn_drain(reader, session.clone(), 1024, "[stderr] ", tasks);
         assert!(wait_for_drains(&session, Duration::from_secs(1)).await);
-        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
 
         assert_eq!(output, "[stderr] error at src/main.rs:10: boom\n");
     }
@@ -1821,12 +2885,12 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         buffer.append(b"hello", 16);
         buffer.append(b" world", 16);
-        let (first, _, next, truncated) = buffer.render_window(None);
+        let (first, _, next, truncated) = buffer.render_window(None, true);
         assert_eq!(first, "hello world");
         assert_eq!(next, 11);
         assert!(!truncated);
         buffer.append(b" again", 16);
-        let (second, start, next, _) = buffer.render_window(None);
+        let (second, start, next, _) = buffer.render_window(None, true);
         assert_eq!((second, start, next), (" again".to_owned(), 11, 17));
     }
 
@@ -1834,7 +2898,7 @@ mod tests {
     fn zero_byte_output_limit_retains_nothing_but_reports_omission() {
         let mut buffer = OutputBuffer::default();
         buffer.append(b"abcdef", 0);
-        let (output, _, next, truncated) = buffer.render_window(None);
+        let (output, _, next, truncated) = buffer.render_window(None, true);
         assert_eq!(next, 6);
         assert!(truncated);
         assert!(output.contains("6 buffered bytes omitted"));
@@ -2107,6 +3171,8 @@ mod tests {
             drains_finished: Notify::new(),
             execution_capacity_permit: Mutex::new(None),
             process_permits: Mutex::new(None),
+            podman_tracker: Mutex::new(None),
+            podman_cleanup_requested: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
         });
         let tasks = Arc::new(AtomicUsize::new(0));
@@ -2115,7 +3181,8 @@ mod tests {
         drop(writer);
 
         assert!(wait_for_drains(&session, Duration::from_secs(1)).await);
-        let (output, _, bytes, truncated) = session.output.lock().unwrap().render_window(None);
+        let (output, _, bytes, truncated) =
+            session.output.lock().unwrap().render_window(None, true);
         assert_eq!(output, "the-final-tail");
         assert_eq!(bytes, 14);
         assert!(!truncated);
@@ -2240,7 +3307,7 @@ mod tests {
     fn output_buffer_replaces_invalid_utf8_without_losing_byte_accounting() {
         let mut buffer = OutputBuffer::default();
         buffer.append(&[b'a', 0xff, b'b'], 16);
-        let (output, _, bytes, truncated) = buffer.render_window(None);
+        let (output, _, bytes, truncated) = buffer.render_window(None, true);
         assert_eq!(bytes, 3);
         assert!(!truncated);
         assert!(output.starts_with('a'));
@@ -2340,7 +3407,7 @@ mod tests {
         for _ in 0..10 {
             buffer.append(&[b'x'; 1024], 4096);
         }
-        let (text, start, next, truncated) = buffer.render_window(Some(0));
+        let (text, start, next, truncated) = buffer.render_window(Some(0), true);
         // Cursor zero is truthful because the retained head still starts at
         // logical byte zero. The discontinuity is represented explicitly by
         // the omission marker before the retained tail.
@@ -2355,7 +3422,7 @@ mod tests {
     fn cursor_beyond_total_bytes_clamps_to_current_end() {
         let mut buffer = OutputBuffer::default();
         buffer.append(b"hello", 64);
-        let (text, start, next, _) = buffer.render_window(Some(999_999));
+        let (text, start, next, _) = buffer.render_window(Some(999_999), true);
         assert_eq!((start, next), (5, 5));
         assert_eq!(text, "");
     }
@@ -2364,12 +3431,12 @@ mod tests {
     fn render_window_is_idempotent_for_the_same_explicit_cursor() {
         let mut buffer = OutputBuffer::default();
         buffer.append(b"stable", 64);
-        let first = buffer.render_window(Some(2));
-        let second = buffer.render_window(Some(2));
+        let first = buffer.render_window(Some(2), true);
+        let second = buffer.render_window(Some(2), true);
         assert_eq!(first, second);
         // Explicit-cursor renders still mark the stream delivered to its end,
         // so the next default render has nothing new to emit.
-        let advanced = buffer.render_window(None);
+        let advanced = buffer.render_window(None, true);
         assert_eq!((advanced.1, advanced.2), (6, 6));
         assert_eq!(advanced.0, "");
     }
@@ -2381,16 +3448,16 @@ mod tests {
         // caller has already seen — including bytes re-shown during replay.
         let mut buffer = OutputBuffer::default();
         buffer.append(b"alpha", 64);
-        let first = buffer.render_window(None);
+        let first = buffer.render_window(None, true);
         assert_eq!((first.1, first.2), (0, 5));
         buffer.append(b"beta", 64);
-        let second = buffer.render_window(None);
+        let second = buffer.render_window(None, true);
         assert_eq!((second.1, second.2), (5, 9));
         // Lost-response recovery replays from byte 0.
-        let replay = buffer.render_window(Some(0));
+        let replay = buffer.render_window(Some(0), true);
         assert_eq!(replay.0, "alphabeta");
         // Default poll after recovery: nothing new, nothing duplicated.
-        let next = buffer.render_window(None);
+        let next = buffer.render_window(None, true);
         assert_eq!(next.0, "");
         assert_eq!((next.1, next.2), (9, 9));
     }
@@ -2400,10 +3467,110 @@ mod tests {
         let mut buffer = OutputBuffer::default();
         buffer.append("alphaβ".as_bytes(), 64);
         buffer.append("γomega".as_bytes(), 64);
-        let (text, _, _, _) = buffer.render_window(None);
+        let (text, _, _, _) = buffer.render_window(None, true);
         assert!(text.contains("alphaβ"));
         assert!(text.contains("γomega"));
         assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn regression_streaming_poll_waits_for_split_utf8_codepoint() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append(&[0xF0], 64);
+
+        let first = buffer.render_window(None, false);
+        assert_eq!(first.0, "");
+        assert_eq!((first.1, first.2), (0, 0));
+        assert_eq!(buffer.delivered, 0);
+
+        buffer.append(&[0x9F, 0x99, 0x82], 64);
+        let second = buffer.render_window(None, false);
+        assert_eq!(second.0, "🙂");
+        assert_eq!((second.1, second.2), (0, 4));
+        assert_eq!(buffer.delivered, 4);
+        assert!(!second.0.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn bounded_retention_never_cuts_valid_utf8_scalars() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append("🙂".as_bytes(), 6);
+        buffer.append("🙂".as_bytes(), 6);
+
+        let (text, _, next, truncated) = buffer.render_window(Some(0), true);
+        assert_eq!(next, 8);
+        assert!(truncated);
+        assert!(!text.contains('\u{fffd}'), "{text:?}");
+        assert!(
+            text.contains('🙂'),
+            "complete retained scalar missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn podman_cleanup_parses_only_valid_labeled_container_ids() {
+        assert_eq!(
+            podman_container_ids_from_bytes(
+                b"0123456789abcdef\nnot-an-id\r\nfedcba9876543210\n0123456789abcdef\n"
+            ),
+            ["0123456789abcdef".to_owned(), "fedcba9876543210".to_owned()]
+        );
+    }
+
+    #[test]
+    fn valid_utf8_never_gains_replacement_chars_across_small_retention_limits() {
+        let source = "a🙂β界z🙂";
+        for limit in 1..=24 {
+            let mut buffer = OutputBuffer::default();
+            for byte in source.as_bytes() {
+                buffer.append(std::slice::from_ref(byte), limit);
+                assert!(buffer.retained.len() <= limit, "limit={limit}");
+            }
+            let (text, _, next, truncated) = buffer.render_window(Some(0), true);
+            assert_eq!(next, source.len(), "limit={limit}");
+            assert_eq!(truncated, source.len() > limit, "limit={limit}");
+            assert!(
+                !text.contains('\u{fffd}'),
+                "valid UTF-8 gained a replacement character at limit={limit}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_cursor_inside_valid_utf8_scalar_advances_with_disclosure() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append("a🙂b".as_bytes(), 64);
+
+        let (text, start, next, truncated) = buffer.render_window(Some(2), true);
+        assert_eq!(start, 5);
+        assert_eq!(next, 6);
+        assert!(!truncated);
+        assert!(text.contains("3 UTF-8 boundary bytes omitted"), "{text:?}");
+        assert!(text.ends_with('b'), "{text:?}");
+        assert!(!text.contains('\u{fffd}'), "{text:?}");
+    }
+
+    #[test]
+    fn token_window_never_splits_utf16_surrogate_pairs() {
+        let (text, original) = token_window("a🙂bc🙂d".to_owned(), Some(1));
+        assert_eq!(original, Some(2));
+        assert!(!text.contains('\u{fffd}'), "{text:?}");
+        assert!(text.starts_with('a'), "{text:?}");
+        assert!(text.ends_with('d'), "{text:?}");
+        assert!(text.contains("UTF-16 code units omitted"), "{text:?}");
+    }
+
+    #[test]
+    fn finished_stream_flushes_incomplete_utf8_as_replacement() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append(&[0xF0], 64);
+
+        let running = buffer.render_window(None, false);
+        assert_eq!((running.0.as_str(), running.2), ("", 0));
+
+        let finished = buffer.render_window(None, true);
+        assert_eq!(finished.0, "�");
+        assert_eq!(finished.2, 1);
     }
 
     fn omitted_marker_bytes(text: &str) -> usize {

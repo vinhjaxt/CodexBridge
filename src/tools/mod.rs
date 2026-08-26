@@ -1287,6 +1287,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fresh_chat_joining_existing_project_receives_remembered_memory_in_state_snapshot() {
+        use crate::{
+            project::ProjectResolver,
+            request_context::{RequestIdentity, TransportMode},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver =
+            ProjectResolver::new(directory.path().join("workspace"), storage.clone()).unwrap();
+        let identity = |subject: &str, conversation: &str| RequestIdentity {
+            openai_subject: subject.to_owned(),
+            openai_conversation_id: conversation.to_owned(),
+            mcp_session_id: None,
+            transport_mode: TransportMode::Stateless,
+        };
+        let owner = resolver
+            .initialize(&identity("user-a", "chat-a"), Some("shared-project"))
+            .unwrap()
+            .0;
+        storage
+            .memory_set(
+                owner.effective_project_key.as_str(),
+                "architecture/decision",
+                "reuse-the-existing-state",
+            )
+            .unwrap();
+        let joiner = resolver
+            .initialize(&identity("user-b", "chat-b"), Some("shared-project"))
+            .unwrap()
+            .0;
+
+        assert_ne!(owner.native_project_key, joiner.native_project_key);
+        assert_eq!(owner.effective_project_key, joiner.effective_project_key);
+        let (_, snapshot) = project_state_snapshot(&storage, &joiner).unwrap();
+        let snapshot = snapshot.expect("remembered project memory must produce a state handoff");
+        assert!(snapshot.contains("architecture/decision"), "{snapshot}");
+        assert!(snapshot.contains("reuse-the-existing-state"), "{snapshot}");
+    }
+
     #[tokio::test]
     async fn regression_instruction_hash_matches_exact_instruction_context_used_for_brief() {
         use std::collections::BTreeMap;

@@ -112,6 +112,114 @@ fn conversations_joining_one_alias_share_effective_state_but_not_native_identity
 }
 
 #[test]
+fn fresh_conversation_joining_existing_project_key_reuses_existing_folder_and_memory() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
+    let workspace = temp.path().join("workspace");
+    let resolver = ProjectResolver::new(workspace.clone(), storage.clone()).unwrap();
+
+    let owner = resolver
+        .initialize(&identity("owner", "conversation-a"), Some("shared-folder"))
+        .unwrap()
+        .0;
+    let expected_project_root = workspace.canonicalize().unwrap().join("shared-folder");
+    assert_eq!(owner.project_root, expected_project_root);
+    assert!(owner.project_root.is_dir());
+    std::fs::write(
+        owner.project_root.join("checkout-marker.txt"),
+        "existing checkout",
+    )
+    .unwrap();
+    storage
+        .memory_set(
+            owner.effective_project_key.as_str(),
+            "architecture/decision",
+            "reuse existing project memory",
+        )
+        .unwrap();
+
+    let prepared = resolver
+        .prepare_initialize(&identity("joiner", "conversation-b"), Some("shared-folder"))
+        .unwrap();
+    assert!(prepared.joined);
+    assert!(!prepared.reused_existing_binding);
+    assert_eq!(
+        prepared.project.effective_project_key,
+        owner.effective_project_key
+    );
+    assert_eq!(prepared.project.project_root, expected_project_root);
+    resolver.commit_initialize(&prepared).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(prepared.project.project_root.join("checkout-marker.txt")).unwrap(),
+        "existing checkout"
+    );
+    assert_eq!(
+        storage
+            .memory_get(
+                prepared.project.effective_project_key.as_str(),
+                "architecture/decision",
+            )
+            .unwrap()
+            .as_deref(),
+        Some("reuse existing project memory")
+    );
+}
+
+#[test]
+fn preexisting_directory_without_alias_is_not_treated_as_existing_project_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
+    let workspace = temp.path().join("workspace");
+    let resolver = ProjectResolver::new(workspace.clone(), storage.clone()).unwrap();
+    let existing_folder = workspace.canonicalize().unwrap().join("directory-only");
+    std::fs::create_dir(&existing_folder).unwrap();
+    std::fs::write(
+        existing_folder.join("checkout-marker.txt"),
+        "preexisting folder",
+    )
+    .unwrap();
+
+    assert_eq!(storage.effective_for_alias("directory-only").unwrap(), None);
+
+    let prepared = resolver
+        .prepare_initialize(
+            &identity("user", "fresh-conversation"),
+            Some("directory-only"),
+        )
+        .unwrap();
+    assert!(!prepared.joined);
+    assert!(!prepared.reused_existing_binding);
+    assert_eq!(
+        prepared.project.effective_project_key.as_str(),
+        "directory-only"
+    );
+    assert_eq!(prepared.project.project_root, existing_folder);
+    resolver.commit_initialize(&prepared).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(prepared.project.project_root.join("checkout-marker.txt")).unwrap(),
+        "preexisting folder"
+    );
+    assert_eq!(
+        storage
+            .effective_for_alias("directory-only")
+            .unwrap()
+            .as_deref(),
+        Some("directory-only")
+    );
+    assert_eq!(
+        storage
+            .memory_get(
+                prepared.project.effective_project_key.as_str(),
+                "architecture/decision",
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn unrelated_effective_projects_keep_memory_isolated() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();

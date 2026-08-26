@@ -26,6 +26,12 @@ use crate::{
 };
 
 const PROJECT_ACTIVITY_MAX_ENTRIES: usize = 4096;
+const CONSOLE_EXCERPT_CHARS: usize = 500;
+const CONSOLE_EXCERPT_EDGE_CHARS: usize = 250;
+const CONSOLE_PRETTY_ARRAY_ITEMS: usize = 128;
+const CONSOLE_PLAN_BODY_CHARS: usize = 450;
+const CONSOLE_PLAN_STEP_CHARS: usize = 48;
+const CONSOLE_PLAN_STEP_EDGE_CHARS: usize = 24;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunningTool {
@@ -276,8 +282,670 @@ fn console_color(value: &str, color: &str) -> String {
     format!("{color}{value}{ANSI_RESET}")
 }
 
-fn console_project(event: &Value) -> &str {
-    event
+fn console_safe_inline(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            '\0' => safe.push_str("\\0"),
+            '\u{1b}' => safe.push_str("\\x1b"),
+            character if character.is_control() => {
+                safe.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+            character => safe.push(character),
+        }
+    }
+    safe
+}
+
+fn console_excerpt(value: &str) -> String {
+    console_excerpt_edges(value, CONSOLE_EXCERPT_CHARS, CONSOLE_EXCERPT_EDGE_CHARS)
+}
+
+fn console_excerpt_edges(value: &str, maximum: usize, edge: usize) -> String {
+    if value.chars().nth(maximum).is_none() {
+        return value.to_owned();
+    }
+
+    let head: String = value.chars().take(edge).collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(edge)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
+fn console_text(value: &str) -> String {
+    let bounded = console_excerpt(value);
+    console_excerpt(&console_safe_inline(&bounded))
+}
+
+fn console_redacted_excerpt(value: &str, auth_token: &str) -> String {
+    if value.chars().nth(CONSOLE_EXCERPT_CHARS).is_none() {
+        return if auth_token.is_empty() {
+            value.to_owned()
+        } else {
+            value.replace(auth_token, "[REDACTED]")
+        };
+    }
+
+    let overlap = auth_token.chars().count();
+    let edge = CONSOLE_EXCERPT_EDGE_CHARS.saturating_add(overlap);
+    let head = value.chars().take(edge).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(edge)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    let head = if auth_token.is_empty() {
+        head
+    } else {
+        head.replace(auth_token, "[REDACTED]")
+    };
+    let tail = if auth_token.is_empty() {
+        tail
+    } else {
+        tail.replace(auth_token, "[REDACTED]")
+    };
+    console_excerpt(&format!("{head}...{tail}"))
+}
+
+fn console_scrub_pretty(value: &Value, auth_token: &str) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if is_sensitive_key(key) {
+                        (key.clone(), Value::String("[REDACTED]".to_owned()))
+                    } else {
+                        (key.clone(), console_scrub_pretty(value, auth_token))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(array) => {
+            let shown = array.len().min(CONSOLE_PRETTY_ARRAY_ITEMS);
+            let mut values = array
+                .iter()
+                .take(shown)
+                .map(|value| console_scrub_pretty(value, auth_token))
+                .collect::<Vec<_>>();
+            if array.len() > shown {
+                values.push(json!({
+                    "truncated": true,
+                    "original_items": array.len(),
+                    "shown_items": shown,
+                }));
+            }
+            Value::Array(values)
+        }
+        Value::String(value) => Value::String(console_redacted_excerpt(value, auth_token)),
+        other => other.clone(),
+    }
+}
+
+fn console_string_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(console_text)
+}
+
+fn console_optional_string_field(value: &Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(Value::String(value)) => Some(console_text(value)),
+        Some(Value::Null) | None => None,
+        _ => None,
+    }
+}
+
+fn console_u64_field(value: &Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+fn console_bool_field(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+fn console_human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn console_join_fields(fields: Vec<Option<String>>) -> String {
+    fields.into_iter().flatten().collect::<Vec<_>>().join("  ")
+}
+
+fn console_list_lines<'a>(
+    values: impl Iterator<Item = &'a Value>,
+    limit: usize,
+    mut render: impl FnMut(&Value) -> Option<String>,
+) -> String {
+    let values = values.collect::<Vec<_>>();
+    let total = values.len();
+    let mut lines = values
+        .into_iter()
+        .take(limit)
+        .filter_map(&mut render)
+        .map(|line| format!("\n    {line}"))
+        .collect::<String>();
+    if total > limit {
+        lines.push_str(&format!("\n    ... +{} more", total - limit));
+    }
+    lines
+}
+
+fn console_patch_targets(input: &str) -> Vec<String> {
+    input
+        .lines()
+        .filter_map(|line| {
+            [
+                ("*** Add File: ", "+"),
+                ("*** Update File: ", "~"),
+                ("*** Delete File: ", "-"),
+                ("*** Move to: ", "→"),
+            ]
+            .into_iter()
+            .find_map(|(prefix, marker)| {
+                line.strip_prefix(prefix)
+                    .map(|path| format!("{marker} {}", console_text(path)))
+            })
+        })
+        .collect()
+}
+
+fn console_render_tool_call(tool: &str, params: &Value) -> Option<String> {
+    match tool {
+        "chatgpt_turn_init" => Some(console_join_fields(vec![
+            console_optional_string_field(params, "project_key")
+                .map(|value| format!("project={value}")),
+            Some(format!(
+                "previous_turn_ref={}",
+                console_bool_field(params, "previous_turn_ref_present")?
+            )),
+        ])),
+        "apply_patch" => {
+            let input = params.get("input")?.as_str()?;
+            let targets = console_patch_targets(input);
+            let mut rendered = "patch".to_owned();
+            if !targets.is_empty() {
+                for target in targets.iter().take(6) {
+                    rendered.push_str(&format!("\n    {target}"));
+                }
+                if targets.len() > 6 {
+                    rendered.push_str(&format!("\n    ... +{} more", targets.len() - 6));
+                }
+            }
+            Some(rendered)
+        }
+        "read_file" => {
+            let path = console_string_field(params, "path")?;
+            Some(console_join_fields(vec![
+                Some(path),
+                console_u64_field(params, "offset").map(|value| format!("line={}", value + 1)),
+                console_u64_field(params, "line_byte_offset")
+                    .filter(|value| *value != 0)
+                    .map(|value| format!("byte={value}")),
+                console_u64_field(params, "limit").map(|value| format!("limit={value}")),
+                console_u64_field(params, "max_bytes")
+                    .map(|value| format!("max={}", console_human_bytes(value))),
+            ]))
+        }
+        "list_directory" => Some(console_join_fields(vec![
+            Some(console_optional_string_field(params, "path").unwrap_or_else(|| ".".to_owned())),
+            console_u64_field(params, "offset")
+                .filter(|value| *value != 0)
+                .map(|value| format!("offset={value}")),
+            console_u64_field(params, "max_results").map(|value| format!("max={value}")),
+        ])),
+        "tree" => Some(console_join_fields(vec![
+            Some(console_optional_string_field(params, "path").unwrap_or_else(|| ".".to_owned())),
+            console_u64_field(params, "max_depth").map(|value| format!("depth={value}")),
+            console_u64_field(params, "offset")
+                .filter(|value| *value != 0)
+                .map(|value| format!("offset={value}")),
+            console_u64_field(params, "max_entries").map(|value| format!("max={value}")),
+        ])),
+        "glob" => {
+            let pattern = console_string_field(params, "pattern")?;
+            Some(console_join_fields(vec![
+                Some(format!("pattern={pattern}")),
+                Some(format!(
+                    "path={}",
+                    console_optional_string_field(params, "path").unwrap_or_else(|| ".".to_owned())
+                )),
+                console_u64_field(params, "offset")
+                    .filter(|value| *value != 0)
+                    .map(|value| format!("offset={value}")),
+            ]))
+        }
+        "grep" => {
+            let query = console_string_field(params, "query")?;
+            Some(console_join_fields(vec![
+                Some(format!("query={query}")),
+                Some(format!(
+                    "path={}",
+                    console_optional_string_field(params, "path").unwrap_or_else(|| ".".to_owned())
+                )),
+                console_optional_string_field(params, "include")
+                    .map(|value| format!("include={value}")),
+                console_u64_field(params, "context")
+                    .filter(|value| *value != 0)
+                    .map(|value| format!("context={value}")),
+                console_bool_field(params, "files_only")
+                    .filter(|value| *value)
+                    .map(|_| "files_only".to_owned()),
+            ]))
+        }
+        "view_image" => console_string_field(params, "path"),
+        "exec_command" => {
+            let command = console_string_field(params, "command")?;
+            Some(console_join_fields(vec![
+                Some(format!("$ {command}")),
+                console_optional_string_field(params, "workdir")
+                    .map(|value| format!("cwd={value}")),
+                console_u64_field(params, "timeout_ms").map(|value| format!("timeout={value}ms")),
+                console_bool_field(params, "tty")
+                    .filter(|value| *value)
+                    .map(|_| "tty".to_owned()),
+                params
+                    .get("stdin")
+                    .filter(|value| !value.is_null())
+                    .map(|_| "stdin=<provided>".to_owned()),
+            ]))
+        }
+        "write_stdin" => {
+            let session = console_string_field(params, "session_id")?;
+            let chars = params
+                .get("chars")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|_| "input=<provided>".to_owned());
+            Some(console_join_fields(vec![
+                Some(format!("session={session}")),
+                chars,
+                console_optional_string_field(params, "signal")
+                    .map(|value| format!("signal={value}")),
+                console_bool_field(params, "close_stdin")
+                    .filter(|value| *value)
+                    .map(|_| "close_stdin".to_owned()),
+                console_u64_field(params, "since_output_offset")
+                    .map(|value| format!("since={value}")),
+                console_u64_field(params, "wait_for_exit_ms")
+                    .map(|value| format!("wait={value}ms")),
+            ]))
+        }
+        "skills_list" => Some(format!(
+            "path={}",
+            console_optional_string_field(params, "path").unwrap_or_else(|| ".".to_owned())
+        )),
+        "skills_read" => {
+            let name = console_string_field(params, "name")?;
+            Some(console_join_fields(vec![
+                Some(format!("skill={name}")),
+                Some(format!(
+                    "resource={}",
+                    console_optional_string_field(params, "resource")
+                        .unwrap_or_else(|| "SKILL.md".to_owned())
+                )),
+                console_u64_field(params, "offset")
+                    .filter(|value| *value != 0)
+                    .map(|value| format!("offset={value}")),
+                console_u64_field(params, "limit").map(|value| format!("limit={value}")),
+            ]))
+        }
+        "remember" => {
+            let key = console_string_field(params, "key")?;
+            let operation = match params.get("value") {
+                Some(Value::String(value)) if value.is_empty() => "delete",
+                Some(_) => "set",
+                None => return None,
+            };
+            Some(format!("{operation} {key}"))
+        }
+        "recall" => Some(console_join_fields(vec![
+            console_optional_string_field(params, "key")
+                .map(|value| format!("key={value}"))
+                .or_else(|| Some("memory page".to_owned())),
+            console_u64_field(params, "offset")
+                .filter(|value| *value != 0)
+                .map(|value| format!("offset={value}")),
+            console_u64_field(params, "max_results").map(|value| format!("max={value}")),
+            console_bool_field(params, "include_plan")
+                .filter(|value| *value)
+                .map(|_| "include_plan".to_owned()),
+        ])),
+        "update_plan" => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn console_render_process_result(result: &Value) -> Option<String> {
+    let reason = console_string_field(result, "completion_reason")?;
+    let mut fields = vec![Some(reason)];
+    if let Some(exit_code) = result.get("exit_code").and_then(Value::as_i64) {
+        fields.push(Some(format!("exit={exit_code}")));
+    }
+    if let Some(seconds) = result.get("wall_time_seconds").and_then(Value::as_f64) {
+        fields.push(Some(format!("{seconds:.2}s")));
+    }
+    if let Some(session) = console_optional_string_field(result, "session_id") {
+        fields.push(Some(format!("session={session}")));
+    }
+    if console_bool_field(result, "truncated") == Some(true) {
+        fields.push(Some("truncated".to_owned()));
+    }
+    if let Some(output) = console_optional_string_field(result, "output")
+        && !output.is_empty()
+    {
+        fields.push(Some(format!("output={output}")));
+    }
+    Some(console_join_fields(fields))
+}
+
+fn console_render_tool_result(tool: &str, result: &Value) -> Option<String> {
+    match tool {
+        "chatgpt_turn_init" => {
+            let status = console_string_field(result, "status")?;
+            if status == "soft_error" {
+                let code = result
+                    .get("soft_error")
+                    .and_then(|value| console_string_field(value, "code"))
+                    .unwrap_or_else(|| "soft_error".to_owned());
+                return Some(format!("{status} {code}"));
+            }
+            Some(console_join_fields(vec![
+                Some(status),
+                console_optional_string_field(result, "project_key")
+                    .map(|value| format!("project={value}")),
+                console_optional_string_field(result, "workspace_state")
+                    .map(|value| format!("workspace={value}")),
+                console_bool_field(result, "instructions_changed")
+                    .map(|value| format!("instructions_changed={value}")),
+                console_bool_field(result, "state_changed")
+                    .map(|value| format!("state_changed={value}")),
+                console_optional_string_field(result, "turn_ref")
+                    .map(|value| format!("turn={value}")),
+            ]))
+        }
+        "apply_patch" => {
+            let applied = console_bool_field(result, "applied")?;
+            let count = console_u64_field(result, "count")?;
+            let mut rendered = format!(
+                "{} {count} file(s)",
+                if applied { "applied" } else { "not applied" }
+            );
+            if let Some(files) = result.get("files").and_then(Value::as_array) {
+                rendered.push_str(&console_list_lines(files.iter(), 8, |file| {
+                    let path = console_string_field(file, "path")?;
+                    let operation = console_string_field(file, "operation")?;
+                    let marker = match operation.as_str() {
+                        "create" => "+",
+                        "delete" => "-",
+                        "move" => "→",
+                        _ => "~",
+                    };
+                    let destination = console_optional_string_field(file, "destination")
+                        .map(|destination| format!(" -> {destination}"))
+                        .unwrap_or_default();
+                    Some(format!("{marker} {path}{destination}"))
+                }));
+            }
+            Some(rendered)
+        }
+        "read_file" => {
+            let path = console_string_field(result, "path")?;
+            let bytes = console_u64_field(result, "bytes")?;
+            let total_lines = console_u64_field(result, "total_lines")?;
+            let shown_lines = console_u64_field(result, "shown_lines")?;
+            let offset = console_u64_field(result, "offset")?;
+            let mut rendered = format!(
+                "{path}  {}  lines={}  window={}..{}",
+                console_human_bytes(bytes),
+                total_lines,
+                offset + 1,
+                offset.saturating_add(shown_lines)
+            );
+            if console_bool_field(result, "truncated") == Some(true) {
+                rendered.push_str("  truncated");
+            }
+            if let Some(content) = console_optional_string_field(result, "content")
+                && !content.is_empty()
+            {
+                rendered.push_str(&format!("  content={content}"));
+            }
+            Some(rendered)
+        }
+        "list_directory" => {
+            let path = console_string_field(result, "path")?;
+            let count = console_u64_field(result, "count")?;
+            let mut rendered = format!(
+                "{path}  {count} entr{}",
+                if count == 1 { "y" } else { "ies" }
+            );
+            if let Some(entries) = result.get("entries").and_then(Value::as_array) {
+                rendered.push_str(&console_list_lines(entries.iter(), 8, |entry| {
+                    let name = console_string_field(entry, "name")?;
+                    let kind = console_string_field(entry, "type")?;
+                    let bytes = console_u64_field(entry, "bytes")
+                        .map(console_human_bytes)
+                        .unwrap_or_else(|| "-".to_owned());
+                    Some(format!("{kind:<9} {bytes:>9}  {name}"))
+                }));
+            }
+            Some(rendered)
+        }
+        "tree" => {
+            let path = console_string_field(result, "path")?;
+            let entries = result.get("entries")?.as_array()?;
+            let mut rendered = format!("{path}  {} entries", entries.len());
+            rendered.push_str(&console_list_lines(entries.iter(), 10, |entry| {
+                let item_path = console_string_field(entry, "path")?;
+                let kind = console_string_field(entry, "type")?;
+                let depth = console_u64_field(entry, "depth").unwrap_or(0).min(12) as usize;
+                let suffix = match kind.as_str() {
+                    "directory" => "/",
+                    "symlink" => "@",
+                    _ => "",
+                };
+                Some(format!(
+                    "{}{}{}",
+                    "  ".repeat(depth.saturating_sub(1)),
+                    item_path,
+                    suffix
+                ))
+            }));
+            Some(rendered)
+        }
+        "glob" => {
+            let paths = result.get("paths")?.as_array()?;
+            let count = console_u64_field(result, "count").unwrap_or(paths.len() as u64);
+            let mut rendered = format!("{count} match(es)");
+            rendered.push_str(&console_list_lines(paths.iter(), 10, |path| {
+                path.as_str().map(console_text)
+            }));
+            Some(rendered)
+        }
+        "grep" => {
+            let matches = result.get("matches")?.as_array()?;
+            let count = console_u64_field(result, "count").unwrap_or(matches.len() as u64);
+            let mut rendered = format!("{count} match(es)");
+            if console_bool_field(result, "incomplete") == Some(true) {
+                rendered.push_str("  incomplete");
+            }
+            rendered.push_str(&console_list_lines(matches.iter(), 8, |item| {
+                let path = console_string_field(item, "path")?;
+                let line = console_u64_field(item, "line")
+                    .map(|line| format!(":{line}"))
+                    .unwrap_or_default();
+                let text = console_optional_string_field(item, "text")
+                    .map(|text| format!("  {text}"))
+                    .unwrap_or_default();
+                Some(format!("{path}{line}{text}"))
+            }));
+            Some(rendered)
+        }
+        "view_image" => {
+            let path = console_string_field(result, "path")?;
+            let mime = console_string_field(result, "mime_type")?;
+            let bytes = console_u64_field(result, "bytes")?;
+            Some(console_join_fields(vec![
+                Some(path),
+                Some(mime),
+                Some(console_human_bytes(bytes)),
+            ]))
+        }
+        "exec_command" | "write_stdin" => console_render_process_result(result),
+        "skills_list" => {
+            let skills = result.get("skills")?.as_array()?;
+            let mut rendered = format!("{} skill(s)", skills.len());
+            rendered.push_str(&console_list_lines(skills.iter(), 8, |skill| {
+                let name = console_string_field(skill, "name")?;
+                let description = console_optional_string_field(skill, "description")
+                    .map(|value| format!(" — {value}"))
+                    .unwrap_or_default();
+                Some(format!("{name}{description}"))
+            }));
+            Some(rendered)
+        }
+        "skills_read" => {
+            let name = console_string_field(result, "name")?;
+            let resource = console_string_field(result, "resource")?;
+            let shown = console_u64_field(result, "shown_bytes")?;
+            let total = console_u64_field(result, "total_bytes")?;
+            let truncated = console_bool_field(result, "truncated")?;
+            Some(console_join_fields(vec![
+                Some(format!("skill={name}")),
+                Some(format!("resource={resource}")),
+                Some(format!("shown={}", console_human_bytes(shown))),
+                Some(format!("total={}", console_human_bytes(total))),
+                truncated.then(|| "continued".to_owned()),
+            ]))
+        }
+        "remember" => {
+            let key = console_string_field(result, "key")?;
+            let saved = console_bool_field(result, "saved")?;
+            let deleted = console_bool_field(result, "deleted")?;
+            let state = if saved {
+                "saved"
+            } else if deleted {
+                "deleted"
+            } else {
+                "unchanged"
+            };
+            Some(format!("{state} {key}"))
+        }
+        "recall" => {
+            if let Some(key) = console_optional_string_field(result, "key") {
+                let value = result.get("value")?;
+                let found = !value.is_null();
+                return Some(format!(
+                    "key={key}  {}",
+                    if found { "found" } else { "missing" }
+                ));
+            }
+            let notes = result.get("notes")?.as_array()?;
+            let total = console_u64_field(result, "total").unwrap_or(notes.len() as u64);
+            let offset = console_u64_field(result, "offset").unwrap_or(0);
+            let mut rendered = format!("{} memory note(s)  offset={offset}/{total}", notes.len());
+            rendered.push_str(&console_list_lines(notes.iter(), 10, |note| {
+                console_string_field(note, "key")
+            }));
+            if let Some(plan) = result.get("plan").filter(|value| !value.is_null()) {
+                let tasks = plan
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                rendered.push_str(&format!("  plan={tasks} task(s)"));
+            }
+            Some(rendered)
+        }
+        "update_plan" => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn console_plan(event: &Value) -> Option<String> {
+    let plan = event.get("plan")?;
+    if plan.is_null() {
+        return Some(format!("    {}", console_color("plan cleared", ANSI_GRAY)));
+    }
+    let items = plan.get("items")?.as_array()?;
+    if items.is_empty() {
+        return Some(format!("    {}", console_color("plan empty", ANSI_GRAY)));
+    }
+
+    let rendered = items
+        .iter()
+        .filter_map(|item| {
+            let step = console_excerpt_edges(
+                &console_string_field(item, "step")?,
+                CONSOLE_PLAN_STEP_CHARS,
+                CONSOLE_PLAN_STEP_EDGE_CHARS,
+            );
+            let status = console_string_field(item, "status")?;
+            let color = match status.as_str() {
+                "completed" => ANSI_GREEN,
+                "in_progress" => ANSI_YELLOW,
+                "pending" => ANSI_GRAY,
+                _ => ANSI_RED,
+            };
+            Some((step, status, color))
+        })
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        return None;
+    }
+    let step_width = rendered
+        .iter()
+        .map(|(step, _, _)| step.chars().count())
+        .max()
+        .unwrap_or_default();
+    let total = rendered.len();
+    let mut lines = Vec::new();
+    let mut visible_chars = 0usize;
+    for (step, status, color) in rendered {
+        let line_chars = 4usize
+            .saturating_add(step_width)
+            .saturating_add(4)
+            .saturating_add(status.chars().count())
+            .saturating_add(usize::from(!lines.is_empty()));
+        if visible_chars.saturating_add(line_chars) > CONSOLE_PLAN_BODY_CHARS {
+            break;
+        }
+        visible_chars = visible_chars.saturating_add(line_chars);
+        lines.push(format!(
+            "    {step:<step_width$}    {}",
+            console_color(&status, color)
+        ));
+    }
+    if lines.len() < total {
+        lines.push(format!("    ... +{} more", total - lines.len()));
+    }
+    Some(lines.join("\n"))
+}
+
+fn console_project(inner: &AuditInner, event: &Value) -> String {
+    let project = event
         .get("project")
         .and_then(Value::as_object)
         .and_then(|project| {
@@ -286,58 +954,120 @@ fn console_project(event: &Value) -> &str {
                 .and_then(Value::as_str)
                 .or_else(|| project.get("effective_key").and_then(Value::as_str))
         })
-        .unwrap_or("global")
+        .unwrap_or("global");
+    let project = if inner.auth_token.is_empty() {
+        project.to_owned()
+    } else {
+        project.replace(&inner.auth_token, "[REDACTED]")
+    };
+    console_text(&project)
+}
+
+fn console_generic_payload(
+    inner: &AuditInner,
+    event: &Value,
+    key: &str,
+    string_limit: usize,
+) -> String {
+    let value = event.get(key).cloned().unwrap_or(Value::Null);
+    let value = scrub(&value, &inner.auth_token, string_limit);
+    let value = bound_event(value, string_limit.saturating_mul(4));
+    let rendered = serde_json::to_string(&value)
+        .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+    console_excerpt(&rendered)
+}
+
+fn console_pretty_payload(inner: &AuditInner, event: &Value, key: &str) -> Value {
+    event
+        .get(key)
+        .map(|value| console_scrub_pretty(value, &inner.auth_token))
+        .unwrap_or(Value::Null)
 }
 
 fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
     let event_name = event.get("event").and_then(Value::as_str)?;
-    let project = console_project(event);
+    let project = console_project(inner, event);
     let tool = event
         .get("tool")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     match event_name {
         "tool_call" => {
-            let params = event.get("params").cloned().unwrap_or(Value::Null);
-            let params = scrub(&params, &inner.auth_token, inner.config.console_param_bytes);
-            let params = bound_event(params, inner.config.console_param_bytes.saturating_mul(4));
-            let rendered = serde_json::to_string(&params)
-                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            let params = console_pretty_payload(inner, event, "params");
+            let rendered = console_render_tool_call(tool, &params)
+                .map(|rendered| console_excerpt(&rendered))
+                .unwrap_or_else(|| {
+                    console_generic_payload(
+                        inner,
+                        event,
+                        "params",
+                        inner.config.console_param_bytes,
+                    )
+                });
             Some(format!(
-                "{} [{}] {} {rendered}",
+                "{} [{}] {}{}",
                 console_color("=>>", ANSI_GRAY),
-                console_color(project, ANSI_GREEN),
-                console_color(tool, ANSI_RED)
+                console_color(&project, ANSI_GREEN),
+                console_color(tool, ANSI_RED),
+                if rendered.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {rendered}")
+                }
             ))
         }
         "tool_result" => {
-            let result = event.get("result").cloned().unwrap_or(Value::Null);
-            let result = scrub(
-                &result,
-                &inner.auth_token,
-                inner.config.console_result_bytes,
-            );
-            let result = bound_event(result, inner.config.console_result_bytes.saturating_mul(4));
-            let rendered = serde_json::to_string(&result)
-                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            let result = console_pretty_payload(inner, event, "result");
+            let rendered = console_render_tool_result(tool, &result)
+                .map(|rendered| console_excerpt(&rendered))
+                .unwrap_or_else(|| {
+                    console_generic_payload(
+                        inner,
+                        event,
+                        "result",
+                        inner.config.console_result_bytes,
+                    )
+                });
             Some(format!(
-                "{} [{}] {} {rendered}",
+                "{} [{}] {}{}",
                 console_color("<<=", ANSI_GRAY),
-                console_color(project, ANSI_BLUE),
-                console_color(tool, ANSI_YELLOW)
+                console_color(&project, ANSI_BLUE),
+                console_color(tool, ANSI_YELLOW),
+                if rendered.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {rendered}")
+                }
             ))
         }
         "tool_error" | "tool_timeout" => {
-            let error = event.get("error").cloned().unwrap_or(Value::Null);
-            let error = scrub(&error, &inner.auth_token, inner.config.console_result_bytes);
-            let rendered = serde_json::to_string(&error)
-                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            let error = console_pretty_payload(inner, event, "error");
+            let rendered = console_string_field(&error, "message")
+                .map(|message| {
+                    let code = console_optional_string_field(&error, "code")
+                        .map(|code| format!("{code}: "))
+                        .unwrap_or_default();
+                    format!("{code}{message}")
+                })
+                .unwrap_or_else(|| {
+                    console_generic_payload(
+                        inner,
+                        event,
+                        "error",
+                        inner.config.console_result_bytes,
+                    )
+                });
+            let rendered = console_excerpt(&rendered);
             Some(format!(
                 "{} [{}] {} {event_name}: {rendered}",
                 console_color("<<=", ANSI_GRAY),
-                console_color(project, ANSI_BLUE),
+                console_color(&project, ANSI_BLUE),
                 console_color(tool, ANSI_YELLOW)
             ))
+        }
+        "plan_updated" => {
+            let safe = console_scrub_pretty(event, &inner.auth_token);
+            console_plan(&safe)
         }
         _ => None,
     }
@@ -671,6 +1401,33 @@ fn summarize(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    fn console_test_inner() -> AuditInner {
+        let config = LogConfig {
+            root: PathBuf::from("unused"),
+            queue_capacity: 8,
+            queue_max_bytes: 64 * 1024,
+            console_param_bytes: 4096,
+            console_result_bytes: 8192,
+            file_event_bytes: 4096,
+            max_file_bytes: 1024 * 1024,
+            max_files: 1,
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        AuditInner {
+            sender,
+            queue_bytes: Arc::new(Semaphore::new(64 * 1024)),
+            config,
+            auth_token: "bridge-secret".to_owned(),
+            dropped_total: AtomicU64::new(0),
+            dropped_pending: AtomicU64::new(0),
+            running: DashMap::new(),
+            project_activity: DashMap::new(),
+            project_activity_lock: Mutex::new(()),
+            cancellation: CancellationToken::new(),
+            writer: Mutex::new(None),
+        }
+    }
+
     #[test]
     fn secrets_are_recursive_and_auth_token_is_removed_from_strings() {
         let value = json!({"nested":{"api_key":"x","AWS_SECRET_ACCESS_KEY":"aws","safe":"url/token-value/mcp"},"array":[{"password":"p"}]});
@@ -833,7 +1590,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mgrep\u{1b}[0m {\"query\":\"needle\",\"token\":\"[REDACTED]\"}"
+            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mgrep\u{1b}[0m query=needle  path=."
         );
 
         let result = console_line(
@@ -863,7 +1620,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fallback,
-            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32meffective-project\u{1b}[0m] \u{1b}[31mread_file\u{1b}[0m {\"path\":\"src/lib.rs\"}"
+            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32meffective-project\u{1b}[0m] \u{1b}[31mread_file\u{1b}[0m src/lib.rs"
         );
 
         let error = console_line(
@@ -878,8 +1635,574 @@ mod tests {
         .unwrap();
         assert_eq!(
             error,
-            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mexec_command\u{1b}[0m tool_error: {\"code\":\"PROCESS_FAILED\",\"message\":\"[REDACTED] failed\"}"
+            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mexec_command\u{1b}[0m tool_error: PROCESS_FAILED: [REDACTED] failed"
         );
+    }
+
+    #[test]
+    fn console_excerpt_keeps_250_leading_and_trailing_characters() {
+        let value = format!(
+            "{}{}{}",
+            "a".repeat(250),
+            "middle".repeat(32),
+            "z".repeat(250)
+        );
+        let excerpt = console_excerpt(&value);
+
+        assert_eq!(
+            excerpt,
+            format!("{}...{}", "a".repeat(250), "z".repeat(250))
+        );
+        assert_eq!(excerpt.chars().count(), 503);
+
+        let unicode = format!("{}x{}", "🙂".repeat(250), "界".repeat(250));
+        let unicode_excerpt = console_excerpt(&unicode);
+        assert_eq!(
+            unicode_excerpt,
+            format!("{}...{}", "🙂".repeat(250), "界".repeat(250))
+        );
+    }
+
+    #[test]
+    fn console_plan_renders_one_colored_status_per_task() {
+        let rendered = console_plan(&json!({
+            "event":"plan_updated",
+            "project":{"alias":"demo"},
+            "plan":{
+                "items":[
+                    {"step":"compile","status":"in_progress"},
+                    {"step":"test","status":"pending"},
+                    {"step":"ship","status":"completed"}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "    compile    \u{1b}[33min_progress\u{1b}[0m\n    test       \u{1b}[90mpending\u{1b}[0m\n    ship       \u{1b}[32mcompleted\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn console_plan_has_one_bounded_visible_budget_for_large_valid_plans() {
+        let items = (0..100)
+            .map(|index| {
+                json!({
+                    "step": format!("task-{index:03}-{}", "x".repeat(180)),
+                    "status": if index == 0 { "in_progress" } else { "pending" },
+                })
+            })
+            .collect::<Vec<_>>();
+        let rendered = console_plan(&json!({"plan":{"items":items}})).unwrap();
+        let plain = [
+            ANSI_RESET,
+            ANSI_GRAY,
+            ANSI_RED,
+            ANSI_GREEN,
+            ANSI_YELLOW,
+            ANSI_BLUE,
+        ]
+        .into_iter()
+        .fold(rendered.clone(), |value, code| value.replace(code, ""));
+
+        assert!(
+            plain.chars().count() <= CONSOLE_EXCERPT_CHARS,
+            "large plan escaped console budget: {} chars\n{plain}",
+            plain.chars().count()
+        );
+        assert!(
+            plain.contains("... +"),
+            "omitted task count missing: {plain}"
+        );
+        assert!(plain.lines().count() < 100, "large plan was dumped in full");
+    }
+
+    #[test]
+    fn console_pretty_scrub_bounds_large_strings_before_custom_rendering() {
+        let inner = console_test_inner();
+        let payload = format!(
+            "{}bridge-secret{}{}",
+            "a".repeat(240),
+            "middle".repeat(200_000),
+            "z".repeat(300)
+        );
+        let event = json!({"result":{"output":payload}});
+        let safe = console_pretty_payload(&inner, &event, "result");
+        let output = safe["output"].as_str().unwrap();
+
+        assert!(output.chars().count() <= 503, "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+        assert!(!output.contains("bridge-secret"), "{output}");
+        assert!(output.ends_with(&"z".repeat(250)), "{output}");
+        assert!(!output.contains("middlemiddlemiddle"), "{output}");
+    }
+
+    #[test]
+    fn recall_plan_summary_does_not_embed_nested_ansi_or_dump_plan_lines() {
+        let rendered = console_render_tool_result(
+            "recall",
+            &json!({
+                "notes":[],"offset":0,"total":0,
+                "plan":{"items":[{"step":"compile","status":"in_progress"}]}
+            }),
+        )
+        .unwrap();
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(rendered.contains("plan=1 task(s)"), "{rendered}");
+        assert!(!rendered.contains("compile"), "{rendered}");
+    }
+
+    #[test]
+    fn update_plan_console_lifecycle_avoids_dumping_plan_json() {
+        let config = LogConfig {
+            root: PathBuf::from("unused"),
+            queue_capacity: 8,
+            queue_max_bytes: 1024,
+            console_param_bytes: 4096,
+            console_result_bytes: 8192,
+            file_event_bytes: 4096,
+            max_file_bytes: 1024,
+            max_files: 1,
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let inner = AuditInner {
+            sender,
+            queue_bytes: Arc::new(Semaphore::new(1024)),
+            config,
+            auth_token: "bridge-secret".to_owned(),
+            dropped_total: AtomicU64::new(0),
+            dropped_pending: AtomicU64::new(0),
+            running: DashMap::new(),
+            project_activity: DashMap::new(),
+            project_activity_lock: Mutex::new(()),
+            cancellation: CancellationToken::new(),
+            writer: Mutex::new(None),
+        };
+
+        let call = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"update_plan",
+                "project":{"alias":"demo"},
+                "params":{"plan":[{"step":"compile","status":"in_progress"}]}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mupdate_plan\u{1b}[0m"
+        );
+
+        let result = console_line(
+            &inner,
+            &json!({
+                "event":"tool_result",
+                "tool":"update_plan",
+                "project":{"alias":"demo"},
+                "result":{"updated":true,"plan":{"items":[{"step":"compile","status":"completed"}]}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mupdate_plan\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn console_line_truncates_large_serialized_payload_in_the_middle() {
+        let config = LogConfig {
+            root: PathBuf::from("unused"),
+            queue_capacity: 8,
+            queue_max_bytes: 1024,
+            console_param_bytes: 4096,
+            console_result_bytes: 4096,
+            file_event_bytes: 4096,
+            max_file_bytes: 1024,
+            max_files: 1,
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let inner = AuditInner {
+            sender,
+            queue_bytes: Arc::new(Semaphore::new(1024)),
+            config,
+            auth_token: "bridge-secret".to_owned(),
+            dropped_total: AtomicU64::new(0),
+            dropped_pending: AtomicU64::new(0),
+            running: DashMap::new(),
+            project_activity: DashMap::new(),
+            project_activity_lock: Mutex::new(()),
+            cancellation: CancellationToken::new(),
+            writer: Mutex::new(None),
+        };
+        let payload = format!(
+            "{}{}{}",
+            "a".repeat(300),
+            "middle".repeat(50),
+            "z".repeat(300)
+        );
+        let line = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"exec_command",
+                "project":{"alias":"demo"},
+                "params":{"payload":payload}
+            }),
+        )
+        .unwrap();
+
+        assert!(line.contains("..."), "{line}");
+        assert!(!line.contains("middlemiddlemiddle"), "{line}");
+        assert!(line.contains(&"a".repeat(200)), "{line}");
+        assert!(line.contains(&"z".repeat(200)), "{line}");
+    }
+
+    #[test]
+    fn console_pretty_renderers_cover_every_public_tool_shape() {
+        let calls = vec![
+            (
+                "chatgpt_turn_init",
+                json!({"project_key":"demo","previous_turn_ref_present":true}),
+            ),
+            (
+                "apply_patch",
+                json!({"input":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"}),
+            ),
+            (
+                "read_file",
+                json!({"path":"src/lib.rs","offset":2,"limit":20}),
+            ),
+            (
+                "list_directory",
+                json!({"path":"src","offset":0,"max_results":20}),
+            ),
+            (
+                "tree",
+                json!({"path":"src","max_depth":3,"offset":0,"max_entries":30}),
+            ),
+            ("glob", json!({"pattern":"**/*.rs","path":"src","offset":0})),
+            (
+                "grep",
+                json!({"query":"needle","path":"src","include":"*.rs","context":1,"files_only":false}),
+            ),
+            ("view_image", json!({"path":"image.png"})),
+            (
+                "exec_command",
+                json!({"command":"cargo test","workdir":".","timeout_ms":30000,"tty":false}),
+            ),
+            (
+                "write_stdin",
+                json!({"session_id":"session-1","chars":"x","close_stdin":false,"wait_for_exit_ms":500}),
+            ),
+            ("skills_list", json!({"path":"src"})),
+            (
+                "skills_read",
+                json!({"name":"pdfs","resource":"SKILL.md","offset":0,"limit":4096}),
+            ),
+            ("remember", json!({"key":"decision","value":"keep sqlite"})),
+            (
+                "recall",
+                json!({"offset":0,"max_results":10,"include_plan":true}),
+            ),
+            (
+                "update_plan",
+                json!({"plan":[{"step":"test","status":"in_progress"}]}),
+            ),
+        ];
+        for (tool, params) in calls {
+            let rendered = console_render_tool_call(tool, &params)
+                .unwrap_or_else(|| panic!("missing call renderer for {tool}: {params}"));
+            assert!(!rendered.starts_with('{'), "{tool}: {rendered}");
+        }
+
+        let results = vec![
+            (
+                "chatgpt_turn_init",
+                json!({
+                    "status":"synchronized","project_key":"demo","workspace_state":"existing",
+                    "instructions_changed":false,"state_changed":true,"turn_ref":"r_demo"
+                }),
+            ),
+            (
+                "apply_patch",
+                json!({
+                    "applied":true,"count":2,
+                    "files":[
+                        {"path":"src/lib.rs","operation":"update"},
+                        {"path":"src/new.rs","operation":"create"}
+                    ]
+                }),
+            ),
+            (
+                "read_file",
+                json!({
+                    "path":"src/lib.rs","bytes":1200,"total_lines":40,"shown_lines":10,
+                    "offset":5,"truncated":false,"content":"line 6\nline 7"
+                }),
+            ),
+            (
+                "list_directory",
+                json!({
+                    "path":"src","count":2,
+                    "entries":[
+                        {"name":"lib.rs","type":"file","bytes":1200},
+                        {"name":"tools","type":"directory","bytes":null}
+                    ]
+                }),
+            ),
+            (
+                "tree",
+                json!({
+                    "path":"src","entries":[
+                        {"path":"src/tools","type":"directory","depth":1},
+                        {"path":"src/tools/mod.rs","type":"file","depth":2}
+                    ]
+                }),
+            ),
+            (
+                "glob",
+                json!({"count":2,"paths":["src/lib.rs","src/main.rs"]}),
+            ),
+            (
+                "grep",
+                json!({
+                    "count":1,"incomplete":false,
+                    "matches":[{"path":"src/lib.rs","line":7,"text":"needle"}]
+                }),
+            ),
+            (
+                "view_image",
+                json!({"path":"image.png","mime_type":"image/png","bytes":2048}),
+            ),
+            (
+                "exec_command",
+                json!({
+                    "completion_reason":"exited","exit_code":0,"wall_time_seconds":1.25,
+                    "session_id":null,"truncated":false,"output":"ok"
+                }),
+            ),
+            (
+                "write_stdin",
+                json!({
+                    "completion_reason":"running","exit_code":null,"wall_time_seconds":2.0,
+                    "session_id":"session-1","truncated":false,"output":"more"
+                }),
+            ),
+            (
+                "skills_list",
+                json!({"skills":[{"name":"pdfs","description":"Work with PDFs"}]}),
+            ),
+            (
+                "skills_read",
+                json!({
+                    "name":"pdfs","resource":"SKILL.md","shown_bytes":4096,
+                    "total_bytes":8000,"truncated":true
+                }),
+            ),
+            (
+                "remember",
+                json!({"key":"decision","saved":true,"deleted":false}),
+            ),
+            (
+                "recall",
+                json!({
+                    "notes":[{"key":"decision","value":"keep sqlite"}],
+                    "offset":0,"total":1,"plan":null
+                }),
+            ),
+            ("update_plan", json!({"updated":true,"plan":null})),
+        ];
+        for (tool, result) in results {
+            let rendered = console_render_tool_result(tool, &result)
+                .unwrap_or_else(|| panic!("missing result renderer for {tool}: {result}"));
+            assert!(!rendered.starts_with('{'), "{tool}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn console_rendering_is_read_only_and_file_audit_shape_is_unchanged() {
+        let inner = console_test_inner();
+        let event = json!({
+            "event":"tool_result",
+            "tool":"exec_command",
+            "project":{"alias":"demo","effective_key":"demo"},
+            "status":"success",
+            "result":{
+                "completion_reason":"exited","exit_code":0,"output":"hello",
+                "output_bytes":5,"output_offset":0,"output_next_offset":5,"truncated":false
+            }
+        });
+        let original = event.clone();
+        let file_before = bound_event(
+            scrub(&event, &inner.auth_token, inner.config.file_event_bytes),
+            inner.config.file_event_bytes,
+        );
+
+        let rendered = console_line(&inner, &event).unwrap();
+        assert!(rendered.contains("exited"), "{rendered}");
+
+        let file_after = bound_event(
+            scrub(&event, &inner.auth_token, inner.config.file_event_bytes),
+            inner.config.file_event_bytes,
+        );
+        assert_eq!(
+            event, original,
+            "console rendering mutated the audit/tool value"
+        );
+        assert_eq!(
+            file_before, file_after,
+            "console rendering changed the JSON value that the file-audit path would persist"
+        );
+    }
+
+    #[test]
+    fn console_custom_renderers_redact_before_rendering_and_hide_unneeded_values() {
+        let inner = console_test_inner();
+        let exec = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"exec_command",
+                "project":{"alias":"demo"},
+                "params":{
+                    "command":"echo bridge-secret",
+                    "env":{"API_TOKEN":"also-secret"},
+                    "stdin":"bridge-secret"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(!exec.contains("bridge-secret"), "{exec}");
+        assert!(!exec.contains("also-secret"), "{exec}");
+        assert!(exec.contains("[REDACTED]"), "{exec}");
+        assert!(exec.contains("stdin=<provided>"), "{exec}");
+
+        let remember = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"remember",
+                "project":{"alias":"demo"},
+                "params":{"key":"decision","value":"bridge-secret private memory"}
+            }),
+        )
+        .unwrap();
+        assert!(remember.contains("set decision"), "{remember}");
+        assert!(!remember.contains("private memory"), "{remember}");
+        assert!(!remember.contains("bridge-secret"), "{remember}");
+    }
+
+    #[test]
+    fn console_custom_renderers_escape_terminal_control_sequences() {
+        let inner = console_test_inner();
+        let line = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"exec_command",
+                "project":{"alias":"demo\u{1b}[2J"},
+                "params":{"command":"echo \u{1b}[31mred\nnext\rline\tend"}
+            }),
+        )
+        .unwrap();
+        let plain = [
+            ANSI_RESET,
+            ANSI_GRAY,
+            ANSI_RED,
+            ANSI_GREEN,
+            ANSI_YELLOW,
+            ANSI_BLUE,
+        ]
+        .into_iter()
+        .fold(line.clone(), |value, code| value.replace(code, ""));
+        assert!(!plain.contains('\u{1b}'), "{line:?}");
+        assert!(!plain.contains('\r'), "{line:?}");
+        assert_eq!(plain.lines().count(), 1, "{line:?}");
+        assert!(plain.contains("demo\\x1b[2J"), "{plain}");
+        assert!(
+            plain.contains("\\x1b[31mred\\nnext\\rline\\tend"),
+            "{plain}"
+        );
+
+        let plan = console_line(
+            &inner,
+            &json!({
+                "event":"plan_updated",
+                "project":{"alias":"demo"},
+                "plan":{"items":[{"step":"task\u{1b}[2J\nspoof","status":"completed"}]}
+            }),
+        )
+        .unwrap();
+        let plan_plain = [
+            ANSI_RESET,
+            ANSI_GRAY,
+            ANSI_RED,
+            ANSI_GREEN,
+            ANSI_YELLOW,
+            ANSI_BLUE,
+        ]
+        .into_iter()
+        .fold(plan.clone(), |value, code| value.replace(code, ""));
+        assert!(!plan_plain.contains('\u{1b}'), "{plan:?}");
+        assert_eq!(plan_plain.lines().count(), 1, "{plan:?}");
+        assert!(plan_plain.contains("task\\x1b[2J\\nspoof"), "{plan_plain}");
+    }
+
+    #[test]
+    fn console_malformed_custom_shapes_fall_back_without_panicking() {
+        let inner = console_test_inner();
+        for event in [
+            json!({
+                "event":"tool_result","tool":"exec_command","project":{"alias":"demo"},
+                "result":{"completion_reason":123,"output":"x"}
+            }),
+            json!({
+                "event":"tool_result","tool":"grep","project":{"alias":"demo"},
+                "result":{"matches":3,"count":3}
+            }),
+            json!({
+                "event":"tool_call","tool":"read_file","project":{"alias":"demo"},
+                "params":{"path":123}
+            }),
+        ] {
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                console_line(&inner, &event)
+            }))
+            .expect("console rendering must never panic")
+            .expect("tool lifecycle event should remain visible");
+            assert!(rendered.contains('{'), "expected JSON fallback: {rendered}");
+        }
+    }
+
+    #[test]
+    fn console_process_output_keeps_head_and_tail_after_pretty_rendering() {
+        let inner = console_test_inner();
+        let output = format!(
+            "{}{}{}",
+            "a".repeat(300),
+            "middle".repeat(60),
+            "z".repeat(300)
+        );
+        let line = console_line(
+            &inner,
+            &json!({
+                "event":"tool_result",
+                "tool":"exec_command",
+                "project":{"alias":"demo"},
+                "result":{
+                    "completion_reason":"exited","exit_code":0,"wall_time_seconds":0.1,
+                    "session_id":null,"truncated":false,"output":output
+                }
+            }),
+        )
+        .unwrap();
+        assert!(line.contains(&"a".repeat(200)), "{line}");
+        assert!(line.contains(&"z".repeat(200)), "{line}");
+        assert!(line.contains("..."), "{line}");
+        assert!(!line.contains("middlemiddlemiddle"), "{line}");
     }
 
     #[test]

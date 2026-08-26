@@ -1039,16 +1039,22 @@ pub(crate) fn bwrap_usable() -> bool {
     *BWRAP_USABLE.get_or_init(probe_bwrap)
 }
 
-fn invokes_podman(command: &str) -> bool {
+pub(crate) fn invokes_podman(command: &str) -> bool {
     command
         .split(|character: char| "|&;()<>".contains(character))
         .any(|segment| segment_podman_invocation(segment).is_some())
 }
 
-fn invokes_sudo_podman(command: &str) -> bool {
+pub(crate) fn invokes_sudo_podman(command: &str) -> bool {
     command
         .split(|character: char| "|&;()<>".contains(character))
         .any(|segment| segment_podman_invocation(segment) == Some(true))
+}
+
+pub(crate) fn invokes_direct_podman(command: &str) -> bool {
+    command
+        .split(|character: char| "|&;()<>".contains(character))
+        .any(|segment| segment_podman_invocation(segment) == Some(false))
 }
 
 fn segment_podman_invocation(segment: &str) -> Option<bool> {
@@ -1206,6 +1212,7 @@ fn bubblewrap_base_command(
     config: &Config,
     project: &ProjectContext,
     workdir: &Path,
+    runtime_bind: Option<(&Path, &Path)>,
 ) -> Result<Command> {
     let mut command = Command::new("/usr/bin/bwrap");
     command.args([
@@ -1272,6 +1279,15 @@ fn bubblewrap_base_command(
             root.to_string_lossy().as_ref(),
             "/etc/containers",
         ]);
+    }
+    if let Some((host, sandbox)) = runtime_bind {
+        let host = host.canonicalize().map_err(|error| {
+            AppError::new(
+                "SANDBOX_UNAVAILABLE",
+                format!("runtime bind source is unavailable: {error}"),
+            )
+        })?;
+        command.arg("--bind").arg(host).arg(sandbox);
     }
     Ok(command)
 }
@@ -1454,12 +1470,38 @@ pub(crate) fn build_command_with_options(
     workdir: &Path,
     shell: Option<&str>,
 ) -> Result<Command> {
+    build_command_with_options_and_runtime_bind(
+        config,
+        project,
+        command_text,
+        interactive,
+        timeout,
+        environment,
+        workdir,
+        shell,
+        None,
+    )
+    .map(|(command, _)| command)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_command_with_options_and_runtime_bind(
+    config: &Config,
+    project: &ProjectContext,
+    command_text: &str,
+    interactive: bool,
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+    workdir: &Path,
+    shell: Option<&str>,
+    runtime_bind: Option<(&Path, &Path)>,
+) -> Result<(Command, bool)> {
     let use_bwrap = use_bwrap(config, project, Some(command_text));
     let sandbox_default_shell = (use_bwrap && shell.is_none()).then_some("/bin/sh");
     let (shell_bin, shell_args, shell_text) =
         shell_command(shell.or(sandbox_default_shell), command_text)?;
     let command = if use_bwrap {
-        let mut command = bubblewrap_base_command(config, project, workdir)?;
+        let mut command = bubblewrap_base_command(config, project, workdir, runtime_bind)?;
         command.arg(&shell_bin).args(&shell_args).arg(&shell_text);
         command
     } else if config.allow_unsandboxed_exec {
@@ -1475,14 +1517,15 @@ pub(crate) fn build_command_with_options(
             "no usable exec backend; Bubblewrap is unavailable and native execution is disabled",
         ));
     };
-    finalize_process_command(
+    let command = finalize_process_command(
         command,
         config,
         use_bwrap,
         interactive,
         timeout,
         environment,
-    )
+    )?;
+    Ok((command, use_bwrap))
 }
 
 pub(crate) fn build_argv_command(
@@ -1516,7 +1559,7 @@ pub(crate) fn build_argv_command(
     }
     let use_bwrap = use_bwrap(config, project, Some(executable));
     let command = if use_bwrap {
-        let mut command = bubblewrap_base_command(config, project, &project.project_root)?;
+        let mut command = bubblewrap_base_command(config, project, &project.project_root, None)?;
         command.arg(executable).args(arguments);
         command
     } else if config.allow_unsandboxed_exec {
