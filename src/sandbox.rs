@@ -271,6 +271,10 @@ impl SecurePathResolver {
                 self.resolve_project_path(project_root, source, PathOperation::Existing)?;
             let destination =
                 self.resolve_project_path(project_root, destination, PathOperation::Create)?;
+            let destination_parent = destination.parent().ok_or_else(|| {
+                AppError::new("PATH_OUTSIDE_WORKSPACE", "destination has no parent")
+            })?;
+            std::fs::create_dir_all(destination_parent)?;
             std::fs::rename(source, destination)?;
             Ok(())
         }
