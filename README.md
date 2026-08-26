@@ -63,7 +63,7 @@ The explicit `chatgpt_turn_init` bootstrap is recommended for the first prompt b
 - **No general application config file.** Built-in defaults are suitable for normal controlled deployments, while environment variables remain available for resource tuning and stricter fail-closed operation. Upstream MCP aggregation is the one opt-in feature that reads an operator-supplied config file.
 - **YOLO by default.** Valid tool calls execute immediately; there is no approval handshake and no shell command allowlist.
 - **Small native tool surface.** Duplicate CRUD/compatibility tools are not exposed. General shell work goes through `exec_command`; file edits go through `apply_patch`. Optional upstreams default to gateway mode so a large upstream catalogue costs one dispatcher tool plus one progressively disclosed skill.
-- **Codex-style coding-agent behavior.** The base brief tells the model to inspect, act, inspect results, adjust, and verify repeatedly until the requested task mode is complete. It also carries dirty-worktree discipline, scope control, verification requirements, AGENTS/skills handling, planning, durable notes, bounded output, and continuation semantics.
+- **Codex-style coding-agent behavior.** The base brief tells the model to inspect, act, inspect results, adjust, and verify repeatedly until the requested task mode is complete. Coding work must be completed inline with CodexBridge tools rather than delegated to coding agents/subagents/agent CLIs installed on the host. It also carries dirty-worktree discipline, scope control, verification requirements, AGENTS/skills handling, planning, durable notes, bounded output, and continuation semantics.
 - **Isolation where it works, portability where it does not.** Linux auto mode uses Bubblewrap only after a real usability probe succeeds. With the default `MCP_ALLOW_UNSANDBOXED_EXEC=true`, an unavailable Bubblewrap backend falls back to native execution. When Bubblewrap works but Podman cannot operate inside it, Podman alone uses native execution; setting `MCP_ALLOW_UNSANDBOXED_EXEC=false` makes either case fail closed instead.
 
 YOLO does not disable authentication, project separation, structured filesystem-tool confinement, timeouts, concurrency limits, process limits, output caps, or auditing. Native shell fallback is intentionally different: when Bubblewrap is unavailable or bypassed, `exec_command` runs with the daemon account's normal filesystem and network reach, so the outer container/VM/account is the security boundary for shell execution.
@@ -227,7 +227,7 @@ Agent content (`AGENTS.md`, rules, skills, skill resources) is intentionally exe
 - process-tree termination;
 - Unix CPU and file-descriptor resource limits;
 - long-running sessions continued with `write_stdin`;
-- optional one-shot `stdin` plus `close_stdin=true` for CLIs/subagents that read until EOF;
+- optional one-shot `stdin` plus `close_stdin=true` for non-agent CLIs that read until EOF;
 - integrated signal-and-wait via `write_stdin(signal=..., wait_for_exit_ms=...)`, which drains final output and returns terminal status in the same call;
 - the initial `exec_command` wait is capped at 20 seconds so a long build does not sit on a common ~30-second MCP/HTTP request boundary; the process remains live and should be continued with `write_stdin`;
 - native Unix PTY / Windows ConPTY via `tty=true`;

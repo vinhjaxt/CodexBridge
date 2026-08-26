@@ -25,6 +25,8 @@ use crate::{
     project::ProjectContext,
 };
 
+const PROJECT_ACTIVITY_MAX_ENTRIES: usize = 4096;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunningTool {
     pub request_id: String,
@@ -52,6 +54,7 @@ struct AuditInner {
     dropped_pending: AtomicU64,
     running: DashMap<String, RunningTool>,
     project_activity: DashMap<String, ProjectActivity>,
+    project_activity_lock: Mutex<()>,
     cancellation: CancellationToken,
     writer: Mutex<Option<JoinHandle<()>>>,
 }
@@ -257,26 +260,49 @@ async fn writer_loop(inner: Arc<AuditInner>, mut receiver: mpsc::Receiver<AuditE
 }
 
 fn render_console(inner: &AuditInner, event: &Value) {
-    let console_limit = if event.get("event").and_then(Value::as_str) == Some("tool_call") {
-        inner.config.console_param_bytes
-    } else {
-        inner.config.console_result_bytes
-    };
-    let console = bound_event(
-        scrub(event, &inner.auth_token, console_limit),
-        console_limit.saturating_mul(4),
-    );
-    let title = event
-        .get("event")
+    if let Some(line) = console_line(inner, event) {
+        println!("{line}");
+    }
+}
+
+fn console_project(event: &Value) -> &str {
+    event
+        .get("project")
+        .and_then(Value::as_object)
+        .and_then(|project| {
+            project
+                .get("alias")
+                .and_then(Value::as_str)
+                .or_else(|| project.get("effective_key").and_then(Value::as_str))
+        })
+        .unwrap_or("global")
+}
+
+fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
+    let event_name = event.get("event").and_then(Value::as_str)?;
+    let project = console_project(event);
+    let tool = event
+        .get("tool")
         .and_then(Value::as_str)
-        .unwrap_or("EVENT")
-        .replace('_', " ")
-        .to_ascii_uppercase();
-    eprintln!(
-        "────────────────────────────────────────────────────────────\n{title}\n────────────────────────────────────────────────────────────\n{}",
-        serde_json::to_string_pretty(&console)
-            .unwrap_or_else(|_| "{\"event\":\"serialization_error\"}".into())
-    );
+        .unwrap_or("unknown");
+    match event_name {
+        "tool_call" => {
+            let params = event.get("params").cloned().unwrap_or(Value::Null);
+            let params = scrub(&params, &inner.auth_token, inner.config.console_param_bytes);
+            let params = bound_event(params, inner.config.console_param_bytes.saturating_mul(4));
+            let rendered = serde_json::to_string(&params)
+                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            Some(format!("[{project}] {tool} {rendered}"))
+        }
+        "tool_error" | "tool_timeout" => {
+            let error = event.get("error").cloned().unwrap_or(Value::Null);
+            let error = scrub(&error, &inner.auth_token, inner.config.console_result_bytes);
+            let rendered = serde_json::to_string(&error)
+                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            Some(format!("[{project}] {tool} {event_name}: {rendered}"))
+        }
+        _ => None,
+    }
 }
 
 async fn write_event(
@@ -338,6 +364,26 @@ async fn write_event(
 }
 
 impl AuditLogger {
+    fn update_project_activity(&self, key: String, activity: ProjectActivity) {
+        let Ok(_guard) = self.0.project_activity_lock.lock() else {
+            return;
+        };
+        if !self.0.project_activity.contains_key(&key)
+            && self.0.project_activity.len() >= PROJECT_ACTIVITY_MAX_ENTRIES
+        {
+            let victim = self
+                .0
+                .project_activity
+                .iter()
+                .find(|entry| entry.key().as_str() != key)
+                .map(|entry| entry.key().clone());
+            if let Some(victim) = victim {
+                self.0.project_activity.remove(&victim);
+            }
+        }
+        self.0.project_activity.insert(key, activity);
+    }
+
     pub async fn new(config: LogConfig, auth_token: String) -> Result<Self> {
         tokio::fs::create_dir_all(&config.root).await?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
@@ -350,6 +396,7 @@ impl AuditLogger {
             dropped_pending: AtomicU64::new(0),
             running: DashMap::new(),
             project_activity: DashMap::new(),
+            project_activity_lock: Mutex::new(()),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         });
@@ -498,7 +545,7 @@ impl AuditLogger {
             .unwrap_or_default();
         activity.last_tool = Some(tool.to_owned());
         activity.last_successful_operation = Some(tool.to_owned());
-        self.0.project_activity.insert(key, activity);
+        self.update_project_activity(key, activity);
         let audit_result = redact_tool_payload(result);
         self.emit(json!({"event":"tool_result","request_id":request_id,"tool":tool,"project":project_json(project),"duration_ms":started.elapsed().as_millis(),"status":"success","result":audit_result}));
     }
@@ -522,7 +569,7 @@ impl AuditLogger {
             .unwrap_or_default();
         activity.last_tool = Some(tool.to_owned());
         activity.last_error = Some(error_json.clone());
-        self.0.project_activity.insert(key, activity);
+        self.update_project_activity(key, activity);
         let event = if error.code() == "PROCESS_TIMEOUT" {
             "tool_timeout"
         } else {
@@ -634,6 +681,153 @@ mod tests {
         assert_eq!(bounded["truncated"], true);
         assert_eq!(bounded["event"], "tool_result");
         assert!(serde_json::to_vec(&bounded).unwrap().len() < 4608);
+    }
+
+    #[test]
+    fn project_activity_cache_is_bounded() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let config = LogConfig {
+                root: directory.path().to_path_buf(),
+                queue_capacity: 8,
+                queue_max_bytes: 64 * 1024,
+                console_param_bytes: 64,
+                console_result_bytes: 64,
+                file_event_bytes: 4096,
+                max_file_bytes: 1024 * 1024,
+                max_files: 1,
+            };
+            let logger = AuditLogger::new(config, "secret-token".into())
+                .await
+                .unwrap();
+            for index in 0..=PROJECT_ACTIVITY_MAX_ENTRIES {
+                logger.update_project_activity(
+                    format!("project-{index}"),
+                    ProjectActivity::default(),
+                );
+            }
+            assert_eq!(
+                logger.0.project_activity.len(),
+                PROJECT_ACTIVITY_MAX_ENTRIES
+            );
+            logger.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn concurrent_project_activity_updates_respect_the_hard_cap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let config = LogConfig {
+                root: directory.path().to_path_buf(),
+                queue_capacity: 8,
+                queue_max_bytes: 64 * 1024,
+                console_param_bytes: 64,
+                console_result_bytes: 64,
+                file_event_bytes: 4096,
+                max_file_bytes: 1024 * 1024,
+                max_files: 1,
+            };
+            let logger = AuditLogger::new(config, "secret-token".into())
+                .await
+                .unwrap();
+            std::thread::scope(|scope| {
+                for thread_index in 0..16 {
+                    let logger = logger.clone();
+                    scope.spawn(move || {
+                        for index in 0..400 {
+                            logger.update_project_activity(
+                                format!("project-{thread_index}-{index}"),
+                                ProjectActivity::default(),
+                            );
+                        }
+                    });
+                }
+            });
+            assert!(logger.0.project_activity.len() <= PROJECT_ACTIVITY_MAX_ENTRIES);
+            logger.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn console_output_is_compact_and_tool_focused() {
+        let config = LogConfig {
+            root: PathBuf::from("unused"),
+            queue_capacity: 8,
+            queue_max_bytes: 1024,
+            console_param_bytes: 256,
+            console_result_bytes: 256,
+            file_event_bytes: 4096,
+            max_file_bytes: 1024,
+            max_files: 1,
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let inner = AuditInner {
+            sender,
+            queue_bytes: Arc::new(Semaphore::new(1024)),
+            config,
+            auth_token: "bridge-secret".to_owned(),
+            dropped_total: AtomicU64::new(0),
+            dropped_pending: AtomicU64::new(0),
+            running: DashMap::new(),
+            project_activity: DashMap::new(),
+            project_activity_lock: Mutex::new(()),
+            cancellation: CancellationToken::new(),
+            writer: Mutex::new(None),
+        };
+        let line = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"grep",
+                "project":{"alias":"demo","effective_key":"opaque"},
+                "params":{"query":"needle","token":"must-hide"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "[demo] grep {\"query\":\"needle\",\"token\":\"[REDACTED]\"}"
+        );
+        assert!(console_line(&inner, &json!({"event":"tool_result"})).is_none());
+
+        let fallback = console_line(
+            &inner,
+            &json!({
+                "event":"tool_call",
+                "tool":"read_file",
+                "project":{"alias":null,"effective_key":"effective-project"},
+                "params":{"path":"src/lib.rs"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            fallback,
+            "[effective-project] read_file {\"path\":\"src/lib.rs\"}"
+        );
+
+        let error = console_line(
+            &inner,
+            &json!({
+                "event":"tool_error",
+                "tool":"exec_command",
+                "project":{"alias":"demo"},
+                "error":{"code":"PROCESS_FAILED","message":"bridge-secret failed"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            error,
+            "[demo] exec_command tool_error: {\"code\":\"PROCESS_FAILED\",\"message\":\"[REDACTED] failed\"}"
+        );
     }
 
     #[test]

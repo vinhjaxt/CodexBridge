@@ -273,6 +273,9 @@ struct InteractiveSession {
     requested_signal: Mutex<Option<ProcessSignal>>,
     started: Instant,
     last_activity: Mutex<Instant>,
+    /// Completion-relative retention anchor. `last_activity` can be much older
+    /// than process exit for commands that run unattended between polls.
+    finished_at: Mutex<Option<Instant>>,
     pid: Option<u32>,
     changed: Notify,
     drains_remaining: AtomicUsize,
@@ -498,13 +501,28 @@ impl ProcessRegistry {
             .entries
             .iter()
             .filter_map(|entry| {
-                let age = entry
-                    .last_activity
-                    .lock()
-                    .map(|value| now.saturating_duration_since(*value))
-                    .unwrap_or(self.idle);
-                (age >= self.idle || (entry.is_finished() && age >= Duration::from_secs(60)))
-                    .then(|| entry.key().clone())
+                let expired = if entry.is_finished() {
+                    let finished_age = entry
+                        .finished_at
+                        .lock()
+                        .ok()
+                        .and_then(|value| *value)
+                        .map(|value| now.saturating_duration_since(value))
+                        .unwrap_or_default();
+                    let retention = if entry.replay_pending.load(Ordering::Relaxed) {
+                        self.idle.max(Duration::from_secs(60))
+                    } else {
+                        Duration::from_secs(60)
+                    };
+                    finished_age >= retention
+                } else {
+                    entry
+                        .last_activity
+                        .lock()
+                        .map(|value| now.saturating_duration_since(*value) >= self.idle)
+                        .unwrap_or(true)
+                };
+                expired.then(|| entry.key().clone())
             })
             .collect();
         for id in expired {
@@ -530,7 +548,9 @@ impl ProcessRegistry {
             && let Some(oldest_finished) = self
                 .entries
                 .iter()
-                .filter(|entry| entry.is_finished())
+                .filter(|entry| {
+                    entry.is_finished() && !entry.replay_pending.load(Ordering::Relaxed)
+                })
                 .min_by_key(|entry| entry.started)
                 .map(|entry| entry.key().clone())
         {
@@ -614,6 +634,7 @@ impl ProcessRegistry {
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
+            finished_at: Mutex::new(None),
             pid: child.id(),
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(2),
@@ -688,6 +709,9 @@ impl ProcessRegistry {
             // bounded wait also prevents inherited pipe handles in misbehaving
             // grandchildren from retaining a session forever.
             wait_for_drains(&waiter_session, Duration::from_secs(5)).await;
+            if let Ok(mut finished_at) = waiter_session.finished_at.lock() {
+                *finished_at = Some(Instant::now());
+            }
             if let Ok(mut completion) = waiter_session.completion.lock() {
                 *completion = Some(completion_from_exit_status(
                     status,
@@ -744,6 +768,7 @@ impl ProcessRegistry {
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
+            finished_at: Mutex::new(None),
             pid,
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(1),
@@ -821,6 +846,9 @@ impl ProcessRegistry {
             };
             waiter_session.close_pty_handles_after_exit().await;
             wait_for_drains(&waiter_session, Duration::from_secs(5)).await;
+            if let Ok(mut finished_at) = waiter_session.finished_at.lock() {
+                *finished_at = Some(Instant::now());
+            }
             if let Ok(mut completion) = waiter_session.completion.lock() {
                 let exit_code = status.as_ref().and_then(|value| value.exit_code);
                 let inferred_signal = status.as_ref().and_then(|value| value.signal);
@@ -1562,6 +1590,7 @@ mod tests {
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
+            finished_at: Mutex::new(exit_code.map(|_| Instant::now())),
             pid: None,
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(0),
@@ -1570,6 +1599,65 @@ mod tests {
             process_permits: Mutex::new(None),
             cancellation: CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn cleanup_retains_finished_replay_from_completion_time() {
+        let registry = ProcessRegistry::new(4, Duration::from_secs(900), 1024);
+        let session = test_session(Some(0));
+        session.replay_pending.store(true, Ordering::Relaxed);
+        *session.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(3_600);
+        *session.finished_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(61));
+        registry.entries.insert("replay".to_owned(), session);
+
+        registry.cleanup();
+        assert!(registry.entries.contains_key("replay"));
+    }
+
+    #[test]
+    fn cleanup_expires_normal_finished_session_from_completion_time() {
+        let registry = ProcessRegistry::new(4, Duration::from_secs(900), 1024);
+        let session = test_session(Some(0));
+        *session.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(3_600);
+        *session.finished_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(61));
+        registry.entries.insert("finished".to_owned(), session);
+
+        registry.cleanup();
+        assert!(!registry.entries.contains_key("finished"));
+    }
+
+    #[test]
+    fn cleanup_keeps_freshly_finished_session_even_when_last_activity_is_stale() {
+        let registry = ProcessRegistry::new(4, Duration::from_secs(900), 1024);
+        let session = test_session(Some(0));
+        *session.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(86_400);
+        *session.finished_at.lock().unwrap() = Some(Instant::now());
+        registry.entries.insert("fresh-finish".to_owned(), session);
+
+        registry.cleanup();
+        assert!(registry.entries.contains_key("fresh-finish"));
+    }
+
+    #[test]
+    fn capacity_pressure_never_evicts_finished_session_with_pending_replay() {
+        let registry = ProcessRegistry::new(2, Duration::from_secs(900), 1024);
+        let replay = test_session(Some(0));
+        replay.replay_pending.store(true, Ordering::Relaxed);
+        let ordinary = test_session(Some(0));
+        registry.entries.insert("replay".to_owned(), replay);
+        registry.entries.insert("ordinary".to_owned(), ordinary);
+
+        let oldest_finished = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.is_finished() && !entry.replay_pending.load(Ordering::Relaxed))
+            .min_by_key(|entry| entry.started)
+            .map(|entry| entry.key().clone())
+            .unwrap();
+        registry.entries.remove(&oldest_finished);
+
+        assert!(registry.entries.contains_key("replay"));
+        assert!(!registry.entries.contains_key("ordinary"));
     }
 
     #[test]
@@ -1955,6 +2043,7 @@ mod tests {
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
+            finished_at: Mutex::new(None),
             pid: None,
             changed: Notify::new(),
             drains_remaining: AtomicUsize::new(1),

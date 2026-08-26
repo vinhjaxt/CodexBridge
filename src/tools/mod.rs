@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -100,6 +100,7 @@ fn server_contract_version(router: &ToolRouter<AgentHandler>) -> String {
 }
 
 const INSTRUCTION_SCOPE_CACHE_MAX_ENTRIES: usize = 4096;
+const PROJECT_PERMIT_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct InitArgs {
@@ -152,6 +153,7 @@ pub(crate) struct PatchUpdate {
 #[derive(Clone)]
 pub(crate) struct ProjectPermitRegistry {
     entries: Arc<DashMap<String, PermitSet>>,
+    mutation_lock: Arc<Mutex<()>>,
     tool_limit: usize,
     process_limit: usize,
 }
@@ -162,6 +164,7 @@ impl ProjectPermitRegistry {
     fn new(tool_limit: usize, process_limit: usize) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
+            mutation_lock: Arc::new(Mutex::new(())),
             tool_limit: tool_limit.max(1),
             process_limit: process_limit.max(1),
         }
@@ -173,6 +176,32 @@ impl ProjectPermitRegistry {
     ) -> AppResult<(Arc<Semaphore>, Arc<Semaphore>, Arc<Semaphore>)> {
         if let Some(entry) = self.entries.get(project_key) {
             return Ok(entry.clone());
+        }
+        let _mutation = self.mutation_lock.lock().map_err(|_| {
+            AppError::new("SERVER_BUSY", "project concurrency registry lock poisoned")
+        })?;
+        if let Some(entry) = self.entries.get(project_key) {
+            return Ok(entry.clone());
+        }
+        if self.entries.len() >= PROJECT_PERMIT_CACHE_MAX_ENTRIES {
+            let victim = self
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.key().as_str() != project_key
+                        && entry.value().0.available_permits() == self.tool_limit
+                        && entry.value().1.available_permits() == self.process_limit
+                        && entry.value().2.available_permits() == 1
+                })
+                .map(|entry| entry.key().clone());
+            if let Some(victim) = victim {
+                self.entries.remove(&victim);
+            } else {
+                return Err(AppError::new(
+                    "SERVER_BUSY",
+                    "project concurrency registry is full; retry after another project becomes idle",
+                ));
+            }
         }
         let value = (
             Arc::new(Semaphore::new(self.tool_limit)),
@@ -1835,6 +1864,68 @@ mod tests {
         assert!(Arc::ptr_eq(&first.0, &second.0));
         assert!(Arc::ptr_eq(&first.1, &second.1));
         assert!(Arc::ptr_eq(&first.2, &second.2));
+    }
+
+    #[test]
+    fn project_permit_registry_evicts_only_idle_entries_at_capacity() {
+        let registry = ProjectPermitRegistry::new(2, 3);
+        for index in 0..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
+            registry.get(&format!("project-{index}")).unwrap();
+        }
+        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+        registry.get("replacement").unwrap();
+        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+        assert!(registry.entries.contains_key("replacement"));
+    }
+
+    #[test]
+    fn project_permit_registry_fails_closed_when_every_entry_is_active() {
+        let registry = ProjectPermitRegistry::new(1, 1);
+        let mut held = Vec::with_capacity(PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+        for index in 0..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
+            let permits = registry.get(&format!("project-{index}")).unwrap();
+            held.push(permits.0.clone().try_acquire_owned().unwrap());
+        }
+        let error = registry.get("overflow").unwrap_err();
+        assert_eq!(error.code(), "SERVER_BUSY");
+        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+        drop(held);
+    }
+
+    #[test]
+    fn project_permit_registry_never_evicts_an_active_project() {
+        let registry = ProjectPermitRegistry::new(1, 1);
+        let active = registry.get("active").unwrap();
+        let held = active.0.clone().try_acquire_owned().unwrap();
+        for index in 1..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
+            registry.get(&format!("idle-{index}")).unwrap();
+        }
+
+        registry.get("replacement").unwrap();
+
+        assert!(registry.entries.contains_key("active"));
+        assert!(registry.entries.contains_key("replacement"));
+        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+        drop(held);
+    }
+
+    #[test]
+    fn concurrent_project_permit_inserts_respect_the_hard_cap() {
+        let registry = ProjectPermitRegistry::new(1, 1);
+        let threads = 16;
+        let inserts_per_thread = PROJECT_PERMIT_CACHE_MAX_ENTRIES / threads + 64;
+        std::thread::scope(|scope| {
+            for thread_index in 0..threads {
+                let registry = registry.clone();
+                scope.spawn(move || {
+                    for index in 0..inserts_per_thread {
+                        let _ = registry.get(&format!("p-{thread_index}-{index}"));
+                    }
+                });
+            }
+        });
+
+        assert!(registry.entries.len() <= PROJECT_PERMIT_CACHE_MAX_ENTRIES);
     }
 
     #[test]

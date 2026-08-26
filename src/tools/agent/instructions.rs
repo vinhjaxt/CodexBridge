@@ -206,6 +206,8 @@ mod tests {
             "multiple rounds of tool calls",
             "inspect -> reason over the evidence -> act with a tool -> inspect the result -> adjust -> verify",
             "Repeat this loop as many times as needed",
+            "Complete coding work inline with CodexBridge tools",
+            "Do not invoke, delegate to, or depend on coding agents, subagents, agent CLIs, or agent processes installed on the host",
             "Do not stop after the first plausible implementation",
             "Do not leave actionable TODOs",
             "default user-facing outcome should be a finished task",
@@ -259,7 +261,7 @@ mod tests {
         for needle in [
             "initial exec_command response is intentionally capped",
             "polled rather than retried",
-            "subagents that may read stdin until EOF",
+            "one-shot non-agent CLIs that may read stdin until EOF",
             "set close_stdin=true",
             "signal plus wait_for_exit_ms",
             "`failed` means the bridge could not obtain a reliable terminal wait result",
