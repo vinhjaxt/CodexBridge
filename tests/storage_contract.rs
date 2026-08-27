@@ -13,10 +13,12 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
         ("bravo", "2"),
         ("echo", "5"),
     ] {
-        storage.memory_set("project", key, value).unwrap();
+        storage.memory_archive_set("project", key, value).unwrap();
     }
 
-    let first = storage.memory_recall_page_from("project", 0, 2).unwrap();
+    let (first, snapshot_hash) = storage
+        .memory_archive_recall_page_from_snapshot("project", 0, 2, None)
+        .unwrap();
     assert_eq!(
         first
             .notes
@@ -30,8 +32,13 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
     assert!(first.truncated);
     assert_eq!(first.next_offset, Some(2));
 
-    let second = storage
-        .memory_recall_page_from("project", first.next_offset.unwrap(), 2)
+    let (second, _) = storage
+        .memory_archive_recall_page_from_snapshot(
+            "project",
+            first.next_offset.unwrap(),
+            2,
+            Some(&snapshot_hash),
+        )
         .unwrap();
     assert_eq!(
         second
@@ -43,8 +50,13 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
     );
     assert_eq!(second.next_offset, Some(4));
 
-    let third = storage
-        .memory_recall_page_from("project", second.next_offset.unwrap(), 2)
+    let (third, _) = storage
+        .memory_archive_recall_page_from_snapshot(
+            "project",
+            second.next_offset.unwrap(),
+            2,
+            Some(&snapshot_hash),
+        )
         .unwrap();
     assert_eq!(third.notes.len(), 1);
     assert_eq!(third.notes[0].key, "echo");
@@ -56,17 +68,19 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
 fn memory_pagination_accepts_exact_end_and_rejects_past_end() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    storage.memory_set("project", "a", "1").unwrap();
-    storage.memory_set("project", "b", "2").unwrap();
+    storage.memory_archive_set("project", "a", "1").unwrap();
+    storage.memory_archive_set("project", "b", "2").unwrap();
 
-    let end = storage.memory_recall_page_from("project", 2, 10).unwrap();
+    let (end, snapshot_hash) = storage
+        .memory_archive_recall_page_from_snapshot("project", 2, 10, None)
+        .unwrap();
     assert!(end.notes.is_empty());
     assert_eq!(end.total, 2);
     assert!(!end.truncated);
     assert_eq!(end.next_offset, None);
 
     let error = storage
-        .memory_recall_page_from("project", 3, 10)
+        .memory_archive_recall_page_from_snapshot("project", 3, 10, Some(&snapshot_hash))
         .unwrap_err();
     assert_eq!(error.code(), "INVALID_INPUT");
 }
@@ -76,7 +90,7 @@ fn memory_pagination_rejects_zero_page_size() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
     let error = storage
-        .memory_recall_page_from("project", 0, 0)
+        .memory_archive_recall_page_from_snapshot("project", 0, 0, None)
         .unwrap_err();
     assert_eq!(error.code(), "INVALID_INPUT");
 }
@@ -114,22 +128,16 @@ fn semantic_memory_hash_changes_for_update_and_delete() {
 }
 
 #[test]
-fn semantic_memory_hash_covers_entries_beyond_the_default_recall_page() {
+fn semantic_memory_hash_excludes_archive_history() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    for index in 0..129 {
-        storage
-            .memory_set("project", &format!("key-{index:03}"), "before")
-            .unwrap();
-    }
-    let page = storage.memory_recall_page("project").unwrap();
-    assert_eq!(page.notes.len(), 128);
-    assert!(page.truncated);
-
+    storage.memory_set("project", "active", "before").unwrap();
     let before = storage.memory_semantic_hash("project").unwrap();
-    storage.memory_set("project", "key-128", "after").unwrap();
+    storage
+        .memory_archive_set("project", "historical", "after")
+        .unwrap();
     let after = storage.memory_semantic_hash("project").unwrap();
-    assert_ne!(before, after);
+    assert_eq!(before, after);
 }
 
 #[test]

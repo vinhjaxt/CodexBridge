@@ -54,6 +54,8 @@ pub struct PreparedProjectInitialization {
     pub project: ProjectContext,
     pub joined: bool,
     pub reused_existing_binding: bool,
+    pub(crate) parent_turn_ref: Option<String>,
+    pub(crate) continuity_recovered: bool,
     subject_key: String,
     alias: Option<String>,
     expected_binding: Option<String>,
@@ -203,7 +205,7 @@ impl ProjectResolver {
         identity: &RequestIdentity,
         alias: Option<&str>,
     ) -> Result<PreparedProjectInitialization> {
-        self.prepare_initialize_inner(identity, alias, None)
+        self.prepare_initialize_inner(identity, alias, None, None, false)
     }
 
     pub fn prepare_turn_initialize(
@@ -212,22 +214,55 @@ impl ProjectResolver {
         alias: Option<&str>,
         previous_turn_ref: Option<&str>,
     ) -> Result<PreparedProjectInitialization> {
+        let native =
+            derive_native_project_key(&identity.openai_subject, &identity.openai_conversation_id);
         let subject_key = derive_subject_key(&identity.openai_subject);
-        let inherited_effective = if let Some(previous_turn_ref) = previous_turn_ref {
-            Some(
-                self.storage
-                    .turn_ref_effective_for_subject(previous_turn_ref, &subject_key)?
-                    .ok_or_else(|| {
-                        AppError::new(
-                            "TURN_REF_NOT_FOUND",
-                            "previous_turn_ref does not exist or is not available to this ChatGPT subject",
-                        )
-                    })?,
-            )
+        let expected_binding = self.storage.effective_binding(native.as_str())?;
+        let requested_alias = alias.filter(|value| !value.is_empty());
+
+        let (inherited_effective, parent_turn_ref, continuity_recovered) = if let Some(bound) =
+            expected_binding.as_deref()
+        {
+            if let Some(alias) = requested_alias {
+                self.validate_alias(alias)?;
+                if let Some(alias_effective) = self.storage.effective_for_alias(alias)?
+                    && alias_effective != bound
+                {
+                    return Err(AppError::new(
+                        "TURN_PROJECT_MISMATCH",
+                        "project_key belongs to another project than the project already bound to this conversation",
+                    ));
+                }
+            }
+            let resolved_parent = self
+                .storage
+                .continuity_parent_for_bound_native(native.as_str(), previous_turn_ref)?;
+            let recovered = resolved_parent.as_deref() != previous_turn_ref;
+            (Some(bound.to_owned()), resolved_parent, recovered)
+        } else if let Some(previous_turn_ref) = previous_turn_ref {
+            match self
+                .storage
+                .turn_ref_effective_for_subject(previous_turn_ref, &subject_key)?
+            {
+                Some(effective) => (Some(effective), Some(previous_turn_ref.to_owned()), false),
+                None if requested_alias.is_some() => (None, None, true),
+                None => {
+                    return Err(AppError::new(
+                        "PROJECT_KEY_REQUIRED",
+                        "previous_turn_ref cannot resolve a project for this new conversation; call chatgpt_turn_init on the next project-bearing user turn with the intended project_key",
+                    ));
+                }
+            }
         } else {
-            None
+            (None, None, false)
         };
-        self.prepare_initialize_inner(identity, alias, inherited_effective.as_deref())
+        self.prepare_initialize_inner(
+            identity,
+            alias,
+            inherited_effective.as_deref(),
+            parent_turn_ref,
+            continuity_recovered,
+        )
     }
 
     fn prepare_initialize_inner(
@@ -235,6 +270,8 @@ impl ProjectResolver {
         identity: &RequestIdentity,
         alias: Option<&str>,
         inherited_effective: Option<&str>,
+        parent_turn_ref: Option<String>,
+        continuity_recovered: bool,
     ) -> Result<PreparedProjectInitialization> {
         let native =
             derive_native_project_key(&identity.openai_subject, &identity.openai_conversation_id);
@@ -271,6 +308,8 @@ impl ProjectResolver {
             project,
             joined,
             reused_existing_binding,
+            parent_turn_ref,
+            continuity_recovered,
             subject_key,
             alias: requested_alias,
             expected_binding,
@@ -300,7 +339,6 @@ impl ProjectResolver {
         &self,
         prepared: &PreparedProjectInitialization,
         turn_ref: &str,
-        parent_turn_ref: Option<&str>,
         instruction_hash: &str,
         state_hash: &str,
         brief_snapshot: &str,
@@ -315,7 +353,8 @@ impl ProjectResolver {
             prepared.expected_alias_binding.as_deref(),
             TurnRefCommit {
                 turn_ref,
-                parent_turn_ref,
+                parent_turn_ref: prepared.parent_turn_ref.as_deref(),
+                force_full_brief: prepared.continuity_recovered,
                 instruction_hash,
                 state_hash,
                 subject_key: &prepared.subject_key,
@@ -707,7 +746,7 @@ mod tests {
             .prepare_turn_initialize(&original, Some("demo-project"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(&first, "r_A", None, "I1", "S1", "brief-A", None)
+            .commit_initialize_with_turn_ref(&first, "r_A", "I1", "S1", "brief-A", None)
             .unwrap();
 
         let prepared_branch = resolver
@@ -720,15 +759,7 @@ mod tests {
             first.project.effective_project_key
         );
         let outcome = resolver
-            .commit_initialize_with_turn_ref(
-                &prepared_branch,
-                "r_A1",
-                Some("r_A"),
-                "I1",
-                "S1",
-                "brief-A1",
-                None,
-            )
+            .commit_initialize_with_turn_ref(&prepared_branch, "r_A1", "I1", "S1", "brief-A1", None)
             .unwrap();
         assert_eq!(outcome.parent_turn_ref.as_deref(), Some("r_A"));
         assert_eq!(
@@ -749,17 +780,17 @@ mod tests {
             .prepare_turn_initialize(&original, Some("demo-project"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(&first, "r_A", None, "I1", "S1", "brief-A", None)
+            .commit_initialize_with_turn_ref(&first, "r_A", "I1", "S1", "brief-A", None)
             .unwrap();
 
         let error = resolver
             .prepare_turn_initialize(&other_user, None, Some("r_A"))
             .unwrap_err();
-        assert_eq!(error.code(), "TURN_REF_NOT_FOUND");
+        assert_eq!(error.code(), "PROJECT_KEY_REQUIRED");
     }
 
     #[test]
-    fn bound_conversation_requires_explicit_previous_turn_ref_for_next_turn() {
+    fn bound_conversation_recovers_when_previous_turn_ref_is_missing() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
         let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
@@ -769,24 +800,19 @@ mod tests {
             .prepare_turn_initialize(&request, Some("demo-project"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(&first, "r_A", None, "I1", "S1", "brief-A", None)
+            .commit_initialize_with_turn_ref(&first, "r_A", "I1", "S1", "brief-A", None)
             .unwrap();
 
         let missing_parent = resolver
             .prepare_turn_initialize(&request, None, None)
             .unwrap();
-        let error = resolver
-            .commit_initialize_with_turn_ref(
-                &missing_parent,
-                "r_B",
-                None,
-                "I1",
-                "S1",
-                "brief-B",
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(error.code(), "PREVIOUS_TURN_REF_REQUIRED");
+        assert_eq!(missing_parent.parent_turn_ref.as_deref(), Some("r_A"));
+        assert!(missing_parent.continuity_recovered);
+        let outcome = resolver
+            .commit_initialize_with_turn_ref(&missing_parent, "r_B", "I1", "S1", "brief-B", None)
+            .unwrap();
+        assert_eq!(outcome.parent_turn_ref.as_deref(), Some("r_A"));
+        assert_eq!(outcome.brief_snapshot.as_deref(), Some("brief-B"));
     }
 
     #[test]
@@ -800,22 +826,14 @@ mod tests {
             .prepare_turn_initialize(&request, Some("demo-project"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(&root, "r_root", None, "I1", "S1", "brief-root", None)
+            .commit_initialize_with_turn_ref(&root, "r_root", "I1", "S1", "brief-root", None)
             .unwrap();
 
         let child = resolver
             .prepare_turn_initialize(&request, None, Some("r_root"))
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(
-                &child,
-                "r_child",
-                Some("r_root"),
-                "I1",
-                "S1",
-                "brief-child",
-                None,
-            )
+            .commit_initialize_with_turn_ref(&child, "r_child", "I1", "S1", "brief-child", None)
             .unwrap();
 
         let duplicate = resolver
@@ -829,7 +847,6 @@ mod tests {
             .commit_initialize_with_turn_ref(
                 &duplicate,
                 "r_discarded_candidate",
-                Some("r_root"),
                 "I2",
                 "S2",
                 "brief-discarded",
@@ -861,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_conversation_rejects_a_parent_from_another_native_branch_as_stale() {
+    fn bound_conversation_recovers_from_parent_on_another_native_branch() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
         let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
@@ -875,7 +892,6 @@ mod tests {
             .commit_initialize_with_turn_ref(
                 &original_root,
                 "r_original",
-                None,
                 "I1",
                 "S1",
                 "brief-original",
@@ -890,7 +906,6 @@ mod tests {
             .commit_initialize_with_turn_ref(
                 &current_root,
                 "r_current",
-                None,
                 "I1",
                 "S1",
                 "brief-current",
@@ -901,22 +916,25 @@ mod tests {
         let stale = resolver
             .prepare_turn_initialize(&current, None, Some("r_original"))
             .unwrap();
-        let error = resolver
+        assert_eq!(stale.parent_turn_ref.as_deref(), Some("r_current"));
+        assert!(stale.continuity_recovered);
+        let outcome = resolver
             .commit_initialize_with_turn_ref(
                 &stale,
-                "r_should_not_commit",
-                Some("r_original"),
+                "r_should_commit",
                 "I1",
                 "S1",
-                "brief-stale",
+                "brief-recovered",
                 None,
             )
-            .unwrap_err();
-        assert_eq!(error.code(), "STALE_TURN_REF");
+            .unwrap();
+        assert_eq!(outcome.parent_turn_ref.as_deref(), Some("r_current"));
+        assert_eq!(outcome.effective_key, "shared-project");
+        assert_eq!(outcome.brief_snapshot.as_deref(), Some("brief-recovered"));
     }
 
     #[test]
-    fn explicit_alias_cannot_rebind_a_turn_reference_from_another_project() {
+    fn bound_conversation_ignores_turn_reference_from_another_project() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
         let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
@@ -927,47 +945,38 @@ mod tests {
             .prepare_turn_initialize(&first, Some("project-one"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(
-                &first_root,
-                "r_one",
-                None,
-                "I1",
-                "S1",
-                "brief-one",
-                None,
-            )
+            .commit_initialize_with_turn_ref(&first_root, "r_one", "I1", "S1", "brief-one", None)
             .unwrap();
 
         let second_root = resolver
             .prepare_turn_initialize(&second, Some("project-two"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(
-                &second_root,
-                "r_two",
-                None,
-                "I2",
-                "S2",
-                "brief-two",
-                None,
-            )
+            .commit_initialize_with_turn_ref(&second_root, "r_two", "I2", "S2", "brief-two", None)
             .unwrap();
 
         let prepared = resolver
             .prepare_turn_initialize(&second, Some("project-two"), Some("r_one"))
             .unwrap();
-        let error = resolver
+        assert_eq!(prepared.parent_turn_ref.as_deref(), Some("r_two"));
+        assert!(prepared.continuity_recovered);
+        let outcome = resolver
             .commit_initialize_with_turn_ref(
                 &prepared,
-                "r_mismatch",
-                Some("r_one"),
+                "r_recovered",
                 "I2",
                 "S2",
-                "brief-mismatch",
+                "brief-recovered",
                 None,
             )
+            .unwrap();
+        assert_eq!(outcome.effective_key, "project-two");
+        assert_eq!(outcome.parent_turn_ref.as_deref(), Some("r_two"));
+
+        let conflict = resolver
+            .prepare_turn_initialize(&second, Some("project-one"), Some("r_one"))
             .unwrap_err();
-        assert_eq!(error.code(), "TURN_PROJECT_MISMATCH");
+        assert_eq!(conflict.code(), "TURN_PROJECT_MISMATCH");
     }
 
     #[test]
@@ -1064,15 +1073,7 @@ mod tests {
             .prepare_turn_initialize(&identity("usr-a", "conv-a", None), Some("first"), None)
             .unwrap();
         resolver
-            .commit_initialize_with_turn_ref(
-                &first,
-                "r_duplicate",
-                None,
-                "I1",
-                "S1",
-                "brief-first",
-                None,
-            )
+            .commit_initialize_with_turn_ref(&first, "r_duplicate", "I1", "S1", "brief-first", None)
             .unwrap();
 
         let failed = resolver
@@ -1089,7 +1090,6 @@ mod tests {
                 .commit_initialize_with_turn_ref(
                     &failed,
                     "r_duplicate",
-                    None,
                     "I2",
                     "S2",
                     "brief-failed",

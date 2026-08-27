@@ -39,7 +39,7 @@ pub(crate) fn pre_init_instructions(config: &Config, upstream: &Aggregator) -> S
     let environment = RuntimeEnvironment::detect(config);
     let mut sections = vec![
         AGENT_BRIEF.to_owned(),
-        "Project lifecycle: for each new user message that needs project-scoped work or a project-state-dependent answer, call `chatgpt_turn_init` exactly once before any other project tool. On the first project-bearing turn, optionally pass `project_key` for explicit sharing/rejoin. On later turns, if the nearest preceding assistant final response contains a CodexBridge `[ref:...]`, pass that exact token as `previous_turn_ref`; a branched conversation can use the inherited reference to resolve the same effective project. Duplicate calls with the same `previous_turn_ref` are idempotent and reuse the same server-issued `turn_ref`. Instruction context and saved project state are hashed separately: AGENTS.md, skills, gateway catalogue, or environment/instruction changes can return a refreshed full brief, while memory/plan-only changes return a compact state update without repeating the full brief. After a successful call, do not call it again until the user sends another message. Project-specific state, skills, and AGENTS.md content are intentionally disclosed only by the successful turn initialization result.".to_owned(),
+        "Project lifecycle: for each new user message that needs project-scoped work or a project-state-dependent answer, call `chatgpt_turn_init` before any other project tool. On the first project-bearing turn, optionally pass `project_key` for explicit sharing/rejoin. On later turns, if the nearest preceding assistant final response contains a CodexBridge `[ref:...]`, pass that token as `previous_turn_ref`; a valid reference can resolve the same effective project for a new branch, while an already-bound conversation can recover from a missing, stale, or invalid reference by using its persisted project binding. If an unbound conversation supplies an unusable ref and receives `PROJECT_KEY_REQUIRED`, retry `chatgpt_turn_init` with the intended `project_key`; that failed attempt is non-mutating. Duplicate calls with the same valid `previous_turn_ref` are idempotent and reuse the same server-issued `turn_ref`. A successful result is intentionally minimal: consume `brief` when present, otherwise consume `state_update` when present, and always carry the returned `turn_ref` into the final `[ref:...]` marker and the next project-bearing turn. Active project memory is deliberately small and is always hydrated completely together with the current plan; archive/history is never injected automatically and should be retrieved with `recall` scope=archive only when needed. After a successful call, do not call it again until the user sends another message. Project-specific state, skills, and AGENTS.md content are intentionally disclosed only by the successful turn initialization result.".to_owned(),
         environment.render_agent_summary(),
     ];
     if let Some(gateways) = gateway_catalogue(upstream) {
@@ -157,10 +157,11 @@ mod tests {
         let config = config();
         let text = pre_init_instructions(&config, &Aggregator::default());
         assert!(text.contains("first project-bearing turn"));
-        assert!(text.contains("branched conversation"));
+        assert!(text.contains("new branch"));
         assert!(text.contains("chatgpt_turn_init"));
-        assert!(text.contains("exactly once"));
-        assert!(text.contains("nearest preceding assistant final response"));
+        assert!(text.contains("PROJECT_KEY_REQUIRED"));
+        assert!(text.contains("retry `chatgpt_turn_init`"));
+        assert!(text.contains("already-bound conversation"));
         assert!(!text.contains("--- project-doc ---"));
         assert!(!text.contains(&config.auth_token));
         assert!(!text.contains(config.workspace_root.to_string_lossy().as_ref()));

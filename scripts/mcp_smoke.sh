@@ -79,7 +79,7 @@ grep -q 'CodexBridge' "$run_root/modern-init.json"
 grep -Eq '"version":"[^"]+\+contract\.[0-9a-f]{12}"' "$run_root/modern-init.json"
 grep -q 'first project-bearing turn' "$run_root/modern-init.json"
 grep -q 'chatgpt_turn_init' "$run_root/modern-init.json"
-grep -q 'exactly once' "$run_root/modern-init.json"
+grep -q 'PROJECT_KEY_REQUIRED' "$run_root/modern-init.json"
 grep -q 'previous_turn_ref' "$run_root/modern-init.json"
 grep -q 'multiple rounds of tool calls' "$run_root/modern-init.json"
 grep -q 'Repeat this loop as many times as needed' "$run_root/modern-init.json"
@@ -109,13 +109,13 @@ curl -sS "${modern_headers[@]}" -H 'mcp-method: tools/list' \
 
 expected_tools='["apply_patch","chatgpt_turn_init","exec_command","gateway_gateway_smoke","glob","grep","list_directory","read_file","recall","remember","skills_list","skills_read","tree","update_plan","upstream_direct_smoke__mock_echo","view_image","write_stdin"]'
 jq -e --argjson expected "$expected_tools" '(.result.tools | map(.name) | sort) == ($expected | sort)' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "chatgpt_turn_init") | (.description | contains("idempotent")) and (.description | contains("stop_current_turn")) and (.inputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.status.enum == ["synchronized","soft_error"]) and (.outputSchema.properties.agent_action.enum == ["continue","stop_current_turn"]) and (.outputSchema.properties.soft_error.type == ["object","null"]) and (.outputSchema.properties.turn_ref.type == ["string","null"]) and (.outputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.instruction_hash.type == ["string","null"]) and (.outputSchema.properties.state_hash.type == ["string","null"]) and (.outputSchema.properties.instructions_changed.type == "boolean") and (.outputSchema.properties.state_changed.type == "boolean") and (.outputSchema.properties.turn_reused.type == "boolean") and (.outputSchema.properties.brief.type == ["string","null"]) and (.outputSchema.properties.state_update.type == ["string","null"])' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "chatgpt_turn_init") | (.description | contains("idempotent")) and (.description | contains("status=soft_error")) and (.inputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.status.enum == ["synchronized","soft_error"]) and (.outputSchema.properties.soft_error.type == "object") and (.outputSchema.properties.turn_ref.type == "string") and (.outputSchema.properties.brief.type == "string") and (.outputSchema.properties.state_update.type == "string") and (.outputSchema.properties | length == 5) and (.outputSchema.additionalProperties == false)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_list") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_read") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.snapshot_hash.type == ["string","null"] and .inputSchema.properties.include_plan.type == "boolean" and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.snapshot_hash.type == ["string","null"] and .inputSchema.properties.include_plan.type == "boolean" and .inputSchema.properties.scope["$ref"] == "#/$defs/MemoryScope" and .inputSchema["$defs"].MemoryScope.enum == ["active","archive"] and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "exec_command") | .inputSchema.properties.stdin.type == ["string","null"] and .inputSchema.properties.close_stdin.type == "boolean" and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "write_stdin") | .inputSchema.properties.since_output_offset.type == ["integer","null"] and .inputSchema.properties.wait_for_exit_ms.type == ["integer","null"] and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "remember") | (.description | contains("costly to rediscover")) and (.description | contains("memory_set") | not)' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "remember") | (.description | contains("costly to rediscover")) and (.description | contains("scope=archive")) and (.inputSchema.properties.scope["$ref"] == "#/$defs/MemoryScope") and (.inputSchema["$defs"].MemoryScope.enum == ["active","archive"]) and (.description | contains("memory_set") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "grep") | .outputSchema.properties.incomplete.type == "boolean" and .outputSchema.properties.skipped_files.type == "integer" and .outputSchema.properties.traversal_limit_hit.type == "boolean"' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "exec_command") | (.description | contains("Shell:")) and (.description | contains("Default backend:"))' "$run_root/tools.json" >/dev/null
 for removed in exec run_command search_files write_file read_files file_info project_info project_status memory_set plan_get task_add clock_now git_status git_commit; do
@@ -157,11 +157,9 @@ call_tool_with_meta chatgpt_turn_init 1001 '{}' "$partial_meta" "$run_root/parti
 jq -e '.result.isError == true and .result.structuredContent == null and (.result.content[0].text | startswith("INCOMPLETE_OPENAI_CONTEXT:"))' "$run_root/partial-openai-context.json" >/dev/null
 
 call_tool chatgpt_turn_init 4 '{"project_key":"production-stress-test"}' "$run_root/project.json"
-jq -e '.result.structuredContent.initialized == true and .result.structuredContent.workspace_state == "new" and .result.structuredContent.reused_existing_binding == false and .result.structuredContent.previous_turn_ref == null and .result.structuredContent.instructions_changed == true and .result.structuredContent.state_changed == true and .result.structuredContent.turn_reused == false and (.result.structuredContent.instruction_hash | type == "string") and (.result.structuredContent.state_hash | type == "string") and (.result.structuredContent.turn_ref | startswith("r_")) and (.result.structuredContent.brief | type == "string") and .result.structuredContent.state_update == null' "$run_root/project.json" >/dev/null
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent.turn_ref | startswith("r_")) and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | has("state_update") | not) and (.result.structuredContent | length == 3)' "$run_root/project.json" >/dev/null
 [[ -d "$workspace/production-stress-test" ]]
 first_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/project.json")"
-first_instruction_hash="$(jq -r '.result.structuredContent.instruction_hash' "$run_root/project.json")"
-first_state_hash="$(jq -r '.result.structuredContent.state_hash' "$run_root/project.json")"
 [[ ${#first_turn_ref} -eq 24 ]]
 grep -q 'YOLO semantics' "$run_root/project.json"
 grep -q 'gateway_gateway_smoke' "$run_root/project.json"
@@ -171,38 +169,57 @@ grep -F -q "[ref:${first_turn_ref}]" "$run_root/project.json"
 # Simulate the next user turn: pass the nearest prior CodexBridge ref explicitly.
 # Instructions and state are unchanged, so the server returns only a compact receipt.
 call_tool chatgpt_turn_init 44 "$(jq -cn --arg previous "$first_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-existing.json"
-jq -e --arg previous "$first_turn_ref" --arg instructions "$first_instruction_hash" --arg state "$first_state_hash" '.result.structuredContent.workspace_state == "existing" and .result.structuredContent.reused_existing_binding == true and .result.structuredContent.previous_turn_ref == $previous and .result.structuredContent.turn_ref != $previous and .result.structuredContent.instruction_hash == $instructions and .result.structuredContent.state_hash == $state and .result.structuredContent.instructions_changed == false and .result.structuredContent.state_changed == false and .result.structuredContent.turn_reused == false and .result.structuredContent.brief == null and .result.structuredContent.state_update == null' "$run_root/project-existing.json" >/dev/null
+jq -e --arg previous "$first_turn_ref" '.result.structuredContent.status == "synchronized" and .result.structuredContent.turn_ref != $previous and (.result.structuredContent | length == 2)' "$run_root/project-existing.json" >/dev/null
 second_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/project-existing.json")"
-jq -e --slurpfile first "$run_root/project.json" '.result.structuredContent.effective_project_key == $first[0].result.structuredContent.effective_project_key' "$run_root/project-existing.json" >/dev/null
 grep -F -q "[ref:${second_turn_ref}]" "$run_root/project-existing.json"
 
 # An accidental second init in the same turn carries the same previous ref.
 # It must be idempotent and return the already-created second turn.
 call_tool chatgpt_turn_init 46 "$(jq -cn --arg previous "$first_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-duplicate.json"
-jq -e --arg previous "$first_turn_ref" --arg current "$second_turn_ref" '.result.structuredContent.previous_turn_ref == $previous and .result.structuredContent.turn_ref == $current and .result.structuredContent.turn_reused == true and .result.structuredContent.instructions_changed == false and .result.structuredContent.state_changed == false and .result.structuredContent.brief == null and .result.structuredContent.state_update == null' "$run_root/project-duplicate.json" >/dev/null
+jq -e --arg current "$second_turn_ref" '.result.structuredContent.status == "synchronized" and .result.structuredContent.turn_ref == $current and (.result.structuredContent | length == 2)' "$run_root/project-duplicate.json" >/dev/null
 
-# Once bound, omitting the previous ref returns an MCP-success soft stop rather
-# than a tool execution error or silently creating an ambiguous additional turn.
+# Archive/history is durable but is not part of auto-hydrated active state.
+call_tool remember 1046 '{"key":"history/smoke","value":"ARCHIVE_ONLY_SMOKE","scope":"archive"}' "$run_root/archive-remember.json"
+jq -e '.result.structuredContent.saved == true and .result.structuredContent.deleted == false' "$run_root/archive-remember.json" >/dev/null
+call_tool recall 1047 '{"scope":"archive","key":"history/smoke"}' "$run_root/archive-recall.json"
+jq -e '.result.structuredContent.key == "history/smoke" and .result.structuredContent.value == "ARCHIVE_ONLY_SMOKE"' "$run_root/archive-recall.json" >/dev/null
+call_tool chatgpt_turn_init 1048 "$(jq -cn --arg previous "$second_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/archive-only-turn.json"
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent | length == 2)' "$run_root/archive-only-turn.json" >/dev/null
+archive_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/archive-only-turn.json")"
+
+# Once bound, omitting the previous ref recovers from the conversation binding,
+# anchors the new turn to the latest native turn, and forces a full brief refresh.
 call_tool chatgpt_turn_init 47 '{}' "$run_root/project-missing-parent.json"
-jq -e '.result.isError != true and .result.structuredContent.status == "soft_error" and .result.structuredContent.agent_action == "stop_current_turn" and .result.structuredContent.initialized == false and .result.structuredContent.turn_ref == null and .result.structuredContent.soft_error.code == "PREVIOUS_TURN_REF_REQUIRED" and .result.structuredContent.soft_error.retry_on_next_user_turn == true and (.result.content[0].text | startswith("STOP_CURRENT_TURN:"))' "$run_root/project-missing-parent.json" >/dev/null
+jq -e '.result.isError != true and .result.structuredContent.status == "synchronized" and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | has("state_update") | not) and (.result.structuredContent | length == 3)' "$run_root/project-missing-parent.json" >/dev/null
+recovered_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/project-missing-parent.json")"
+[[ "$recovered_turn_ref" != "$archive_turn_ref" ]]
+! grep -q 'ARCHIVE_ONLY_SMOKE' "$run_root/project-missing-parent.json"
+grep -F -q "[ref:${recovered_turn_ref}]" "$run_root/project-missing-parent.json"
+
+# A bad ref on an unbound conversation cannot identify a project. The failure is
+# non-mutating and retryable immediately with the intended project alias.
+retry_meta='"openai/subject":"usr_test","openai/session":"conv_retry","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}'
+call_tool_with_meta chatgpt_turn_init 48 '{"previous_turn_ref":"r_invalid"}' "$retry_meta" "$run_root/project-key-required.json"
+jq -e '.result.isError == true and .result.structuredContent == null and (.result.content[0].text | startswith("PROJECT_KEY_REQUIRED:"))' "$run_root/project-key-required.json" >/dev/null
+call_tool_with_meta chatgpt_turn_init 49 '{"project_key":"production-stress-test","previous_turn_ref":"r_invalid"}' "$retry_meta" "$run_root/project-key-retry.json"
+jq -e '.result.isError != true and .result.structuredContent.status == "synchronized" and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | length == 3)' "$run_root/project-key-retry.json" >/dev/null
 
 # Mutate only durable project state during the second turn. The next turn must
 # return a compact state delta without re-sending the instruction brief.
 call_tool update_plan 82 '{"plan":[{"step":"state-only-smoke","status":"in_progress"}],"explanation":"state hash smoke"}' "$run_root/state-only-plan.json"
-call_tool chatgpt_turn_init 83 "$(jq -cn --arg previous "$second_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-state-changed.json"
-jq -e --arg previous "$second_turn_ref" --arg instructions "$first_instruction_hash" --arg old_state "$first_state_hash" '.result.structuredContent.previous_turn_ref == $previous and .result.structuredContent.instruction_hash == $instructions and .result.structuredContent.state_hash != $old_state and .result.structuredContent.instructions_changed == false and .result.structuredContent.state_changed == true and .result.structuredContent.turn_reused == false and .result.structuredContent.brief == null and (.result.structuredContent.state_update | type == "string")' "$run_root/project-state-changed.json" >/dev/null
+call_tool chatgpt_turn_init 83 "$(jq -cn --arg previous "$recovered_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-state-changed.json"
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent.state_update | type == "string") and (.result.structuredContent | has("brief") | not) and (.result.structuredContent | length == 3)' "$run_root/project-state-changed.json" >/dev/null
 third_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/project-state-changed.json")"
-state_only_hash="$(jq -r '.result.structuredContent.state_hash' "$run_root/project-state-changed.json")"
 grep -q 'state-only-smoke' "$run_root/project-state-changed.json"
-grep -q 'recall pagination and include_plan=true' "$run_root/project-state-changed.json"
+grep -q 'complete active memory and current plan' "$run_root/project-state-changed.json"
 grep -F -q "[ref:${third_turn_ref}]" "$run_root/project-state-changed.json"
 
 # Duplicate continuation replay must return the snapshot committed for that turn,
 # even if durable state changes after the original response. Restore the state
 # afterward so the following instruction-only change remains isolated.
 call_tool update_plan 87 '{"plan":[{"step":"state-after-original-response","status":"in_progress"}],"explanation":"retry replay mutation"}' "$run_root/replay-mutated-plan.json"
-call_tool chatgpt_turn_init 88 "$(jq -cn --arg previous "$second_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-replay-after-state-change.json"
-jq -e --arg current "$third_turn_ref" --arg state "$state_only_hash" '.result.structuredContent.turn_ref == $current and .result.structuredContent.turn_reused == true and .result.structuredContent.state_hash == $state and .result.structuredContent.instructions_changed == false and .result.structuredContent.state_changed == true and .result.structuredContent.brief == null and (.result.structuredContent.state_update | type == "string")' "$run_root/project-replay-after-state-change.json" >/dev/null
+call_tool chatgpt_turn_init 88 "$(jq -cn --arg previous "$recovered_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-replay-after-state-change.json"
+jq -e --arg current "$third_turn_ref" '.result.structuredContent.status == "synchronized" and .result.structuredContent.turn_ref == $current and (.result.structuredContent.state_update | type == "string") and (.result.structuredContent | length == 3)' "$run_root/project-replay-after-state-change.json" >/dev/null
 grep -q 'state-only-smoke' "$run_root/project-replay-after-state-change.json"
 ! grep -q 'state-after-original-response' "$run_root/project-replay-after-state-change.json"
 call_tool update_plan 89 '{"plan":[{"step":"state-only-smoke","status":"in_progress"}],"explanation":"state hash smoke"}' "$run_root/replay-restore-plan.json"
@@ -280,7 +297,7 @@ jq -e '.result.structuredContent.applied == true' "$run_root/patch.json" >/dev/n
 # A later user turn observes the new root AGENTS.md and root skill catalogue.
 # The instruction hash changes while the saved-state hash remains stable.
 call_tool chatgpt_turn_init 48 "$(jq -cn --arg previous "$third_turn_ref" '{previous_turn_ref:$previous}')" "$run_root/project-context-changed.json"
-jq -e --arg previous "$third_turn_ref" --arg old_instructions "$first_instruction_hash" --arg state "$state_only_hash" '.result.structuredContent.previous_turn_ref == $previous and .result.structuredContent.instructions_changed == true and .result.structuredContent.state_changed == false and .result.structuredContent.turn_reused == false and .result.structuredContent.instruction_hash != $old_instructions and .result.structuredContent.state_hash == $state and (.result.structuredContent.brief | type == "string") and .result.structuredContent.state_update == null' "$run_root/project-context-changed.json" >/dev/null
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | has("state_update") | not) and (.result.structuredContent | length == 3)' "$run_root/project-context-changed.json" >/dev/null
 fourth_turn_ref="$(jq -r '.result.structuredContent.turn_ref' "$run_root/project-context-changed.json")"
 grep -q 'SMOKE_AGENT_INSTRUCTION' "$run_root/project-context-changed.json"
 grep -q 'integration smoke checks' "$run_root/project-context-changed.json"
@@ -318,7 +335,7 @@ grep -q 'services/api/visible.txt' "$run_root/nested-ignore-glob.json"
 # a full brief even when both stored hashes themselves did not change.
 branch_meta='"openai/subject":"usr_test","openai/session":"conv_branch","io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}'
 call_tool_with_meta chatgpt_turn_init 49 "$(jq -cn --arg previous "$fourth_turn_ref" '{previous_turn_ref:$previous}')" "$branch_meta" "$run_root/project-branch.json"
-jq -e --slurpfile main "$run_root/project-context-changed.json" --arg previous "$fourth_turn_ref" '.result.structuredContent.workspace_state == "joined" and .result.structuredContent.previous_turn_ref == $previous and .result.structuredContent.instructions_changed == true and .result.structuredContent.state_changed == true and (.result.structuredContent.brief | type == "string") and .result.structuredContent.effective_project_key == $main[0].result.structuredContent.effective_project_key' "$run_root/project-branch.json" >/dev/null
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | length == 3)' "$run_root/project-branch.json" >/dev/null
 
 blank_envelope_patch="$(printf '\n\n*** Begin Patch\n*** Add File: blank-envelope.txt\n+BLANK_ENVELOPE_OK\n*** End Patch\n\n')"
 call_tool apply_patch 73 "$(jq -cn --arg input "$blank_envelope_patch" '{input:$input}')" "$run_root/blank-envelope-patch.json"
@@ -535,11 +552,11 @@ other_meta='"openai/subject":"usr_other","openai/session":"conv_other","io.model
 # A turn reference is continuity metadata for one ChatGPT subject, not a bearer
 # capability that lets another user join the referenced effective project.
 call_tool_with_meta chatgpt_turn_init 51 "$(jq -cn --arg previous "$fourth_turn_ref" '{previous_turn_ref:$previous}')" "$other_meta" "$run_root/cross-subject-ref.json"
-jq -e '.result.isError != true and .result.structuredContent.status == "soft_error" and .result.structuredContent.agent_action == "stop_current_turn" and .result.structuredContent.initialized == false and .result.structuredContent.turn_ref == null and .result.structuredContent.soft_error.code == "TURN_REF_NOT_FOUND" and .result.structuredContent.soft_error.retry_on_next_user_turn == true and (.result.content[0].text | startswith("STOP_CURRENT_TURN:"))' "$run_root/cross-subject-ref.json" >/dev/null
-# The harness now simulates that subject's next user turn, where starting its own
-# project is valid because it has no prior successful CodexBridge turn reference.
+jq -e '.result.isError == true and .result.structuredContent == null and (.result.content[0].text | startswith("PROJECT_KEY_REQUIRED:"))' "$run_root/cross-subject-ref.json" >/dev/null
+# The failed attempt is non-mutating, so the same turn can retry with an explicit
+# project key and then continue normally after successful synchronization.
 call_tool_with_meta chatgpt_turn_init 52 '{"project_key":"other-workspace"}' "$other_meta" "$run_root/other-project.json"
-jq -e '.result.structuredContent.workspace_state == "new" and .result.structuredContent.instructions_changed == true and .result.structuredContent.state_changed == true' "$run_root/other-project.json" >/dev/null
+jq -e '.result.structuredContent.status == "synchronized" and (.result.structuredContent.brief | type == "string") and (.result.structuredContent | length == 3)' "$run_root/other-project.json" >/dev/null
 call_tool_with_meta write_stdin 53 "$(jq -cn --arg id "$session" '{session_id:$id,chars:""}')" "$other_meta" "$run_root/cross-project-session.json"
 jq -e '.result.isError == true and .result.structuredContent == null and (.result.content[0].text | startswith("FILE_NOT_FOUND:"))' "$run_root/cross-project-session.json" >/dev/null
 call_tool write_stdin 15 "$(jq -cn --arg id "$session" '{session_id:$id,chars:"hello\n",close_stdin:true,yield_time_ms:5000}')" "$run_root/stdin.json"

@@ -19,9 +19,12 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, Result};
 
 pub const MEMORY_KEY_MAX_BYTES: usize = 256;
-pub const MEMORY_VALUE_MAX_BYTES: usize = 256 * 1024;
-pub const MEMORY_MAX_ENTRIES: usize = 512;
-pub const MEMORY_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+pub const MEMORY_VALUE_MAX_BYTES: usize = 64 * 1024;
+pub const MEMORY_MAX_ENTRIES: usize = 64;
+pub const MEMORY_MAX_TOTAL_BYTES: usize = 64 * 1024;
+pub const MEMORY_ARCHIVE_VALUE_MAX_BYTES: usize = 256 * 1024;
+pub const MEMORY_ARCHIVE_MAX_ENTRIES: usize = 4096;
+pub const MEMORY_ARCHIVE_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub const MEMORY_RECALL_MAX_ENTRIES: usize = 128;
 pub const MEMORY_RECALL_MAX_BYTES: usize = 1024 * 1024;
 
@@ -30,7 +33,7 @@ pub const PLAN_ITEM_MAX_BYTES: usize = 4096;
 pub const PLAN_EXPLANATION_MAX_BYTES: usize = 16 * 1024;
 pub const PLAN_MAX_TOTAL_BYTES: usize = 256 * 1024;
 const PLAN_STORAGE_MAX_BYTES: usize = 512 * 1024;
-const STORAGE_SCHEMA_VERSION: i64 = 4;
+const STORAGE_SCHEMA_VERSION: i64 = 5;
 const STORAGE_READ_CONNECTIONS: usize = 4;
 const STORAGE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,6 +54,7 @@ pub struct Storage {
 pub(crate) struct TurnRefCommit<'a> {
     pub turn_ref: &'a str,
     pub parent_turn_ref: Option<&'a str>,
+    pub force_full_brief: bool,
     pub instruction_hash: &'a str,
     pub state_hash: &'a str,
     pub subject_key: &'a str,
@@ -179,6 +183,73 @@ fn validate_memory_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_archive_value(value: &str) -> Result<()> {
+    if value.len() > MEMORY_ARCHIVE_VALUE_MAX_BYTES {
+        return Err(input_too_large(format!(
+            "archive memory value exceeds {MEMORY_ARCHIVE_VALUE_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE memory_archive(project_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_key,key));",
+    )?;
+
+    let mut projects_statement =
+        transaction.prepare("SELECT DISTINCT project_key FROM memories ORDER BY project_key")?;
+    let projects = projects_statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(projects_statement);
+
+    for project in projects {
+        let mut statement = transaction.prepare(
+            "SELECT key,value,updated_at FROM memories WHERE project_key=?1 ORDER BY updated_at DESC,key ASC",
+        )?;
+        let rows = statement
+            .query_map([&project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut kept_entries = 0usize;
+        let mut kept_bytes = 0usize;
+        for (key, value, updated_at) in rows {
+            let entry_bytes = key.len().saturating_add(value.len());
+            let keep_active = value.len() <= MEMORY_VALUE_MAX_BYTES
+                && kept_entries < MEMORY_MAX_ENTRIES
+                && kept_bytes.saturating_add(entry_bytes) <= MEMORY_MAX_TOTAL_BYTES;
+            if keep_active {
+                kept_entries += 1;
+                kept_bytes = kept_bytes.saturating_add(entry_bytes);
+                continue;
+            }
+
+            validate_archive_value(&value)?;
+            transaction.execute(
+                "INSERT INTO memory_archive(project_key,key,value,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(project_key,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![&project, &key, &value, &updated_at],
+            )?;
+            transaction.execute(
+                "DELETE FROM memories WHERE project_key=?1 AND key=?2",
+                params![&project, &key],
+            )?;
+        }
+    }
+
+    transaction.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn validate_task_text(task: &TaskRecord) -> Result<()> {
     if !matches!(
         task.status.as_str(),
@@ -304,14 +375,16 @@ impl Storage {
                  CREATE TABLE aliases(alias TEXT PRIMARY KEY COLLATE NOCASE, effective_key TEXT NOT NULL);
                  CREATE TABLE bindings(native_key TEXT PRIMARY KEY, effective_key TEXT NOT NULL);
                  CREATE TABLE memories(project_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_key,key));
+                 CREATE TABLE memory_archive(project_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_key,key));
                  CREATE TABLE plans(project_key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
                  CREATE TABLE tasks(project_key TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, details TEXT, parent_task TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, PRIMARY KEY(project_key,id));
                  CREATE TABLE turn_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, turn_ref TEXT NOT NULL UNIQUE, native_key TEXT NOT NULL, effective_key TEXT NOT NULL, subject_key TEXT NOT NULL, parent_turn_ref TEXT, instruction_hash TEXT NOT NULL, state_hash TEXT NOT NULL, brief_snapshot TEXT, state_snapshot TEXT, created_at TEXT NOT NULL);
                  CREATE INDEX turn_refs_native_id ON turn_refs(native_key,id DESC);
                  CREATE UNIQUE INDEX turn_refs_native_parent_unique ON turn_refs(native_key,parent_turn_ref) WHERE parent_turn_ref IS NOT NULL;
-                 PRAGMA user_version=4;
+                 PRAGMA user_version=5;
                  COMMIT;",
             )?,
+            4 => migrate_v4_to_v5(&mut writer_connection)?,
             STORAGE_SCHEMA_VERSION => {}
             version => {
                 return Err(AppError::new(
@@ -322,7 +395,7 @@ impl Storage {
                 ));
             }
         }
-        validate_schema_v4(&writer_connection)?;
+        validate_schema_v5(&writer_connection)?;
 
         let mut readers = Vec::with_capacity(STORAGE_READ_CONNECTIONS);
         for _ in 0..STORAGE_READ_CONNECTIONS {
@@ -462,6 +535,7 @@ impl Storage {
             Some((
                 turn.turn_ref,
                 turn.parent_turn_ref,
+                turn.force_full_brief,
                 turn.instruction_hash,
                 turn.state_hash,
                 turn.subject_key,
@@ -487,7 +561,16 @@ impl Storage {
         alias: Option<&str>,
         expected_binding: Option<&str>,
         expected_alias_binding: Option<&str>,
-        turn_ref: Option<(&str, Option<&str>, &str, &str, &str, &str, Option<&str>)>,
+        turn_ref: Option<(
+            &str,
+            Option<&str>,
+            bool,
+            &str,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+        )>,
     ) -> Result<Option<TurnRefCommitOutcome>> {
         let native_key = native_key.to_owned();
         let effective_key = effective_key.to_owned();
@@ -498,6 +581,7 @@ impl Storage {
             |(
                 turn_ref,
                 parent_turn_ref,
+                force_full_brief,
                 instruction_hash,
                 state_hash,
                 subject_key,
@@ -507,6 +591,7 @@ impl Storage {
                 (
                     turn_ref.to_owned(),
                     parent_turn_ref.map(str::to_owned),
+                    force_full_brief,
                     instruction_hash.to_owned(),
                     state_hash.to_owned(),
                     subject_key.to_owned(),
@@ -517,7 +602,7 @@ impl Storage {
         );
         self.with_write(move |connection| {
             let transaction = connection.transaction()?;
-            if let Some((_, Some(parent_turn_ref), _, _, subject_key, _, _)) = turn_ref.as_ref()
+            if let Some((_, Some(parent_turn_ref), _, _, _, subject_key, _, _)) = turn_ref.as_ref()
                 && let Some(existing) = transaction
                     .query_row(
                         "SELECT turn_ref,effective_key,instruction_hash,state_hash,brief_snapshot,state_snapshot FROM turn_refs WHERE native_key=?1 AND parent_turn_ref=?2",
@@ -611,13 +696,20 @@ impl Storage {
 
             if turn_ref
                 .as_ref()
-                .is_some_and(|(_, parent_turn_ref, _, _, _, _, _)| parent_turn_ref.is_none())
+                .is_some_and(|(_, parent_turn_ref, _, _, _, _, _, _)| parent_turn_ref.is_none())
                 && current_binding.is_some()
             {
-                return Err(AppError::new(
-                    "PREVIOUS_TURN_REF_REQUIRED",
-                    "this conversation is already bound; call chatgpt_turn_init with previous_turn_ref from the nearest preceding CodexBridge [ref:...] marker",
-                ));
+                let has_turn: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM turn_refs WHERE native_key=?1)",
+                    [&native_key],
+                    |row| row.get(0),
+                )?;
+                if has_turn {
+                    return Err(AppError::new(
+                        "PREVIOUS_TURN_REF_REQUIRED",
+                        "this conversation already has turn history but no continuity parent was resolved",
+                    ));
+                }
             }
 
             let mut alias_needs_insert = false;
@@ -643,7 +735,7 @@ impl Storage {
 
             let inherited_existing_project = turn_ref
                 .as_ref()
-                .is_some_and(|(_, parent_turn_ref, _, _, _, _, _)| parent_turn_ref.is_some());
+                .is_some_and(|(_, parent_turn_ref, _, _, _, _, _, _)| parent_turn_ref.is_some());
             if current_binding.is_none()
                 && !joining_existing_alias
                 && !inherited_existing_project
@@ -685,7 +777,7 @@ impl Storage {
                       |row| row.get::<_, String>(0),
                   )
                   .optional()?;
-            let turn_outcome = if let Some((turn_ref, parent_turn_ref, instruction_hash, state_hash, subject_key, brief_snapshot, state_snapshot)) = turn_ref.as_ref() {
+            let turn_outcome = if let Some((turn_ref, parent_turn_ref, force_full_brief, instruction_hash, state_hash, subject_key, brief_snapshot, state_snapshot)) = turn_ref.as_ref() {
                 let (parent_native_key, parent_instruction_hash, parent_state_hash) = if let Some(parent_turn_ref) = parent_turn_ref.as_ref() {
                     let parent = transaction
                         .query_row(
@@ -739,10 +831,12 @@ impl Storage {
                 let branched = parent_native_key
                     .as_deref()
                     .is_some_and(|parent_native| parent_native != native_key.as_str());
-                let instructions_changed = parent_turn_ref.is_none()
+                let instructions_changed = *force_full_brief
+                    || parent_turn_ref.is_none()
                     || branched
                     || parent_instruction_hash.as_deref() != Some(instruction_hash.as_str());
-                let state_changed = parent_turn_ref.is_none()
+                let state_changed = *force_full_brief
+                    || parent_turn_ref.is_none()
                     || branched
                     || parent_state_hash.as_deref() != Some(state_hash.as_str());
                 let stored_brief = instructions_changed.then_some(brief_snapshot.as_str());
@@ -812,6 +906,39 @@ impl Storage {
                     None
                 }
             }))
+        })
+    }
+
+    pub(crate) fn continuity_parent_for_bound_native(
+        &self,
+        native_key: &str,
+        requested_turn_ref: Option<&str>,
+    ) -> Result<Option<String>> {
+        let native_key = native_key.to_owned();
+        let requested_turn_ref = requested_turn_ref.map(str::to_owned);
+        self.with_read(move |connection| {
+            if let Some(requested_turn_ref) = requested_turn_ref.as_deref() {
+                let already_continued: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM turn_refs WHERE native_key=?1 AND parent_turn_ref=?2)",
+                    params![&native_key, requested_turn_ref],
+                    |row| row.get(0),
+                )?;
+                if already_continued {
+                    return Ok(Some(requested_turn_ref.to_owned()));
+                }
+            }
+
+            let latest = connection
+                .query_row(
+                    "SELECT turn_ref FROM turn_refs WHERE native_key=?1 ORDER BY id DESC LIMIT 1",
+                    [&native_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if requested_turn_ref.as_deref() == latest.as_deref() {
+                return Ok(requested_turn_ref);
+            }
+            Ok(latest)
         })
     }
 
@@ -940,7 +1067,7 @@ impl Storage {
                 .optional()?;
             if old_bytes.is_none() && entry_count >= MEMORY_MAX_ENTRIES as i64 {
                 return Err(resource_limit(format!(
-                    "project memory is limited to {MEMORY_MAX_ENTRIES} entries"
+                    "active project memory is limited to {MEMORY_MAX_ENTRIES} entries; archive durable history with remember scope=archive"
                 )));
             }
             let next_total = total_bytes
@@ -948,7 +1075,7 @@ impl Storage {
                 .saturating_add((key.len() + value.len()) as i64);
             if next_total > MEMORY_MAX_TOTAL_BYTES as i64 {
                 return Err(resource_limit(format!(
-                    "project memory exceeds the {MEMORY_MAX_TOTAL_BYTES}-byte aggregate limit"
+                    "active project memory exceeds the {MEMORY_MAX_TOTAL_BYTES}-byte aggregate limit; archive durable history with remember scope=archive"
                 )));
             }
             transaction.execute("INSERT INTO memories(project_key,key,value,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(project_key,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", params![&project,&key,&value,Utc::now().to_rfc3339()])?;
@@ -966,6 +1093,191 @@ impl Storage {
                 "DELETE FROM memories WHERE project_key=?1 AND key=?2",
                 params![&project, &key],
             )? > 0)
+        })
+    }
+
+    pub fn memory_archive_get(&self, project: &str, key: &str) -> Result<Option<String>> {
+        validate_memory_key(key)?;
+        self.with_read(|connection| {
+            let length: Option<i64> = connection
+                .query_row(
+                    "SELECT length(CAST(value AS BLOB)) FROM memory_archive WHERE project_key=?1 AND key=?2",
+                    params![project, key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if length.is_some_and(|length| length > MEMORY_ARCHIVE_VALUE_MAX_BYTES as i64) {
+                return Err(resource_limit(
+                    "stored archive memory value exceeds the current safe retrieval limit",
+                ));
+            }
+            if length.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(connection.query_row(
+                "SELECT value FROM memory_archive WHERE project_key=?1 AND key=?2",
+                params![project, key],
+                |row| row.get(0),
+            )?))
+        })
+    }
+
+    pub fn memory_archive_set(&self, project: &str, key: &str, value: &str) -> Result<()> {
+        validate_memory_key(key)?;
+        validate_archive_value(value)?;
+        let project = project.to_owned();
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.with_write(move |connection| {
+            let transaction = connection.transaction()?;
+            let (entry_count, total_bytes): (i64, i64) = transaction.query_row(
+                "SELECT count(*),coalesce(sum(length(CAST(key AS BLOB))+length(CAST(value AS BLOB))),0) FROM memory_archive WHERE project_key=?1",
+                [&project],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let old_bytes: Option<i64> = transaction
+                .query_row(
+                    "SELECT length(CAST(key AS BLOB))+length(CAST(value AS BLOB)) FROM memory_archive WHERE project_key=?1 AND key=?2",
+                    params![&project, &key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if old_bytes.is_none() && entry_count >= MEMORY_ARCHIVE_MAX_ENTRIES as i64 {
+                return Err(resource_limit(format!(
+                    "project archive is limited to {MEMORY_ARCHIVE_MAX_ENTRIES} entries"
+                )));
+            }
+            let next_total = total_bytes
+                .saturating_sub(old_bytes.unwrap_or_default())
+                .saturating_add((key.len() + value.len()) as i64);
+            if next_total > MEMORY_ARCHIVE_MAX_TOTAL_BYTES as i64 {
+                return Err(resource_limit(format!(
+                    "project archive exceeds the {MEMORY_ARCHIVE_MAX_TOTAL_BYTES}-byte aggregate limit"
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO memory_archive(project_key,key,value,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(project_key,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![&project,&key,&value,Utc::now().to_rfc3339()],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn memory_archive_delete(&self, project: &str, key: &str) -> Result<bool> {
+        validate_memory_key(key)?;
+        let project = project.to_owned();
+        let key = key.to_owned();
+        self.with_write(move |connection| {
+            Ok(connection.execute(
+                "DELETE FROM memory_archive WHERE project_key=?1 AND key=?2",
+                params![&project, &key],
+            )? > 0)
+        })
+    }
+
+    pub fn memory_archive_recall_page_from_snapshot(
+        &self,
+        project: &str,
+        offset: usize,
+        requested: usize,
+        expected_snapshot_hash: Option<&str>,
+    ) -> Result<(MemoryPage, String)> {
+        let requested = requested.min(MEMORY_RECALL_MAX_ENTRIES);
+        if requested == 0 {
+            return Err(AppError::new(
+                "INVALID_INPUT",
+                "memory page size must be positive",
+            ));
+        }
+        self.with_read(|connection| {
+            connection.execute_batch("BEGIN DEFERRED")?;
+            let result = (|| {
+                let mut hash_statement = connection.prepare(
+                    "SELECT key,value FROM memory_archive WHERE project_key=?1 ORDER BY key",
+                )?;
+                let mut hash_rows = hash_statement.query([project])?;
+                let mut hasher = Sha256::new();
+                hasher.update(b"codexbridge-memory-archive-v1\0");
+                while let Some(row) = hash_rows.next()? {
+                    let key: String = row.get(0)?;
+                    let value: String = row.get(1)?;
+                    validate_memory_key(&key)?;
+                    validate_archive_value(&value)?;
+                    hasher.update((key.len() as u64).to_be_bytes());
+                    hasher.update(key.as_bytes());
+                    hasher.update((value.len() as u64).to_be_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                drop(hash_rows);
+                drop(hash_statement);
+                let snapshot_hash = format!("{:x}", hasher.finalize());
+                if expected_snapshot_hash.is_some_and(|expected| expected != snapshot_hash) {
+                    return Err(AppError::new(
+                        "PAGINATION_STALE",
+                        "project archive changed during pagination; restart recall from offset=0",
+                    ));
+                }
+
+                let total: i64 = connection.query_row(
+                    "SELECT count(*) FROM memory_archive WHERE project_key=?1",
+                    [project],
+                    |row| row.get(0),
+                )?;
+                let total = total.max(0) as usize;
+                if offset > total {
+                    return Err(AppError::new(
+                        "INVALID_INPUT",
+                        "memory offset is outside the available archive notes",
+                    ));
+                }
+                let mut statement = connection.prepare(
+                    "SELECT key,value FROM memory_archive WHERE project_key=?1 ORDER BY key LIMIT ?2 OFFSET ?3",
+                )?;
+                let mut rows = statement.query(params![project, (requested + 1) as i64, offset as i64])?;
+                let mut notes = Vec::new();
+                let mut retained_bytes = 0usize;
+                let mut more = false;
+                while let Some(row) = rows.next()? {
+                    if notes.len() >= requested {
+                        more = true;
+                        break;
+                    }
+                    let key: String = row.get(0)?;
+                    let value: String = row.get(1)?;
+                    let next_bytes = retained_bytes
+                        .saturating_add(key.len())
+                        .saturating_add(value.len());
+                    if next_bytes > MEMORY_RECALL_MAX_BYTES {
+                        more = true;
+                        break;
+                    }
+                    retained_bytes = next_bytes;
+                    notes.push(MemoryRecord { key, value });
+                }
+                more |= offset.saturating_add(notes.len()) < total;
+                let next_offset = more.then_some(offset.saturating_add(notes.len()));
+                Ok((
+                    MemoryPage {
+                        notes,
+                        total,
+                        offset,
+                        truncated: more,
+                        next_offset,
+                    },
+                    snapshot_hash,
+                ))
+            })();
+            match result {
+                Ok(value) => {
+                    connection.execute_batch("COMMIT")?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -1132,10 +1444,10 @@ impl Storage {
         })
     }
 
-    /// Read the memory presentation page, complete semantic memory hash, and
-    /// current plan from one SQLite read transaction. WAL permits concurrent
-    /// writers, while the explicit transaction keeps every component pinned to
-    /// the same database snapshot for turn synchronization.
+    /// Read the complete hard-bounded active memory, its semantic hash, and the
+    /// current plan from one SQLite read transaction. Archive/history is not
+    /// part of turn state. WAL permits concurrent writers, while the explicit
+    /// transaction keeps every component pinned to the same database snapshot.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn project_state_read_with_hook<F>(
         &self,
@@ -1154,13 +1466,17 @@ impl Storage {
                     |row| row.get(0),
                 )?;
                 let total = total.max(0) as usize;
+                if total > MEMORY_MAX_ENTRIES {
+                    return Err(resource_limit(
+                        "active project memory exceeds its entry quota; archive excess notes before turn synchronization",
+                    ));
+                }
 
                 let mut statement = connection
                     .prepare("SELECT key,value FROM memories WHERE project_key=?1 ORDER BY key")?;
                 let mut rows = statement.query([project])?;
                 let mut notes = Vec::new();
                 let mut retained_bytes = 0usize;
-                let mut presentation_open = true;
                 let mut hasher = Sha256::new();
                 hasher.update(b"codexbridge-memory-v1\0");
                 while let Some(row) = rows.next()? {
@@ -1177,26 +1493,22 @@ impl Storage {
                     hasher.update((value.len() as u64).to_be_bytes());
                     hasher.update(value.as_bytes());
 
-                    if presentation_open {
-                        let next_bytes = retained_bytes
-                            .saturating_add(key.len())
-                            .saturating_add(value.len());
-                        if notes.len() >= MEMORY_RECALL_MAX_ENTRIES
-                            || next_bytes > MEMORY_RECALL_MAX_BYTES
-                        {
-                            presentation_open = false;
-                        } else {
-                            retained_bytes = next_bytes;
-                            notes.push(MemoryRecord { key, value });
-                        }
+                    retained_bytes = retained_bytes
+                        .saturating_add(key.len())
+                        .saturating_add(value.len());
+                    if retained_bytes > MEMORY_MAX_TOTAL_BYTES {
+                        return Err(resource_limit(
+                            "active project memory exceeds its aggregate quota; archive excess notes before turn synchronization",
+                        ));
                     }
+                    notes.push(MemoryRecord { key, value });
                 }
                 drop(rows);
                 drop(statement);
 
                 let memory = MemoryPage {
-                    truncated: notes.len() < total,
-                    next_offset: (notes.len() < total).then_some(notes.len()),
+                    truncated: false,
+                    next_offset: None,
                     notes,
                     total,
                     offset: 0,
@@ -1421,7 +1733,7 @@ impl Storage {
     }
 }
 
-fn validate_schema_v4(connection: &Connection) -> Result<()> {
+fn validate_schema_v5(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(turn_refs)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1442,7 +1754,7 @@ fn validate_schema_v4(connection: &Connection) -> Result<()> {
             return Err(AppError::new(
                 "STORAGE_SCHEMA_UNSUPPORTED",
                 format!(
-                    "database reports schema version 4 but is missing required column `{required}`; recreate the development database"
+                    "database reports schema version 5 but is missing required column `{required}`; recreate the development database"
                 ),
             ));
         }
@@ -1458,7 +1770,18 @@ fn validate_schema_v4(connection: &Connection) -> Result<()> {
     {
         return Err(AppError::new(
             "STORAGE_SCHEMA_UNSUPPORTED",
-            "database reports schema version 4 but aliases are not case-insensitive",
+            "database reports schema version 5 but aliases are not case-insensitive",
+        ));
+    }
+    let archive_exists: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='memory_archive'",
+        [],
+        |row| row.get(0),
+    )?;
+    if archive_exists != 1 {
+        return Err(AppError::new(
+            "STORAGE_SCHEMA_UNSUPPORTED",
+            "database reports schema version 5 but memory_archive is missing",
         ));
     }
     Ok(())
@@ -1578,8 +1901,48 @@ mod tests {
 
             let error = Storage::open(&path).err().unwrap();
             assert_eq!(error.code(), "STORAGE_SCHEMA_UNSUPPORTED");
-            assert!(error.message().contains("fresh schema version 4"));
+            assert!(error.message().contains("fresh schema version 5"));
         }
+    }
+
+    #[test]
+    fn schema_v4_memory_overflow_is_migrated_to_archive_without_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE aliases(alias TEXT PRIMARY KEY COLLATE NOCASE, effective_key TEXT NOT NULL);
+                 CREATE TABLE bindings(native_key TEXT PRIMARY KEY, effective_key TEXT NOT NULL);
+                 CREATE TABLE memories(project_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_key,key));
+                 CREATE TABLE plans(project_key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE tasks(project_key TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, details TEXT, parent_task TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, PRIMARY KEY(project_key,id));
+                 CREATE TABLE turn_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, turn_ref TEXT NOT NULL UNIQUE, native_key TEXT NOT NULL, effective_key TEXT NOT NULL, subject_key TEXT NOT NULL, parent_turn_ref TEXT, instruction_hash TEXT NOT NULL, state_hash TEXT NOT NULL, brief_snapshot TEXT, state_snapshot TEXT, created_at TEXT NOT NULL);
+                 CREATE INDEX turn_refs_native_id ON turn_refs(native_key,id DESC);
+                 CREATE UNIQUE INDEX turn_refs_native_parent_unique ON turn_refs(native_key,parent_turn_ref) WHERE parent_turn_ref IS NOT NULL;
+                 PRAGMA user_version=4;",
+            )
+            .unwrap();
+        for index in 0..MEMORY_MAX_ENTRIES + 2 {
+            connection
+                .execute(
+                    "INSERT INTO memories(project_key,key,value,updated_at) VALUES('p',?1,'v',?2)",
+                    params![
+                        format!("key-{index:04}"),
+                        format!("2026-01-01T00:{index:02}:00Z")
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.memory_count("p").unwrap(), MEMORY_MAX_ENTRIES);
+        let (archive, _) = storage
+            .memory_archive_recall_page_from_snapshot("p", 0, 10, None)
+            .unwrap();
+        assert_eq!(archive.total, 2);
+        assert_eq!(archive.notes.len(), 2);
     }
 
     #[test]
@@ -1625,6 +1988,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_first",
                     parent_turn_ref: None,
+                    force_full_brief: false,
                     instruction_hash: "instructions-one",
                     state_hash: "state-one",
                     subject_key: "subject",
@@ -1649,6 +2013,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_second",
                     parent_turn_ref: Some("r_first"),
+                    force_full_brief: false,
                     instruction_hash: "instructions-two",
                     state_hash: "state-two",
                     subject_key: "subject",
@@ -1719,6 +2084,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_parent",
                     parent_turn_ref: None,
+                    force_full_brief: false,
                     instruction_hash: "instructions-parent",
                     state_hash: "state-parent",
                     subject_key: "subject",
@@ -1737,6 +2103,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_child",
                     parent_turn_ref: Some("r_parent"),
+                    force_full_brief: false,
                     instruction_hash: "instructions-child",
                     state_hash: "state-child",
                     subject_key: "subject",
@@ -1755,6 +2122,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_other_candidate",
                     parent_turn_ref: Some("r_parent"),
+                    force_full_brief: false,
                     instruction_hash: "instructions-other",
                     state_hash: "state-other",
                     subject_key: "subject",
@@ -1785,6 +2153,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_collision",
                     parent_turn_ref: None,
+                    force_full_brief: false,
                     instruction_hash: "instructions-one",
                     state_hash: "state-one",
                     subject_key: "subject-one",
@@ -1804,6 +2173,7 @@ mod tests {
                 TurnRefCommit {
                     turn_ref: "r_collision",
                     parent_turn_ref: None,
+                    force_full_brief: false,
                     instruction_hash: "instructions-two",
                     state_hash: "state-two",
                     subject_key: "subject-two",
@@ -1962,28 +2332,27 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_page_has_entry_and_byte_bounds() {
+    fn archive_recall_page_has_entry_and_byte_bounds() {
         let (_directory, storage) = storage();
-        storage
-            .with_write(|connection| {
-                let transaction = connection.transaction()?;
-                {
-                    let mut insert = transaction.prepare("INSERT INTO memories(project_key,key,value,updated_at) VALUES('p',?1,'value','now')")?;
-                    for index in 0..MEMORY_RECALL_MAX_ENTRIES + 4 {
-                        insert.execute([format!("key-{index:04}")])?;
-                    }
-                }
-                transaction.commit()?;
-                Ok(())
-            })
-            .expect("seed recall page");
-        let page = storage.memory_recall_page("p").expect("recall");
+        for index in 0..MEMORY_RECALL_MAX_ENTRIES + 4 {
+            storage
+                .memory_archive_set("p", &format!("key-{index:04}"), "value")
+                .unwrap();
+        }
+        let (page, hash) = storage
+            .memory_archive_recall_page_from_snapshot("p", 0, MEMORY_RECALL_MAX_ENTRIES, None)
+            .expect("recall");
         assert_eq!(page.notes.len(), MEMORY_RECALL_MAX_ENTRIES);
         assert_eq!(page.total, MEMORY_RECALL_MAX_ENTRIES + 4);
         assert!(page.truncated);
         assert_eq!(page.next_offset, Some(MEMORY_RECALL_MAX_ENTRIES));
-        let tail = storage
-            .memory_recall_page_from("p", page.next_offset.unwrap(), 16)
+        let (tail, _) = storage
+            .memory_archive_recall_page_from_snapshot(
+                "p",
+                page.next_offset.unwrap(),
+                16,
+                Some(&hash),
+            )
             .expect("tail page");
         assert_eq!(tail.notes.len(), 4);
         assert!(!tail.truncated);
@@ -2013,19 +2382,15 @@ mod tests {
     }
 
     #[test]
-    fn memory_semantic_hash_includes_notes_beyond_presentation_page() {
+    fn active_memory_semantic_hash_excludes_archive_history() {
         let (_directory, storage) = storage();
-        for index in 0..=MEMORY_RECALL_MAX_ENTRIES {
-            storage
-                .memory_set("p", &format!("key-{index:04}"), "before")
-                .unwrap();
-        }
+        storage.memory_set("p", "active", "before").unwrap();
         let before = storage.memory_semantic_hash("p").unwrap();
         storage
-            .memory_set("p", &format!("key-{MEMORY_RECALL_MAX_ENTRIES:04}"), "after")
+            .memory_archive_set("p", "historical", "after")
             .unwrap();
         let after = storage.memory_semantic_hash("p").unwrap();
-        assert_ne!(before, after);
+        assert_eq!(before, after);
     }
 
     #[test]

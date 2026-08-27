@@ -13,7 +13,6 @@ mod instructions;
 mod plugin_skills;
 mod project_docs;
 mod skills;
-pub(crate) use content::utf8_prefix_bounded;
 pub(crate) use instructions::{PROJECT_DOC_PREAMBLE, pre_init_instructions, project_instructions};
 pub(crate) use project_docs::project_instruction_delta;
 use skills::{

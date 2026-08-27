@@ -36,39 +36,21 @@ pub(super) fn typed_output_schema(tool: &str) -> Option<Arc<serde_json::Map<Stri
             "type":"object",
             "properties":{
                 "status":{"type":"string","enum":["synchronized","soft_error"]},
-                "agent_action":{"type":"string","enum":["continue","stop_current_turn"]},
                 "soft_error":{
-                    "type":["object","null"],
+                    "type":"object",
                     "properties":{
                         "code":{"type":"string"},
-                        "message":{"type":"string"},
-                        "retry_on_next_user_turn":{"type":"boolean"}
+                        "message":{"type":"string"}
                     },
-                    "required":["code","message","retry_on_next_user_turn"],
-                    "additionalProperties":true
+                    "required":["code","message"],
+                    "additionalProperties":false
                 },
-                "identity_mode":{"type":"string"},
-                "transport_mode":{"type":"string"},
-                "project_key":{"type":["string","null"]},
-                "native_project_key":{"type":["string","null"]},
-                "effective_project_key":{"type":["string","null"]},
-                "alias":{"type":["string","null"]},
-                "initialized":{"type":"boolean"},
-                "turn_ref":{"type":["string","null"]},
-                "previous_turn_ref":{"type":["string","null"]},
-                "instruction_hash":{"type":["string","null"]},
-                "state_hash":{"type":["string","null"]},
-                "instructions_changed":{"type":"boolean"},
-                "state_changed":{"type":"boolean"},
-                "turn_reused":{"type":"boolean"},
-                "workspace_state":{"type":["string","null"],"enum":["new","existing","joined",null]},
-                "reused_existing_binding":{"type":"boolean"},
-                "joined_existing_alias":{"type":"boolean"},
-                "brief":{"type":["string","null"]},
-                "state_update":{"type":["string","null"]}
+                "turn_ref":{"type":"string"},
+                "brief":{"type":"string"},
+                "state_update":{"type":"string"}
             },
-            "required":["status","agent_action","soft_error","identity_mode","transport_mode","project_key","native_project_key","effective_project_key","initialized","turn_ref","previous_turn_ref","instruction_hash","state_hash","instructions_changed","state_changed","turn_reused","workspace_state","reused_existing_binding","joined_existing_alias","brief","state_update"],
-            "additionalProperties":true
+            "required":["status"],
+            "additionalProperties":false
         }),
         "exec_command" | "write_stdin" => json!({
             "type":"object",

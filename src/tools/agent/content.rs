@@ -88,6 +88,7 @@ pub(super) fn read_text_prefix_bounded(path: &Path, maximum: usize) -> AppResult
     Ok((content, metadata.len() > shown as u64))
 }
 
+#[cfg(test)]
 pub(crate) fn utf8_prefix_bounded(content: &str, maximum: usize) -> (String, bool) {
     if content.len() <= maximum {
         return (content.to_owned(), false);

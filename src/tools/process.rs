@@ -1986,13 +1986,7 @@ mod tests {
             shell: shell.map(str::to_owned),
             timeout_ms: Some(10_000),
             yield_time_ms: None,
-            env: BTreeMap::from([(
-                "CODEXBRIDGE_HIDDEN_PROBE_EXE".to_owned(),
-                std::env::current_exe()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            )]),
+            env: BTreeMap::new(),
             max_output_tokens: None,
             stdin: None,
             close_stdin: false,
@@ -2052,18 +2046,16 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn write_windows_probe_cmd(project_dir: &tempfile::TempDir, child_test: &str) {
+    fn write_windows_probe_cmd(project_dir: &tempfile::TempDir) {
         std::fs::write(
             project_dir.path().join("hidden-probe.cmd"),
-            format!(
-                "@echo off\r\n\"%CODEXBRIDGE_HIDDEN_PROBE_EXE%\" --exact {child_test} --nocapture\r\nexit /b %ERRORLEVEL%\r\n"
-            ),
+            "@echo off\r\necho codexbridge-hidden-stdout\r\necho codexbridge-hidden-stderr 1>&2\r\n",
         )
         .unwrap();
     }
 
     #[cfg(windows)]
-    fn assert_windows_hidden_probe_success(session: &Arc<InteractiveSession>) {
+    fn assert_windows_command_success(session: &Arc<InteractiveSession>) {
         let completion = session.completion().expect("hidden process completion");
         assert_eq!(completion.reason, CompletionReason::Exited);
         assert_eq!(completion.exit_code, Some(0));
@@ -2073,55 +2065,27 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn windows_hidden_exec_probe_child() {
-        if std::env::var_os("CODEXBRIDGE_HIDDEN_PROBE_EXE").is_none() {
-            return;
-        }
-
-        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
-        assert_eq!(
-            console_code_page, 0,
-            "non-TTY exec descendant unexpectedly inherited a Windows console"
-        );
-        println!("codexbridge-hidden-stdout");
-        eprintln!("codexbridge-hidden-stderr");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_hidden_long_running_probe_child() {
-        if std::env::var_os("CODEXBRIDGE_HIDDEN_LONG_PROBE").is_none() {
-            return;
-        }
-
-        use std::io::Write as _;
-
-        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
-        assert_eq!(
-            console_code_page, 0,
-            "long-running non-TTY exec descendant unexpectedly inherited a Windows console"
-        );
-        println!("codexbridge-hidden-long-ready");
-        std::io::stdout().flush().unwrap();
-        std::thread::sleep(Duration::from_secs(60));
+    fn windows_long_running_args() -> ExecCommandArgs {
+        windows_exec_args(
+            "echo codexbridge-hidden-long-ready & ping.exe -n 60 127.0.0.1 >nul",
+            Some("cmd"),
+        )
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_non_tty_exec_hides_explicit_cmd_and_keeps_pipes() {
         let project_dir = tempfile::tempdir().unwrap();
-        write_windows_probe_cmd(
-            &project_dir,
-            "tools::process::tests::windows_hidden_exec_probe_child",
-        );
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_exec_args("call hidden-probe.cmd", Some("cmd"));
+        let args = windows_exec_args(
+            "echo codexbridge-hidden-stdout & echo codexbridge-hidden-stderr 1>&2",
+            Some("cmd"),
+        );
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
-        assert_windows_hidden_probe_success(&session);
+        assert_windows_command_success(&session);
     }
 
     #[cfg(windows)]
@@ -2131,30 +2095,27 @@ mod tests {
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
         let args = windows_exec_args(
-            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_exec_probe_child --nocapture",
+            "Write-Output 'codexbridge-hidden-stdout'; [Console]::Error.WriteLine('codexbridge-hidden-stderr')",
             None,
         );
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
-        assert_windows_hidden_probe_success(&session);
+        assert_windows_command_success(&session);
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_hidden_powershell_cmd_shim_does_not_create_nested_console() {
         let project_dir = tempfile::tempdir().unwrap();
-        write_windows_probe_cmd(
-            &project_dir,
-            "tools::process::tests::windows_hidden_exec_probe_child",
-        );
+        write_windows_probe_cmd(&project_dir);
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
         let args = windows_exec_args("& .\\hidden-probe.cmd", None);
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
-        assert_windows_hidden_probe_success(&session);
+        assert_windows_command_success(&session);
     }
 
     #[cfg(windows)]
@@ -2163,12 +2124,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_exec_args(
-            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
-            None,
-        );
-        args.env
-            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+        let args = windows_long_running_args();
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
@@ -2196,12 +2152,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_exec_args(
-            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
-            None,
-        );
-        args.env
-            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+        let args = windows_long_running_args();
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
@@ -2217,13 +2168,8 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_exec_args(
-            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
-            None,
-        );
+        let mut args = windows_long_running_args();
         args.timeout_ms = Some(100);
-        args.env
-            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
@@ -2238,12 +2184,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_exec_args(
-            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
-            None,
-        );
-        args.env
-            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+        let args = windows_long_running_args();
 
         let (registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;

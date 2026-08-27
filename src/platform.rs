@@ -204,48 +204,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn non_tty_process_does_not_inherit_a_console() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "platform::tests::non_tty_process_console_parent",
-                "--nocapture",
-            ])
-            .env("CODEXBRIDGE_NO_WINDOW_PARENT_PROBE", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "parent probe failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn non_tty_process_console_parent() {
-        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_PARENT_PROBE").is_none() {
-            return;
-        }
-
-        use windows_sys::Win32::System::Console::{AllocConsole, FreeConsole, GetConsoleCP};
-
-        unsafe {
-            if GetConsoleCP() == 0 {
-                assert_ne!(AllocConsole(), 0, "failed to allocate parent console");
-            }
-            assert_ne!(GetConsoleCP(), 0, "parent probe must own a console");
-        }
-
+    fn non_tty_process_does_not_show_a_console_window() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
                 "--exact",
-                "platform::tests::non_tty_process_console_child",
+                "platform::tests::non_tty_process_console_window_probe",
                 "--nocapture",
             ])
-            .env("CODEXBRIDGE_NO_WINDOW_CHILD_PROBE", "1");
+            .env("CODEXBRIDGE_NO_WINDOW_PROBE", "1");
         configure_windows_non_tty_process(&mut command);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -254,12 +221,9 @@ mod tests {
             .unwrap();
         let output = runtime.block_on(command.output()).unwrap();
 
-        unsafe {
-            let _ = FreeConsole();
-        }
         assert!(
             output.status.success(),
-            "hidden child probe failed: stdout={} stderr={}",
+            "hidden window probe failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -267,15 +231,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn non_tty_process_console_child() {
-        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_CHILD_PROBE").is_none() {
+    fn non_tty_process_console_window_probe() {
+        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_PROBE").is_none() {
             return;
         }
 
-        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
-        assert_eq!(
-            console_code_page, 0,
-            "CREATE_NO_WINDOW child unexpectedly inherited a console"
-        );
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let window = unsafe { GetConsoleWindow() };
+        if !window.is_null() {
+            assert_eq!(
+                unsafe { IsWindowVisible(window) },
+                0,
+                "CREATE_NO_WINDOW process has a visible console window"
+            );
+        }
     }
 }

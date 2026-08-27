@@ -19,6 +19,16 @@ use crate::{
 pub struct RememberArgs {
     pub key: String,
     pub value: String,
+    #[serde(default)]
+    pub scope: MemoryScope,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    #[default]
+    Active,
+    Archive,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -35,6 +45,8 @@ pub struct RecallArgs {
     pub snapshot_hash: Option<String>,
     #[serde(default)]
     pub include_plan: bool,
+    #[serde(default)]
+    pub scope: MemoryScope,
     /// Forward-compatible optional arguments. Typed top-level fields remain preferred;
     /// newer servers may consume additional keys here without requiring clients to
     /// refresh their top-level tool schema first.
@@ -80,11 +92,19 @@ fn remember_value(
     project_key: &str,
     key: &str,
     value: &str,
+    scope: MemoryScope,
 ) -> AppResult<(bool, bool)> {
     if value.is_empty() {
-        return Ok((false, storage.memory_delete(project_key, key)?));
+        let deleted = match scope {
+            MemoryScope::Active => storage.memory_delete(project_key, key)?,
+            MemoryScope::Archive => storage.memory_archive_delete(project_key, key)?,
+        };
+        return Ok((false, deleted));
     }
-    storage.memory_set(project_key, key, value)?;
+    match scope {
+        MemoryScope::Active => storage.memory_set(project_key, key, value)?,
+        MemoryScope::Archive => storage.memory_archive_set(project_key, key, value)?,
+    }
     Ok((true, false))
 }
 
@@ -109,7 +129,7 @@ fn normalized_explanation(value: Option<String>) -> Option<String> {
 #[tool_router(router = continuity_router, vis = "pub(crate)")]
 impl AgentHandler {
     #[tool(
-        description = "Persist a concise project-scoped working-memory note under key; an empty value deletes that note. Use it for durable facts that are costly to rediscover, not for facts already recorded by the repository."
+        description = "Persist or delete one project-scoped note. scope=active (default) is small working memory that chatgpt_turn_init always hydrates in full with the current plan; use it only for concise durable facts that are costly to rediscover. scope=archive stores larger history that is never injected automatically and is retrieved on demand with recall scope=archive. An empty value deletes the key from the selected scope."
     )]
     async fn remember(
         &self,
@@ -128,17 +148,18 @@ impl AgentHandler {
         };
         let value = args.value;
         let storage = self.shared.storage.clone();
-        let params = json!({"key":key,"value":value});
+        let scope = args.scope;
+        let params = json!({"key":key,"value":value,"scope":scope});
         self.run(context.0, "remember", params, move |project| async move {
             let project_key = project.effective_project_key.as_str();
-            let (saved, deleted) = remember_value(&storage, project_key, &key, &value)?;
+            let (saved, deleted) = remember_value(&storage, project_key, &key, &value, scope)?;
             Ok(json!({"key":key,"saved":saved,"deleted":deleted}))
         })
         .await
     }
 
     #[tool(
-        description = "Read project-scoped working state. With key, return one memory note. Without key, return a bounded lexicographically sorted memory page using offset/max_results. The first page also returns snapshot_hash; every continuation with offset>0 requires that exact hash so concurrent memory changes fail with PAGINATION_STALE instead of silently repeating/skipping notes. snapshot_hash and future optional arguments may also be supplied under extensions; typed top-level fields remain preferred. On PAGINATION_STALE, restart enumeration from offset=0 without the old snapshot hash. Set include_plan=true to include the complete persisted plan."
+        description = "Read project-scoped memory on demand. scope=active (default) reads the small working-memory set that chatgpt_turn_init hydrates fully; scope=archive reads durable history that is not injected automatically. With key, return one note. Without key, return a bounded lexicographically sorted page using offset/max_results. The first page returns snapshot_hash; continuations with offset>0 require that exact hash so concurrent changes fail with PAGINATION_STALE. Set include_plan=true to include the complete current plan."
     )]
     async fn recall(
         &self,
@@ -153,21 +174,36 @@ impl AgentHandler {
         let params = serde_json::to_value(&args).unwrap_or_default();
         self.run(context.0, "recall", params, move |project| async move {
             let project_key = project.effective_project_key.as_str();
-              validate_recall_continuation(&args, &snapshot_hash)?;
+            validate_recall_continuation(&args, &snapshot_hash)?;
             if let Some(key) = args.key {
                 let key = normalized_memory_key(&key)?;
+                let value = match args.scope {
+                    MemoryScope::Active => storage.memory_get(project_key, &key)?,
+                    MemoryScope::Archive => storage.memory_archive_get(project_key, &key)?,
+                };
                 return Ok(json!({
                     "key":key,
-                    "value":storage.memory_get(project_key,&key)?,
+                    "value":value,
                     "plan": if args.include_plan { storage.plan_get(project_key)? } else { None },
                 }));
             }
-            let (page, snapshot_hash) = storage.memory_recall_page_from_snapshot(
-                project_key,
-                args.offset,
-                args.max_results.unwrap_or(crate::storage::MEMORY_RECALL_MAX_ENTRIES),
-                snapshot_hash.as_deref(),
-            )?;
+            let requested = args
+                .max_results
+                .unwrap_or(crate::storage::MEMORY_RECALL_MAX_ENTRIES);
+            let (page, snapshot_hash) = match args.scope {
+                MemoryScope::Active => storage.memory_recall_page_from_snapshot(
+                    project_key,
+                    args.offset,
+                    requested,
+                    snapshot_hash.as_deref(),
+                )?,
+                MemoryScope::Archive => storage.memory_archive_recall_page_from_snapshot(
+                    project_key,
+                    args.offset,
+                    requested,
+                    snapshot_hash.as_deref(),
+                )?,
+            };
             let mut value = serde_json::to_value(page).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {
                 object.insert(
@@ -186,7 +222,8 @@ impl AgentHandler {
                     object.insert(
                         "continuation".to_owned(),
                         serde_json::Value::String(format!(
-                            "Call recall again with offset={next_offset} and snapshot_hash={snapshot_hash} to continue memory enumeration."
+                            "Call recall again with scope={}, offset={next_offset} and snapshot_hash={snapshot_hash} to continue memory enumeration.",
+                            match args.scope { MemoryScope::Active => "active", MemoryScope::Archive => "archive" }
                         )),
                     );
                 } else {
@@ -410,14 +447,31 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let storage = Storage::open(&directory.path().join("state.sqlite3")).expect("storage");
         assert_eq!(
-            remember_value(&storage, "p", "key", "value").expect("save"),
+            remember_value(&storage, "p", "key", "value", MemoryScope::Active).expect("save"),
             (true, false)
         );
         assert_eq!(
-            remember_value(&storage, "p", "key", "").expect("delete"),
+            remember_value(&storage, "p", "key", "", MemoryScope::Active).expect("delete"),
             (false, true)
         );
         assert_eq!(storage.memory_get("p", "key").expect("get"), None);
+    }
+
+    #[test]
+    fn archive_memory_is_separate_from_active_memory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).expect("storage");
+        remember_value(&storage, "p", "history", "archived", MemoryScope::Archive).unwrap();
+        assert_eq!(storage.memory_get("p", "history").unwrap(), None);
+        assert_eq!(
+            storage
+                .memory_archive_get("p", "history")
+                .unwrap()
+                .as_deref(),
+            Some("archived")
+        );
+        remember_value(&storage, "p", "history", "", MemoryScope::Archive).unwrap();
+        assert_eq!(storage.memory_archive_get("p", "history").unwrap(), None);
     }
 
     #[test]
@@ -457,11 +511,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
         // Deleting a note that never existed is (saved=false, deleted=false).
-        let (saved, deleted) = remember_value(&storage, "p", "ghost", "").unwrap();
+        let (saved, deleted) =
+            remember_value(&storage, "p", "ghost", "", MemoryScope::Active).unwrap();
         assert!(!saved);
         assert!(!deleted);
         storage.memory_set("p", "real", "value").unwrap();
-        let (saved, deleted) = remember_value(&storage, "p", "real", "").unwrap();
+        let (saved, deleted) =
+            remember_value(&storage, "p", "real", "", MemoryScope::Active).unwrap();
         assert!(!saved);
         assert!(deleted);
     }
