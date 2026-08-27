@@ -121,10 +121,11 @@ pub struct WriteStdinArgs {
     pub rows: Option<u16>,
     #[serde(default)]
     pub cols: Option<u16>,
-    /// Deliver a bounded process-control signal. `interrupt` sends Ctrl-C to a PTY,
-    /// SIGINT on Unix, or Ctrl-Break to a dedicated non-TTY Windows process group.
-    /// `terminate` requests SIGTERM on Unix or non-forced taskkill tree termination on
-    /// Windows; `kill` forcefully ends the process tree.
+    /// Deliver a bounded process-control signal. `interrupt` sends Ctrl-C to a PTY or
+    /// SIGINT on Unix. Hidden non-TTY Windows processes have no console and reject
+    /// `interrupt`; use `terminate` or `kill` for those sessions. `terminate` requests
+    /// SIGTERM on Unix or non-forced taskkill tree termination on Windows; `kill`
+    /// forcefully ends the process tree.
     #[serde(default)]
     pub signal: Option<ProcessSignal>,
     /// Explicitly wait this long for terminal process completion after any
@@ -184,14 +185,14 @@ pub enum ProcessSignal {
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowsSignalAction {
-    ConsoleBreak,
+    UnsupportedInterrupt,
     Taskkill { force: bool },
 }
 
 #[cfg(any(windows, test))]
 fn windows_signal_action(signal: ProcessSignal) -> WindowsSignalAction {
     match signal {
-        ProcessSignal::Interrupt => WindowsSignalAction::ConsoleBreak,
+        ProcessSignal::Interrupt => WindowsSignalAction::UnsupportedInterrupt,
         ProcessSignal::Terminate => WindowsSignalAction::Taskkill { force: false },
         ProcessSignal::Kill => WindowsSignalAction::Taskkill { force: true },
     }
@@ -1173,7 +1174,7 @@ impl ProcessRegistry {
                 .await;
         }
         #[cfg(windows)]
-        crate::platform::configure_windows_process_group(&mut command);
+        crate::platform::configure_windows_non_tty_process(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
@@ -1656,15 +1657,10 @@ fn signal_tree(pid: Option<u32>, signal: ProcessSignal) -> AppResult<()> {
     #[cfg(windows)]
     {
         match windows_signal_action(signal) {
-            WindowsSignalAction::ConsoleBreak => crate::platform::windows_send_interrupt(pid)
-                .map_err(|error| {
-                    AppError::new(
-                        "PROCESS_FAILED",
-                        format!(
-                            "unable to send Ctrl-Break to Windows process group {pid}: {error}; use terminate or kill when console signaling is unavailable"
-                        ),
-                    )
-                }),
+            WindowsSignalAction::UnsupportedInterrupt => Err(AppError::new(
+                "PROCESS_FAILED",
+                "interrupt is unavailable for hidden non-TTY Windows processes; use terminate or kill",
+            )),
             WindowsSignalAction::Taskkill { force } => {
                 let status = crate::platform::windows_taskkill(pid, force)?;
                 if status.success() {
@@ -1870,7 +1866,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY, SIGINT on Unix, or Ctrl-Break to a dedicated non-TTY Windows process group; terminate uses SIGTERM on Unix or non-forced taskkill tree termination on Windows; kill forcefully ends the tree. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
+        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY or SIGINT on Unix; hidden non-TTY Windows processes have no console and reject interrupt, so use terminate or kill for those sessions. terminate uses SIGTERM on Unix or non-forced taskkill tree termination on Windows; kill forcefully ends the tree. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
     )]
     async fn write_stdin(
         &self,
@@ -1953,6 +1949,341 @@ impl AgentHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn windows_test_project(project_dir: &tempfile::TempDir) -> ProjectContext {
+        use crate::project::ProjectKey;
+        use crate::request_context::TransportMode;
+
+        ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: TransportMode::Stateless,
+            mcp_session_present: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_test_config() -> crate::config::Config {
+        use crate::config::ConfigBuilder;
+
+        ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+        ]))
+        .build()
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn windows_exec_args(command: impl Into<String>, shell: Option<&str>) -> ExecCommandArgs {
+        ExecCommandArgs {
+            command: command.into(),
+            workdir: None,
+            shell: shell.map(str::to_owned),
+            timeout_ms: Some(10_000),
+            yield_time_ms: None,
+            env: BTreeMap::from([(
+                "CODEXBRIDGE_HIDDEN_PROBE_EXE".to_owned(),
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
+            max_output_tokens: None,
+            stdin: None,
+            close_stdin: false,
+            tty: false,
+            rows: None,
+            cols: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn windows_start_exec(
+        config: &crate::config::Config,
+        project: &ProjectContext,
+        args: &ExecCommandArgs,
+    ) -> (ProcessRegistry, Arc<InteractiveSession>) {
+        let registry = ProcessRegistry::new(4, Duration::from_secs(60), 16 * 1024);
+        let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let project_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_id, session) = registry
+            .start(config, project, args, global_permit, project_permit)
+            .await
+            .unwrap();
+        (registry, session)
+    }
+
+    #[cfg(windows)]
+    async fn windows_wait_for_session(session: &Arc<InteractiveSession>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !session.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Windows process did not publish completion");
+        assert!(wait_for_drains(session, Duration::from_secs(2)).await);
+    }
+
+    #[cfg(windows)]
+    async fn windows_wait_for_output(session: &Arc<InteractiveSession>, needle: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (output, _, _, _) =
+                    session.output.lock().unwrap().render_window(Some(0), false);
+                if output.contains(needle) {
+                    break;
+                }
+                assert!(
+                    !session.is_finished(),
+                    "Windows process exited before producing {needle:?}: {output:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Windows process did not produce {needle:?}"));
+    }
+
+    #[cfg(windows)]
+    fn write_windows_probe_cmd(project_dir: &tempfile::TempDir, child_test: &str) {
+        std::fs::write(
+            project_dir.path().join("hidden-probe.cmd"),
+            format!(
+                "@echo off\r\n\"%CODEXBRIDGE_HIDDEN_PROBE_EXE%\" --exact {child_test} --nocapture\r\nexit /b %ERRORLEVEL%\r\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_hidden_probe_success(session: &Arc<InteractiveSession>) {
+        let completion = session.completion().expect("hidden process completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert!(output.contains("codexbridge-hidden-stdout"), "{output:?}");
+        assert!(output.contains("codexbridge-hidden-stderr"), "{output:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hidden_exec_probe_child() {
+        if std::env::var_os("CODEXBRIDGE_HIDDEN_PROBE_EXE").is_none() {
+            return;
+        }
+
+        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
+        assert_eq!(
+            console_code_page, 0,
+            "non-TTY exec descendant unexpectedly inherited a Windows console"
+        );
+        println!("codexbridge-hidden-stdout");
+        eprintln!("codexbridge-hidden-stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hidden_long_running_probe_child() {
+        if std::env::var_os("CODEXBRIDGE_HIDDEN_LONG_PROBE").is_none() {
+            return;
+        }
+
+        use std::io::Write as _;
+
+        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
+        assert_eq!(
+            console_code_page, 0,
+            "long-running non-TTY exec descendant unexpectedly inherited a Windows console"
+        );
+        println!("codexbridge-hidden-long-ready");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_non_tty_exec_hides_explicit_cmd_and_keeps_pipes() {
+        let project_dir = tempfile::tempdir().unwrap();
+        write_windows_probe_cmd(
+            &project_dir,
+            "tools::process::tests::windows_hidden_exec_probe_child",
+        );
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let args = windows_exec_args("call hidden-probe.cmd", Some("cmd"));
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        assert_windows_hidden_probe_success(&session);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_non_tty_exec_hides_default_powershell_and_keeps_pipes() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let args = windows_exec_args(
+            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_exec_probe_child --nocapture",
+            None,
+        );
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        assert_windows_hidden_probe_success(&session);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_powershell_cmd_shim_does_not_create_nested_console() {
+        let project_dir = tempfile::tempdir().unwrap();
+        write_windows_probe_cmd(
+            &project_dir,
+            "tools::process::tests::windows_hidden_exec_probe_child",
+        );
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let args = windows_exec_args("& .\\hidden-probe.cmd", None);
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        assert_windows_hidden_probe_success(&session);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_non_tty_interrupt_fails_explicitly_and_kill_still_works() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args(
+            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
+            None,
+        );
+        args.env
+            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
+
+        let error = session.signal(ProcessSignal::Interrupt).await.unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("interrupt is unavailable for hidden non-TTY Windows processes"),
+            "{error}"
+        );
+        assert!(
+            !session.is_finished(),
+            "unsupported interrupt killed the process"
+        );
+
+        session.signal(ProcessSignal::Kill).await.unwrap();
+        windows_wait_for_session(&session).await;
+        assert!(session.is_finished());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_non_tty_terminate_still_ends_the_process_tree() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args(
+            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
+            None,
+        );
+        args.env
+            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
+
+        session.signal(ProcessSignal::Terminate).await.unwrap();
+        windows_wait_for_session(&session).await;
+        assert!(session.is_finished());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_non_tty_timeout_still_kills_and_reaps_the_process() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args(
+            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
+            None,
+        );
+        args.timeout_ms = Some(100);
+        args.env
+            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("timed out hidden completion");
+        assert_eq!(completion.reason, CompletionReason::TimedOut);
+        assert!(session.timed_out.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_non_tty_registry_shutdown_still_kills_the_process_tree() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args(
+            "& $env:CODEXBRIDGE_HIDDEN_PROBE_EXE --exact tools::process::tests::windows_hidden_long_running_probe_child --nocapture",
+            None,
+        );
+        args.env
+            .insert("CODEXBRIDGE_HIDDEN_LONG_PROBE".to_owned(), "1".to_owned());
+
+        let (registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
+
+        registry.shutdown();
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("shutdown hidden completion");
+        assert_ne!(
+            completion.exit_code,
+            Some(0),
+            "registry shutdown allowed the hidden process to exit successfully"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_tty_exec_through_start_remains_conpty_backed() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args("echo codexbridge-conpty-through-start", Some("cmd"));
+        args.tty = true;
+        args.rows = Some(24);
+        args.cols = Some(80);
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        assert!(
+            session.tty,
+            "tty=true did not select the ConPTY session path"
+        );
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("ConPTY completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert!(
+            output.contains("codexbridge-conpty-through-start"),
+            "{output:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3345,15 +3676,15 @@ mod tests {
     #[test]
     fn process_signal_schema_documents_platform_specific_semantics() {
         let rendered = serde_json::to_string(&schemars::schema_for!(WriteStdinArgs)).unwrap();
-        assert!(rendered.contains("Ctrl-Break"), "{rendered}");
+        assert!(rendered.contains("Hidden non-TTY Windows"), "{rendered}");
         assert!(rendered.contains("non-forced taskkill"), "{rendered}");
     }
 
     #[test]
-    fn windows_signal_contract_keeps_interrupt_distinct_from_termination() {
+    fn windows_signal_contract_rejects_hidden_interrupt_without_aliasing_termination() {
         assert_eq!(
             windows_signal_action(ProcessSignal::Interrupt),
-            WindowsSignalAction::ConsoleBreak
+            WindowsSignalAction::UnsupportedInterrupt
         );
         assert_eq!(
             windows_signal_action(ProcessSignal::Terminate),

@@ -1005,9 +1005,9 @@ fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
                     )
                 });
             Some(format!(
-                "{} [{}] {}{}",
-                console_color("=>>", ANSI_GRAY),
+                "[{}] {} {}{}",
                 console_color(&project, ANSI_GREEN),
+                console_color("->", ANSI_GRAY),
                 console_color(tool, ANSI_RED),
                 if rendered.is_empty() {
                     String::new()
@@ -1029,9 +1029,9 @@ fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
                     )
                 });
             Some(format!(
-                "{} [{}] {}{}",
-                console_color("<<=", ANSI_GRAY),
+                "[{}] {} {}{}",
                 console_color(&project, ANSI_BLUE),
+                console_color("<-", ANSI_GRAY),
                 console_color(tool, ANSI_YELLOW),
                 if rendered.is_empty() {
                     String::new()
@@ -1059,9 +1059,9 @@ fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
                 });
             let rendered = console_excerpt(&rendered);
             Some(format!(
-                "{} [{}] {} {event_name}: {rendered}",
-                console_color("<<=", ANSI_GRAY),
+                "[{}] {} {} {event_name}: {rendered}",
                 console_color(&project, ANSI_BLUE),
+                console_color("<-", ANSI_GRAY),
                 console_color(tool, ANSI_YELLOW)
             ))
         }
@@ -1590,7 +1590,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mgrep\u{1b}[0m query=needle  path=."
+            "[\u{1b}[32mdemo\u{1b}[0m] \u{1b}[90m->\u{1b}[0m \u{1b}[31mgrep\u{1b}[0m query=needle  path=."
         );
 
         let result = console_line(
@@ -1605,7 +1605,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mgrep\u{1b}[0m {\"matches\":3,\"token\":\"[REDACTED]\"}"
+            "[\u{1b}[34mdemo\u{1b}[0m] \u{1b}[90m<-\u{1b}[0m \u{1b}[33mgrep\u{1b}[0m {\"matches\":3,\"token\":\"[REDACTED]\"}"
         );
 
         let fallback = console_line(
@@ -1620,7 +1620,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fallback,
-            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32meffective-project\u{1b}[0m] \u{1b}[31mread_file\u{1b}[0m src/lib.rs"
+            "[\u{1b}[32meffective-project\u{1b}[0m] \u{1b}[90m->\u{1b}[0m \u{1b}[31mread_file\u{1b}[0m src/lib.rs"
         );
 
         let error = console_line(
@@ -1635,7 +1635,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             error,
-            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mexec_command\u{1b}[0m tool_error: PROCESS_FAILED: [REDACTED] failed"
+            "[\u{1b}[34mdemo\u{1b}[0m] \u{1b}[90m<-\u{1b}[0m \u{1b}[33mexec_command\u{1b}[0m tool_error: PROCESS_FAILED: [REDACTED] failed"
         );
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             call,
-            "\u{1b}[90m=>>\u{1b}[0m [\u{1b}[32mdemo\u{1b}[0m] \u{1b}[31mupdate_plan\u{1b}[0m"
+            "[\u{1b}[32mdemo\u{1b}[0m] \u{1b}[90m->\u{1b}[0m \u{1b}[31mupdate_plan\u{1b}[0m"
         );
 
         let result = console_line(
@@ -1807,7 +1807,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            "\u{1b}[90m<<=\u{1b}[0m [\u{1b}[34mdemo\u{1b}[0m] \u{1b}[33mupdate_plan\u{1b}[0m"
+            "[\u{1b}[34mdemo\u{1b}[0m] \u{1b}[90m<-\u{1b}[0m \u{1b}[33mupdate_plan\u{1b}[0m"
         );
     }
 

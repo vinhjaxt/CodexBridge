@@ -83,12 +83,15 @@ pub(crate) fn windows_system32_executable(name: &str) -> PathBuf {
 
 #[cfg(windows)]
 pub(crate) fn windows_taskkill(pid: u32, force: bool) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::process::CommandExt as _;
+
     let mut command = std::process::Command::new(windows_system32_executable("taskkill.exe"));
     command.args(["/T", "/PID", &pid.to_string()]);
     if force {
         command.arg("/F");
     }
     command
+        .creation_flags(windows_hidden_creation_flags(false))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -96,27 +99,24 @@ pub(crate) fn windows_taskkill(pid: u32, force: bool) -> std::io::Result<std::pr
 }
 
 #[cfg(windows)]
-pub(crate) fn configure_windows_process_group(command: &mut Command) {
+fn windows_hidden_creation_flags(new_process_group: bool) -> u32 {
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    CREATE_NO_WINDOW
+        | if new_process_group {
+            CREATE_NEW_PROCESS_GROUP
+        } else {
+            0
+        }
+}
+
+#[cfg(windows)]
+pub(crate) fn configure_windows_non_tty_process(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
 
     command
         .as_std_mut()
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_send_interrupt(process_group_id: u32) -> std::io::Result<()> {
-    let sent = unsafe {
-        windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
-            windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
-            process_group_id,
-        )
-    };
-    if sent == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+        .creation_flags(windows_hidden_creation_flags(true));
 }
 
 #[cfg(test)]
@@ -188,5 +188,94 @@ mod tests {
         // A deliberately invalid PID still proves the executable itself could
         // be launched without consulting PATH.
         assert!(windows_taskkill(u32::MAX, true).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_creation_flags_cover_exec_and_internal_taskkill() {
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        assert_eq!(
+            windows_hidden_creation_flags(true),
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        );
+        assert_eq!(windows_hidden_creation_flags(false), CREATE_NO_WINDOW);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_tty_process_does_not_inherit_a_console() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::tests::non_tty_process_console_parent",
+                "--nocapture",
+            ])
+            .env("CODEXBRIDGE_NO_WINDOW_PARENT_PROBE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "parent probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_tty_process_console_parent() {
+        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_PARENT_PROBE").is_none() {
+            return;
+        }
+
+        use windows_sys::Win32::System::Console::{AllocConsole, FreeConsole, GetConsoleCP};
+
+        unsafe {
+            if GetConsoleCP() == 0 {
+                assert_ne!(AllocConsole(), 0, "failed to allocate parent console");
+            }
+            assert_ne!(GetConsoleCP(), 0, "parent probe must own a console");
+        }
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "platform::tests::non_tty_process_console_child",
+                "--nocapture",
+            ])
+            .env("CODEXBRIDGE_NO_WINDOW_CHILD_PROBE", "1");
+        configure_windows_non_tty_process(&mut command);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = runtime.block_on(command.output()).unwrap();
+
+        unsafe {
+            let _ = FreeConsole();
+        }
+        assert!(
+            output.status.success(),
+            "hidden child probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_tty_process_console_child() {
+        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_CHILD_PROBE").is_none() {
+            return;
+        }
+
+        let console_code_page = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() };
+        assert_eq!(
+            console_code_page, 0,
+            "CREATE_NO_WINDOW child unexpectedly inherited a console"
+        );
     }
 }
