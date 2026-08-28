@@ -102,7 +102,7 @@ fn ranged_reads_work_across_large_files_without_whole_file_limit() {
 }
 
 #[test]
-fn atomic_write_creates_parent_directories_and_replaces_content() {
+fn write_creates_parent_directories_and_replaces_content() {
     let temp = tempfile::tempdir().unwrap();
     let resolver = SecurePathResolver;
     resolver

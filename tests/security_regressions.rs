@@ -87,3 +87,45 @@ fn capability_copy_and_move_reject_parent_traversal() {
     );
     assert!(temp.path().join("source.txt").is_file());
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_junction_components_cannot_escape_capability_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let command = format!("mklink /J linked \"{}\"", outside.path().display());
+    let output = std::process::Command::new(system_root.join("System32/cmd.exe"))
+        .args(["/d", "/s", "/c", &command])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to create Windows junction: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let resolver = SecurePathResolver;
+    for operation in [PathOperation::Existing, PathOperation::Create] {
+        let error = resolver
+            .resolve_project_path(temp.path(), "linked/secret.txt", operation)
+            .unwrap_err();
+        assert!(
+            matches!(error.code(), "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE"),
+            "junction escape returned unexpected error: {error}"
+        );
+    }
+    assert_eq!(
+        resolver
+            .read_file_bounded(temp.path(), "linked/secret.txt", 1024)
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+}

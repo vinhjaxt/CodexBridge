@@ -53,7 +53,10 @@ const MAX_YIELD_MS: u64 = 30_000;
 // deadlines. Long-running commands remain resident and are continued with
 // write_stdin instead of risking a transport-level timeout at the boundary.
 const MAX_INITIAL_YIELD_MS: u64 = 20_000;
-const MAX_POLL_YIELD_MS: u64 = 300_000;
+// Follow-up polls are MCP requests too. Keep them under the same conservative
+// transport budget as the initial request; callers can repeat write_stdin for
+// longer-running processes instead of holding one connector request open.
+const MAX_POLL_YIELD_MS: u64 = MAX_INITIAL_YIELD_MS;
 const TIMEOUT_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 const PODMAN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PODMAN_CIDFILE_PREFIX: &str = "cid.";
@@ -67,6 +70,9 @@ pub struct ExecCommandArgs {
     pub workdir: Option<String>,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Maximum lifetime of the spawned process. This is not the MCP response
+    /// wait; use `yield_time_ms` to control how long the initial call waits
+    /// before returning a session_id for continued polling.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -124,8 +130,9 @@ pub struct WriteStdinArgs {
     /// Deliver a bounded process-control signal. `interrupt` sends Ctrl-C to a PTY or
     /// SIGINT on Unix. Hidden non-TTY Windows processes have no console and reject
     /// `interrupt`; use `terminate` or `kill` for those sessions. `terminate` requests
-    /// SIGTERM on Unix or non-forced taskkill tree termination on Windows; `kill`
-    /// forcefully ends the process tree.
+    /// SIGTERM on Unix or taskkill tree termination on Windows, with a forced fallback
+    /// when Windows cannot terminate the hidden process gracefully. `kill` forcefully
+    /// ends the process tree.
     #[serde(default)]
     pub signal: Option<ProcessSignal>,
     /// Explicitly wait this long for terminal process completion after any
@@ -676,7 +683,7 @@ fn unsafe_podman_create_invocation(tokens: &[&str]) -> Option<&'static str> {
                     index += 1;
                 }
             }
-            "exec" | "nohup" => index += 1,
+            "exec" | "nohup" | "rtk" => index += 1,
             "sudo" => {
                 sudo = true;
                 sudo_absolute = token.contains(['/', '\\']);
@@ -804,8 +811,7 @@ struct InteractiveSession {
     terminal: Option<Mutex<vt100::Parser>>,
     output: Mutex<OutputBuffer>,
     completion: Mutex<Option<ProcessCompletion>>,
-    timed_out: AtomicBool,
-    deadline_exceeded: AtomicBool,
+    process_deadline_exceeded: AtomicBool,
     /// Set once a finished response is truncated. Keep returning the session id
     /// on cursorless polls so callers do not lose the ability to replay retained
     /// output merely because one follow-up response itself is empty/untruncated.
@@ -1197,8 +1203,7 @@ impl ProcessRegistry {
             terminal: None,
             output: Mutex::new(OutputBuffer::default()),
             completion: Mutex::new(None),
-            timed_out: AtomicBool::new(false),
-            deadline_exceeded: AtomicBool::new(false),
+            process_deadline_exceeded: AtomicBool::new(false),
             replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
@@ -1242,12 +1247,11 @@ impl ProcessRegistry {
                     Err(error) => (None, None, Some(error.to_string())),
                 },
                 _ = tokio::time::sleep(timeout) => {
-                    waiter_session.deadline_exceeded.store(true, Ordering::Relaxed);
+                    waiter_session.process_deadline_exceeded.store(true, Ordering::Relaxed);
                     match tokio::time::timeout(TIMEOUT_COMPLETION_GRACE, child.wait()).await {
                         Ok(Ok(status)) => (Some(status), None, None),
                         Ok(Err(error)) => (None, None, Some(error.to_string())),
                         Err(_) => {
-                            waiter_session.timed_out.store(true, Ordering::Relaxed);
                             kill_tree(waiter_session.pid);
                             let _ = child.kill().await;
                             match child.wait().await {
@@ -1333,8 +1337,7 @@ impl ProcessRegistry {
             terminal: Some(Mutex::new(vt100::Parser::new(rows, cols, 0))),
             output: Mutex::new(OutputBuffer::default()),
             completion: Mutex::new(None),
-            timed_out: AtomicBool::new(false),
-            deadline_exceeded: AtomicBool::new(false),
+            process_deadline_exceeded: AtomicBool::new(false),
             replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
@@ -1372,13 +1375,12 @@ impl ProcessRegistry {
                     Err(error) => (None, None, Some(error.to_string())),
                 },
                 _ = tokio::time::sleep(timeout) => {
-                    waiter_session.deadline_exceeded.store(true, Ordering::Relaxed);
+                    waiter_session.process_deadline_exceeded.store(true, Ordering::Relaxed);
                     match tokio::time::timeout(TIMEOUT_COMPLETION_GRACE, &mut wait).await {
                         Ok(Ok(Ok(status))) => (Some(status), None, None),
                         Ok(Ok(Err(error))) => (None, None, Some(error.to_string())),
                         Ok(Err(error)) => (None, None, Some(error.to_string())),
                         Err(_) => {
-                            waiter_session.timed_out.store(true, Ordering::Relaxed);
                             kill_tree(waiter_session.pid);
                             let _ = killer.kill();
                             match wait.await {
@@ -1666,6 +1668,18 @@ fn signal_tree(pid: Option<u32>, signal: ProcessSignal) -> AppResult<()> {
                 if status.success() {
                     return Ok(());
                 }
+                if !force {
+                    let forced_status = crate::platform::windows_taskkill(pid, true)?;
+                    if forced_status.success() {
+                        return Ok(());
+                    }
+                    return Err(AppError::new(
+                        "PROCESS_FAILED",
+                        format!(
+                            "taskkill failed for process tree {pid} with status {status}; forced fallback failed with status {forced_status}"
+                        ),
+                    ));
+                }
                 Err(AppError::new(
                     "PROCESS_FAILED",
                     format!("taskkill failed for process tree {pid} with status {status}"),
@@ -1770,8 +1784,7 @@ async fn yield_result(
         "output_next_offset": output_next_offset,
         "truncated": response_truncated,
         "original_token_count": original_token_count,
-        "timed_out": session.timed_out.load(Ordering::Relaxed),
-        "deadline_exceeded": session.deadline_exceeded.load(Ordering::Relaxed),
+        "process_deadline_exceeded": session.process_deadline_exceeded.load(Ordering::Relaxed),
         "tty": session.tty,
         "terminal_snapshot": terminal_snapshot,
         "wall_time_seconds": session.started.elapsed().as_secs_f64(),
@@ -1790,7 +1803,7 @@ async fn yield_result(
 #[tool_router(router = process_router, vis = "pub(crate)")]
 impl AgentHandler {
     #[tool(
-        description = "Start a bounded command with a project-relative working directory. The effective execution backend may be Bubblewrap or native YOLO; native execution is not OS-filesystem-confined. Returns immediately when it exits, otherwise returns a project-scoped session_id for write_stdin. For one-shot CLIs or subagents that may read until EOF, pass optional stdin and close_stdin=true. Set tty=true for a native Unix PTY or Windows ConPTY. Results distinguish normal exit, signal, cancellation, deadline overrun, and forced timeout. output_offset/output_next_offset are logical byte-stream cursors; after bounded head+tail eviction a response can include an explicit omission marker rather than one contiguous original range. Recover lost/truncated presentation with write_stdin(since_output_offset=...) instead of re-running; evicted bytes are unrecoverable. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. Finished truncated sessions retain a recovery session_id. No extra approval is requested."
+        description = "Start a bounded command with a project-relative working directory. The effective execution backend may be Bubblewrap or native YOLO; native execution is not OS-filesystem-confined. timeout_ms is the maximum lifetime of the spawned process, not the MCP request wait; use yield_time_ms to control how long the initial call waits before returning a session_id. Returns immediately when it exits, otherwise returns a project-scoped session_id for write_stdin. For one-shot CLIs or subagents that may read until EOF, pass optional stdin and close_stdin=true. Set tty=true for a native Unix PTY or Windows ConPTY. Results distinguish normal exit, signal, cancellation, deadline overrun, and forced timeout. output_offset/output_next_offset are logical byte-stream cursors; after bounded head+tail eviction a response can include an explicit omission marker rather than one contiguous original range. Recover lost/truncated presentation with write_stdin(since_output_offset=...) instead of re-running; evicted bytes are unrecoverable. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. Finished truncated sessions retain a recovery session_id. No extra approval is requested."
     )]
     async fn exec_command(
         &self,
@@ -1866,7 +1879,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY or SIGINT on Unix; hidden non-TTY Windows processes have no console and reject interrupt, so use terminate or kill for those sessions. terminate uses SIGTERM on Unix or non-forced taskkill tree termination on Windows; kill forcefully ends the tree. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
+        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY or SIGINT on Unix; hidden non-TTY Windows processes have no console and reject interrupt, so use terminate or kill for those sessions. terminate uses SIGTERM on Unix or taskkill tree termination on Windows with a forced fallback when graceful termination is unavailable; kill forcefully ends the tree. wait_for_exit_ms/yield_time_ms are bounded to a transport-safe poll window; repeat write_stdin for longer waits instead of holding one MCP request open. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output/status when it fits in that poll window. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
     )]
     async fn write_stdin(
         &self,
@@ -2015,7 +2028,7 @@ mod tests {
 
     #[cfg(windows)]
     async fn windows_wait_for_session(session: &Arc<InteractiveSession>) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             while !session.is_finished() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -2049,16 +2062,38 @@ mod tests {
     fn write_windows_probe_cmd(project_dir: &tempfile::TempDir) {
         std::fs::write(
             project_dir.path().join("hidden-probe.cmd"),
-            "@echo off\r\necho codexbridge-hidden-stdout\r\necho codexbridge-hidden-stderr 1>&2\r\n",
+            "@echo off\r\n\"%CODEXBRIDGE_HIDDEN_PROBE_EXE%\" --exact tools::process::tests::windows_hidden_powershell_cmd_shim_console_probe_child --ignored --nocapture\r\nexit /b %ERRORLEVEL%\r\n",
         )
         .unwrap();
     }
 
     #[cfg(windows)]
-    fn assert_windows_command_success(session: &Arc<InteractiveSession>) {
+    fn windows_hidden_cmd_shim_probe_args() -> ExecCommandArgs {
+        let mut args = windows_exec_args("& .\\hidden-probe.cmd", None);
+        args.env.insert(
+            "CODEXBRIDGE_HIDDEN_PROBE_EXE".to_owned(),
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.env.insert(
+            "CODEXBRIDGE_HIDDEN_CMD_SHIM_PROBE".to_owned(),
+            "1".to_owned(),
+        );
+        args
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_exit_success(session: &Arc<InteractiveSession>) {
         let completion = session.completion().expect("hidden process completion");
         assert_eq!(completion.reason, CompletionReason::Exited);
         assert_eq!(completion.exit_code, Some(0));
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_command_success(session: &Arc<InteractiveSession>) {
+        assert_windows_exit_success(session);
         let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
         assert!(output.contains("codexbridge-hidden-stdout"), "{output:?}");
         assert!(output.contains("codexbridge-hidden-stderr"), "{output:?}");
@@ -2070,6 +2105,130 @@ mod tests {
             "echo codexbridge-hidden-long-ready & ping.exe -n 60 127.0.0.1 >nul",
             Some("cmd"),
         )
+    }
+
+    #[cfg(windows)]
+    fn windows_tree_probe_args(
+        project_dir: &tempfile::TempDir,
+    ) -> (ExecCommandArgs, std::path::PathBuf) {
+        let pid_file = project_dir.path().join("tree-probe.pid");
+        let mut args = windows_exec_args(
+            "echo codexbridge-hidden-long-ready & \"%CODEXBRIDGE_TREE_PROBE_EXE%\" --exact tools::process::tests::windows_process_tree_probe_child --ignored --nocapture",
+            Some("cmd"),
+        );
+        args.env.insert(
+            "CODEXBRIDGE_TREE_PROBE_EXE".to_owned(),
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.env.insert(
+            "CODEXBRIDGE_TREE_PROBE_PID_FILE".to_owned(),
+            pid_file.to_string_lossy().into_owned(),
+        );
+        args.env
+            .insert("CODEXBRIDGE_TREE_PROBE_CHILD".to_owned(), "1".to_owned());
+        (args, pid_file)
+    }
+
+    #[cfg(windows)]
+    async fn windows_wait_for_probe_pid(pid_file: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(pid_file)
+                    && let Ok(pid) = value.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Windows tree probe child never published its PID")
+    }
+
+    #[cfg(windows)]
+    fn windows_process_is_running(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let output = std::process::Command::new(crate::platform::windows_system32_executable(
+            "tasklist.exe",
+        ))
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .expect("tasklist probe must launch");
+        assert!(output.status.success(), "tasklist probe failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
+    }
+
+    #[cfg(windows)]
+    async fn windows_assert_process_exited(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while windows_process_is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("descendant process {pid} survived process-tree termination"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child harness: invoked by Windows process-tree parent tests"]
+    fn windows_process_tree_probe_child() {
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_TREE_PROBE_CHILD").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under Windows process-tree parent tests"
+        );
+        let pid_file =
+            std::env::var_os("CODEXBRIDGE_TREE_PROBE_PID_FILE").expect("tree probe child PID file");
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child harness: invoked by the Windows native-exit parent test"]
+    fn windows_native_exit_probe_child() {
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_NATIVE_EXIT_PROBE_CHILD").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under the Windows native-exit parent test"
+        );
+        std::process::exit(37);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_default_powershell_propagates_native_exit_code_end_to_end() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_exec_args(
+            "& $env:CODEXBRIDGE_NATIVE_EXIT_PROBE_EXE --exact tools::process::tests::windows_native_exit_probe_child --ignored --nocapture",
+            None,
+        );
+        args.env.insert(
+            "CODEXBRIDGE_NATIVE_EXIT_PROBE_EXE".to_owned(),
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.env.insert(
+            "CODEXBRIDGE_NATIVE_EXIT_PROBE_CHILD".to_owned(),
+            "1".to_owned(),
+        );
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("native exit probe completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(37));
     }
 
     #[cfg(windows)]
@@ -2111,11 +2270,57 @@ mod tests {
         write_windows_probe_cmd(&project_dir);
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_exec_args("& .\\hidden-probe.cmd", None);
+        let args = windows_hidden_cmd_shim_probe_args();
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
-        assert_windows_command_success(&session);
+        assert_windows_exit_success(&session);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child harness: invoked by the Windows hidden PowerShell .cmd parent test"]
+    fn windows_hidden_powershell_cmd_shim_console_probe_child() {
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_HIDDEN_CMD_SHIM_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under the hidden PowerShell .cmd parent test"
+        );
+
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+
+        let window = unsafe { GetConsoleWindow() };
+        let console_window_detected =
+            std::env::var_os("CODEXBRIDGE_HIDDEN_CMD_SHIM_FORCE_CONSOLE_WINDOW").is_some()
+                || !window.is_null();
+        assert!(
+            !console_window_detected,
+            "PowerShell .cmd shim inherited or created a console window"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_hidden_powershell_cmd_shim_parent_rejects_console_probe_failure() {
+        let project_dir = tempfile::tempdir().unwrap();
+        write_windows_probe_cmd(&project_dir);
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_hidden_cmd_shim_probe_args();
+        args.env.insert(
+            "CODEXBRIDGE_HIDDEN_CMD_SHIM_FORCE_CONSOLE_WINDOW".to_owned(),
+            "1".to_owned(),
+        );
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        let parent_accepts_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_windows_exit_success(&session);
+        }));
+        assert!(
+            parent_accepts_failure.is_err(),
+            "parent must reject a console-probe child failure"
+        );
     }
 
     #[cfg(windows)]
@@ -2152,14 +2357,16 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_long_running_args();
+        let (args, pid_file) = windows_tree_probe_args(&project_dir);
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
-        windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
+        let descendant_pid = windows_wait_for_probe_pid(&pid_file).await;
+        assert!(windows_process_is_running(descendant_pid));
 
         session.signal(ProcessSignal::Terminate).await.unwrap();
         windows_wait_for_session(&session).await;
         assert!(session.is_finished());
+        windows_assert_process_exited(descendant_pid).await;
     }
 
     #[cfg(windows)]
@@ -2168,14 +2375,17 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_long_running_args();
-        args.timeout_ms = Some(100);
+        let (mut args, pid_file) = windows_tree_probe_args(&project_dir);
+        args.timeout_ms = Some(5_000);
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        let descendant_pid = windows_wait_for_probe_pid(&pid_file).await;
+        assert!(windows_process_is_running(descendant_pid));
         windows_wait_for_session(&session).await;
         let completion = session.completion().expect("timed out hidden completion");
         assert_eq!(completion.reason, CompletionReason::TimedOut);
-        assert!(session.timed_out.load(Ordering::Relaxed));
+        assert!(session.process_deadline_exceeded.load(Ordering::Relaxed));
+        windows_assert_process_exited(descendant_pid).await;
     }
 
     #[cfg(windows)]
@@ -2184,10 +2394,11 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_long_running_args();
+        let (args, pid_file) = windows_tree_probe_args(&project_dir);
 
         let (registry, session) = windows_start_exec(&config, &project, &args).await;
-        windows_wait_for_output(&session, "codexbridge-hidden-long-ready").await;
+        let descendant_pid = windows_wait_for_probe_pid(&pid_file).await;
+        assert!(windows_process_is_running(descendant_pid));
 
         registry.shutdown();
         windows_wait_for_session(&session).await;
@@ -2197,6 +2408,7 @@ mod tests {
             Some(0),
             "registry shutdown allowed the hidden process to exit successfully"
         );
+        windows_assert_process_exited(descendant_pid).await;
     }
 
     #[cfg(windows)]
@@ -2299,6 +2511,7 @@ mod tests {
             .args([
                 "--exact",
                 "tools::process::tests::windows_bare_cmd_spawns_through_conpty_child",
+                "--ignored",
                 "--nocapture",
             ])
             .env("CODEXBRIDGE_CONPTY_CMD_PROBE", "1")
@@ -2326,10 +2539,13 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "child harness: invoked by windows_bare_cmd_spawns_through_conpty"]
     async fn windows_bare_cmd_spawns_through_conpty_child() {
-        if std::env::var_os("CODEXBRIDGE_CONPTY_CMD_PROBE").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_CONPTY_CMD_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under windows_bare_cmd_spawns_through_conpty"
+        );
         use crate::config::ConfigBuilder;
         use crate::project::ProjectKey;
         use crate::request_context::TransportMode;
@@ -2465,8 +2681,7 @@ mod tests {
                 signal: None,
                 error: None,
             })),
-            timed_out: AtomicBool::new(false),
-            deadline_exceeded: AtomicBool::new(false),
+            process_deadline_exceeded: AtomicBool::new(false),
             replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
@@ -2513,7 +2728,7 @@ mod tests {
         let tracker = PodmanExecutionTracker::prepare(
             &config,
             &project,
-            "sudo -n podman run --rm alpine true",
+            "rtk sudo -n podman run --rm alpine true",
         )
         .unwrap()
         .expect("Podman command should allocate an execution tracker");
@@ -2559,6 +2774,7 @@ mod tests {
             "sudo -n podman run --rm alpine true",
             "sudo --non-interactive /usr/bin/podman create alpine true",
             "env FOO=1 podman run --rm alpine true",
+            "rtk sudo -n podman run --rm alpine true",
             "podman run --cidfile /tmp/user.cid alpine true",
             "podman run --cidfile=/tmp/user.cid alpine true",
         ] {
@@ -2611,7 +2827,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_terminate_or_kill_requests_owned_podman_cleanup() {
         for signal in [ProcessSignal::Terminate, ProcessSignal::Kill] {
-            let session = test_session(None);
+            let session = test_session(Some(0));
             let root = tempfile::tempdir().unwrap();
             let host_dir = root.path().join(format!("tracker-{}", signal.as_str()));
             std::fs::create_dir(&host_dir).unwrap();
@@ -2624,9 +2840,20 @@ mod tests {
                 container_host: None,
                 docker_host: None,
             });
-            session
-                .podman_cleanup_requested
-                .store(true, Ordering::Release);
+            assert!(!session.podman_cleanup_requested.load(Ordering::Acquire));
+
+            session.signal(signal).await.unwrap();
+
+            assert!(
+                session.podman_cleanup_requested.load(Ordering::Acquire),
+                "{} did not request Podman cleanup",
+                signal.as_str()
+            );
+            let requested_signal = *session.requested_signal.lock().unwrap();
+            assert_eq!(
+                requested_signal.map(ProcessSignal::as_str),
+                Some(signal.as_str())
+            );
             let mut wait_error = None;
             cleanup_podman_after_forced_exit(&session, None, &mut wait_error).await;
             assert!(wait_error.is_none());
@@ -2653,13 +2880,35 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn podman_test_output(
+        config: &crate::config::Config,
+        args: &[&str],
+    ) -> std::process::Output {
+        let mut command = if std::env::var_os("CODEXBRIDGE_PODMAN_ROOTFUL_PROBE").is_some() {
+            let mut command = TokioCommand::new("sudo");
+            command.args(["-n", "env"]);
+            if let Some(socket) = config.container_socket.as_ref() {
+                command.arg(format!("CONTAINER_HOST=unix://{}", socket.display()));
+            }
+            command.arg("podman");
+            command
+        } else {
+            let mut command = TokioCommand::new("podman");
+            if let Some(socket) = config.container_socket.as_ref() {
+                command.env("CONTAINER_HOST", format!("unix://{}", socket.display()));
+            }
+            command
+        };
+        command.args(args);
+        command.output().await.unwrap_or_else(|error| {
+            panic!("live Podman prerequisite failed to launch runtime: {error}")
+        })
+    }
+
+    #[cfg(target_os = "linux")]
     async fn podman_container_ids(config: &crate::config::Config, name: &str) -> String {
-        let mut command = TokioCommand::new("podman");
-        command.args(["ps", "-aq", "--filter", &format!("name=^{name}$")]);
-        if let Some(socket) = config.container_socket.as_ref() {
-            command.env("CONTAINER_HOST", format!("unix://{}", socket.display()));
-        }
-        let output = command.output().await.unwrap();
+        let filter = format!("name=^{name}$");
+        let output = podman_test_output(config, &["ps", "-aq", "--filter", &filter]).await;
         assert!(output.status.success(), "{output:?}");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
@@ -2668,9 +2917,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live Podman daemon; run explicitly with CODEXBRIDGE_PODMAN_TIMEOUT_PROBE=1"]
     async fn regression_podman_timeout_and_cancel_remove_daemon_managed_containers() {
-        if std::env::var_os("CODEXBRIDGE_PODMAN_TIMEOUT_PROBE").is_none() {
-            return;
-        }
+        let probe = std::env::var("CODEXBRIDGE_PODMAN_TIMEOUT_PROBE").unwrap_or_else(|_| {
+            panic!(
+                "live Podman test was explicitly selected but CODEXBRIDGE_PODMAN_TIMEOUT_PROBE is missing; set CODEXBRIDGE_PODMAN_TIMEOUT_PROBE=1"
+            )
+        });
+        assert_eq!(
+            probe, "1",
+            "CODEXBRIDGE_PODMAN_TIMEOUT_PROBE must be exactly 1 for explicit live Podman execution"
+        );
         use crate::{config::ConfigBuilder, project::ProjectKey, request_context::TransportMode};
 
         let directory = tempfile::tempdir().unwrap();
@@ -2679,12 +2934,26 @@ mod tests {
         let metadata_root = workspace.join(".metadata/projects/effective");
         std::fs::create_dir_all(&project_root).unwrap();
         std::fs::create_dir_all(metadata_root.join("tmp")).unwrap();
-        let socket = std::env::var("CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET")
-            .unwrap_or_else(|_| "/run/podman/podman.sock".to_owned());
+        let socket = std::env::var("CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET").unwrap_or_else(|_| {
+            panic!(
+                "live Podman test requires CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET to name the daemon socket explicitly"
+            )
+        });
+        assert!(
+            !socket.trim().is_empty(),
+            "CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET must not be empty"
+        );
+        let socket_metadata = std::fs::metadata(&socket)
+            .unwrap_or_else(|error| panic!("live Podman socket {socket} is unavailable: {error}"));
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            socket_metadata.file_type().is_socket(),
+            "CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET must point to a Unix socket: {socket}"
+        );
         let config = ConfigBuilder::from_map(BTreeMap::from([
             ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
             ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
-            ("MCP_CONTAINER_SOCKET".to_owned(), socket),
+            ("MCP_CONTAINER_SOCKET".to_owned(), socket.clone()),
             ("EXEC_DEFAULT_TIMEOUT_MS".to_owned(), "5000".to_owned()),
             ("EXEC_MAX_TIMEOUT_MS".to_owned(), "5000".to_owned()),
         ]))
@@ -2702,11 +2971,28 @@ mod tests {
         let name = format!("tmp-codexbridge-timeout-{}", Uuid::now_v7().simple());
         let image = std::env::var("CODEXBRIDGE_PODMAN_TEST_IMAGE")
             .unwrap_or_else(|_| "docker.io/library/alpine:latest".to_owned());
+        let runtime = podman_test_output(&config, &["info"]).await;
+        assert!(
+            runtime.status.success(),
+            "live Podman runtime is unavailable through {socket}: {}",
+            String::from_utf8_lossy(&runtime.stderr).trim()
+        );
+        let pull = podman_test_output(&config, &["pull", &image]).await;
+        assert!(
+            pull.status.success(),
+            "live Podman test image {image} could not be prepared: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        );
+        let podman = if std::env::var_os("CODEXBRIDGE_PODMAN_ROOTFUL_PROBE").is_some() {
+            "sudo -n podman"
+        } else {
+            "podman"
+        };
         let args = ExecCommandArgs {
-            command: format!("podman run --rm --name {name} {image} sleep 30"),
+            command: format!("{podman} run --rm --name {name} {image} sleep 30"),
             workdir: None,
             shell: None,
-            timeout_ms: Some(500),
+            timeout_ms: Some(5_000),
             yield_time_ms: Some(250),
             env: BTreeMap::new(),
             max_output_tokens: None,
@@ -2724,6 +3010,14 @@ mod tests {
             .start(&config, &project, &args, global_permit, project_permit)
             .await
             .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while podman_container_ids(&config, &name).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Podman timeout probe container was never created before its deadline");
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while !session.is_finished() {
@@ -2744,7 +3038,7 @@ mod tests {
 
         let cancel_name = format!("tmp-codexbridge-cancel-{}", Uuid::now_v7().simple());
         let cancel_args = ExecCommandArgs {
-            command: format!("podman run --rm --name {cancel_name} {image} sleep 30"),
+            command: format!("{podman} run --rm --name {cancel_name} {image} sleep 30"),
             timeout_ms: Some(5_000),
             ..args
         };
@@ -2786,7 +3080,7 @@ mod tests {
 
         let terminate_name = format!("tmp-codexbridge-terminate-{}", Uuid::now_v7().simple());
         let terminate_args = ExecCommandArgs {
-            command: format!("podman run --rm --name {terminate_name} {image} sleep 30"),
+            command: format!("{podman} run --rm --name {terminate_name} {image} sleep 30"),
             timeout_ms: Some(5_000),
             ..cancel_args
         };
@@ -2832,7 +3126,7 @@ mod tests {
 
         let shutdown_name = format!("tmp-codexbridge-shutdown-{}", Uuid::now_v7().simple());
         let shutdown_args = ExecCommandArgs {
-            command: format!("podman run --rm --name {shutdown_name} {image} sleep 30"),
+            command: format!("{podman} run --rm --name {shutdown_name} {image} sleep 30"),
             timeout_ms: Some(5_000),
             ..terminate_args
         };
@@ -2871,12 +3165,12 @@ mod tests {
         let user_cid = directory.path().join("user-provided.cid");
         let user_cid_args = ExecCommandArgs {
             command: format!(
-                "podman run --rm --cidfile {} --name {user_cid_name} {image} sleep 30",
+                "{podman} run --rm --cidfile {} --name {user_cid_name} {image} sleep 30",
                 user_cid.display()
             ),
             workdir: None,
             shell: None,
-            timeout_ms: Some(500),
+            timeout_ms: Some(5_000),
             yield_time_ms: Some(250),
             env: BTreeMap::new(),
             max_output_tokens: None,
@@ -2899,6 +3193,16 @@ mod tests {
             )
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while podman_container_ids(&config, &user_cid_name)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Podman user-cidfile probe container was never created before its deadline");
         tokio::time::timeout(Duration::from_secs(10), async {
             while !user_cid_session.is_finished() {
                 user_cid_session.changed.notified().await;
@@ -2921,7 +3225,7 @@ mod tests {
             let sudo_name = format!("tmp-codexbridge-sudo-{}", Uuid::now_v7().simple());
             let sudo_args = ExecCommandArgs {
                 command: format!("sudo -n podman run --rm --name {sudo_name} {image} sleep 30"),
-                timeout_ms: Some(500),
+                timeout_ms: Some(5_000),
                 ..user_cid_args
             };
             let global_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
@@ -2930,6 +3234,13 @@ mod tests {
                 .start(&config, &project, &sudo_args, global_permit, project_permit)
                 .await
                 .unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while podman_container_ids(&config, &sudo_name).await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("sudo Podman timeout probe container was never created before its deadline");
             tokio::time::timeout(Duration::from_secs(10), async {
                 while !sudo_session.is_finished() {
                     sudo_session.changed.notified().await;
@@ -3430,8 +3741,7 @@ mod tests {
             terminal: None,
             output: Mutex::new(OutputBuffer::default()),
             completion: Mutex::new(None),
-            timed_out: AtomicBool::new(false),
-            deadline_exceeded: AtomicBool::new(false),
+            process_deadline_exceeded: AtomicBool::new(false),
             replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
@@ -3479,8 +3789,9 @@ mod tests {
         .expect("finished session must not wait for the yield deadline");
         assert_eq!(value["exit_code"], 0);
         assert_eq!(value["completion_reason"], "exited");
-        assert_eq!(value["deadline_exceeded"], false);
-        assert_eq!(value["timed_out"], false);
+        assert_eq!(value["process_deadline_exceeded"], false);
+        assert!(value.get("deadline_exceeded").is_none());
+        assert!(value.get("timed_out").is_none());
         assert_eq!(value["output"], "done");
         assert!(value["session_id"].is_null());
         assert!(value["continuation"].is_null());
@@ -3576,6 +3887,12 @@ mod tests {
     }
 
     #[test]
+    fn regression_poll_yield_is_below_common_transport_deadline() {
+        assert_eq!(MAX_POLL_YIELD_MS, MAX_INITIAL_YIELD_MS);
+        assert!(MAX_POLL_YIELD_MS <= 20_000);
+    }
+
+    #[test]
     fn output_buffer_replaces_invalid_utf8_without_losing_byte_accounting() {
         let mut buffer = OutputBuffer::default();
         buffer.append(&[b'a', 0xff, b'b'], 16);
@@ -3618,7 +3935,7 @@ mod tests {
     fn process_signal_schema_documents_platform_specific_semantics() {
         let rendered = serde_json::to_string(&schemars::schema_for!(WriteStdinArgs)).unwrap();
         assert!(rendered.contains("Hidden non-TTY Windows"), "{rendered}");
-        assert!(rendered.contains("non-forced taskkill"), "{rendered}");
+        assert!(rendered.contains("forced fallback"), "{rendered}");
     }
 
     #[test]
@@ -3644,6 +3961,7 @@ mod tests {
             .args([
                 "--exact",
                 "tools::process::tests::windows_taskkill_does_not_depend_on_path_child",
+                "--ignored",
                 "--nocapture",
             ])
             .env("PATH", "")
@@ -3660,10 +3978,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "child harness: invoked by windows_taskkill_does_not_depend_on_path"]
     fn windows_taskkill_does_not_depend_on_path_child() {
-        if std::env::var_os("CODEXBRIDGE_TASKKILL_PATH_PROBE").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_TASKKILL_PATH_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under windows_taskkill_does_not_depend_on_path"
+        );
+        let taskkill = std::path::PathBuf::from(
+            crate::platform::windows_taskkill_program_for_test(u32::MAX, true),
+        );
+        assert!(
+            taskkill.is_absolute() && taskkill.ends_with(r"System32\taskkill.exe"),
+            "taskkill must be launched by absolute System32 path, got {}",
+            taskkill.display()
+        );
         let error = signal_tree(Some(u32::MAX), ProcessSignal::Kill).unwrap_err();
         assert!(
             error.message().contains("taskkill failed for process tree"),
@@ -3856,13 +4185,23 @@ mod tests {
 
     #[tokio::test]
     async fn yield_result_reports_requested_signal_on_forced_timeout() {
-        let session = test_session(Some(9));
+        let session = test_session(None);
+        *session.completion.lock().unwrap() = Some(ProcessCompletion {
+            reason: CompletionReason::TimedOut,
+            exit_code: Some(9),
+            signal: None,
+            error: None,
+        });
         *session.requested_signal.lock().unwrap() = Some(ProcessSignal::Interrupt);
-        session.timed_out.store(true, Ordering::Relaxed);
+        session
+            .process_deadline_exceeded
+            .store(true, Ordering::Relaxed);
         let value = yield_result("sig-timeout", &session, 10, None, None).await;
-        assert_eq!(value["completion_reason"], "exited");
+        assert_eq!(value["completion_reason"], "timed_out");
         assert_eq!(value["exit_code"], 9);
         assert_eq!(value["requested_signal"], "interrupt");
-        assert_eq!(value["timed_out"], true);
+        assert_eq!(value["process_deadline_exceeded"], true);
+        assert!(value.get("deadline_exceeded").is_none());
+        assert!(value.get("timed_out").is_none());
     }
 }

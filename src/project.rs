@@ -403,42 +403,31 @@ impl ProjectResolver {
             metadata_dirs_created: Vec::new(),
         };
         let result = (|| {
-            if project.project_root.exists() {
-                if !project.project_root.is_dir() {
-                    return Err(AppError::new(
+            layout.project_root_created =
+                create_directory_if_missing(&project.project_root, || {
+                    AppError::new(
                         "INVALID_PROJECT_ALIAS",
                         "project checkout path exists but is not a directory",
-                    ));
-                }
-            } else {
-                std::fs::create_dir(&project.project_root)?;
-                layout.project_root_created = true;
-            }
-            if project.metadata_root.exists() {
-                if !project.metadata_root.is_dir() {
-                    return Err(AppError::new(
+                    )
+                })?;
+            layout.metadata_root_created =
+                create_directory_if_missing(&project.metadata_root, || {
+                    AppError::new(
                         "PROCESS_FAILED",
                         "project metadata path exists but is not a directory",
-                    ));
-                }
-            } else {
-                std::fs::create_dir(&project.metadata_root)?;
-                layout.metadata_root_created = true;
-            }
+                    )
+                })?;
             for directory in ["memory", "plans", "tmp", "home", "state"] {
                 let path = project.metadata_root.join(directory);
-                if path.exists() {
-                    if !path.is_dir() {
-                        return Err(AppError::new(
-                            "PROCESS_FAILED",
-                            format!(
-                                "project metadata entry {} is not a directory",
-                                path.display()
-                            ),
-                        ));
-                    }
-                } else {
-                    std::fs::create_dir(&path)?;
+                if create_directory_if_missing(&path, || {
+                    AppError::new(
+                        "PROCESS_FAILED",
+                        format!(
+                            "project metadata entry {} is not a directory",
+                            path.display()
+                        ),
+                    )
+                })? {
                     layout.metadata_dirs_created.push(path);
                 }
             }
@@ -475,6 +464,30 @@ impl ProjectResolver {
             return;
         }
         layout.remove_empty_created_paths(&prepared.project);
+    }
+}
+
+fn create_directory_if_missing(
+    path: &std::path::Path,
+    not_directory_error: impl Fn() -> AppError,
+) -> Result<bool> {
+    if path.exists() {
+        return if path.is_dir() {
+            Ok(false)
+        } else {
+            Err(not_directory_error())
+        };
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if path.is_dir() {
+                Ok(false)
+            } else {
+                Err(not_directory_error())
+            }
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1105,7 +1118,8 @@ mod tests {
     fn concurrent_new_alias_commit_fails_closed_without_binding_loser() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
-        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let resolver =
+            ProjectResolver::new(directory.path().join("workspace"), storage.clone()).unwrap();
         let first = identity("usr_a", "conv_a", None);
         let second = identity("usr_b", "conv_b", None);
         let prepared_first = resolver
@@ -1115,11 +1129,70 @@ mod tests {
             .prepare_initialize(&second, Some("shared-project"))
             .unwrap();
 
-        resolver.commit_initialize(&prepared_first).unwrap();
-        let error = resolver.commit_initialize(&prepared_second).unwrap_err();
-        assert_eq!(error.code(), "SERVER_BUSY");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first_resolver = resolver.clone();
+            let first_barrier = barrier.clone();
+            let first_commit = scope.spawn(move || {
+                first_barrier.wait();
+                first_resolver.commit_initialize(&prepared_first)
+            });
+
+            let second_resolver = resolver.clone();
+            let second_barrier = barrier.clone();
+            let second_commit = scope.spawn(move || {
+                second_barrier.wait();
+                second_resolver.commit_initialize(&prepared_second)
+            });
+
+            (first_commit.join().unwrap(), second_commit.join().unwrap())
+        });
+
+        let (winner, loser, loser_error) = match (&first_result, &second_result) {
+            (Ok(()), Err(error)) => (&first, &second, error),
+            (Err(error), Ok(())) => (&second, &first, error),
+            _ => panic!(
+                "expected exactly one successful commit, got first={first_result:?}, second={second_result:?}"
+            ),
+        };
+        assert_eq!(loser_error.code(), "SERVER_BUSY");
         assert_eq!(
-            resolver.resolve_initialized(&second).unwrap_err().code(),
+            loser_error.message(),
+            "project alias changed concurrently; retry initialization"
+        );
+
+        let winner_native =
+            derive_native_project_key(&winner.openai_subject, &winner.openai_conversation_id);
+        let loser_native =
+            derive_native_project_key(&loser.openai_subject, &loser.openai_conversation_id);
+        assert_eq!(
+            storage
+                .effective_for_alias("shared-project")
+                .unwrap()
+                .as_deref(),
+            Some("shared-project")
+        );
+        assert_eq!(
+            storage
+                .effective_binding(winner_native.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("shared-project")
+        );
+        assert_eq!(
+            storage.effective_binding(loser_native.as_str()).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolver
+                .resolve_initialized(winner)
+                .unwrap()
+                .effective_project_key
+                .as_str(),
+            "shared-project"
+        );
+        assert_eq!(
+            resolver.resolve_initialized(loser).unwrap_err().code(),
             "TURN_NOT_INITIALIZED"
         );
     }

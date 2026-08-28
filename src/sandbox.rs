@@ -862,7 +862,7 @@ fn default_shell() -> String {
 
 fn powershell_script(command_text: &str) -> String {
     format!(
-        "& {{\n{command_text}\n}}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}"
+        "& {{\n{command_text}\n}}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }} else {{ exit 0 }}"
     )
 }
 
@@ -1075,7 +1075,7 @@ fn segment_podman_invocation(segment: &str) -> Option<bool> {
         if saw_sudo && matches!(base, "-n" | "--non-interactive") {
             continue;
         }
-        if matches!(base, "env" | "command" | "exec" | "nohup") {
+        if matches!(base, "env" | "command" | "exec" | "nohup" | "rtk") {
             continue;
         }
         return (base == "podman").then_some(saw_sudo);
@@ -1948,38 +1948,40 @@ mod tests {
     #[test]
     fn regression_bounded_read_rejects_fifo_without_waiting_for_peer() {
         use std::ffi::CString;
-        use std::io::Write as _;
         use std::os::unix::ffi::OsStrExt;
-        use std::time::{Duration, Instant};
+        use std::sync::mpsc;
+        use std::time::Duration;
 
         let project = tempfile::tempdir().unwrap();
         let fifo = project.path().join("pipe");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
-        // Keep the current blocking implementation finite: after one second a
-        // peer opens the FIFO and writes one byte. A safe regular-file reader
-        // should reject the FIFO before this peer is needed.
-        let writer_path = fifo.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(1));
-            if let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(writer_path) {
-                let _ = writer.write_all(b"x");
-            }
+        // There is intentionally no peer writer. Production opens with O_NONBLOCK
+        // and rejects non-regular metadata before reading, so completion must not
+        // depend on a FIFO peer. The timeout is only an outer deadlock guard.
+        let project_path = project.path().to_path_buf();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let result = SecurePathResolver.read_file_bounded(&project_path, "pipe", 16);
+            let _ = sender.send(result);
         });
 
-        let started = Instant::now();
-        let result = SecurePathResolver.read_file_bounded(project.path(), "pipe", 16);
-        let elapsed = started.elapsed();
+        let result = match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("FIFO read blocked waiting for a peer")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                reader.join().expect("FIFO reader thread panicked");
+                panic!("FIFO reader exited without reporting a result")
+            }
+        };
+        reader.join().expect("FIFO reader thread panicked");
 
-        assert!(
-            result.is_err(),
-            "FIFO must be rejected as non-regular; elapsed={elapsed:?}, result={result:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "FIFO open blocked waiting for a peer: {elapsed:?}"
-        );
+        let error = result.expect_err("FIFO must be rejected as non-regular");
+        assert_eq!(error.code(), "INVALID_INPUT");
+        assert_eq!(error.message(), "path is not a regular file");
     }
 
     #[test]
@@ -2028,10 +2030,11 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("-Command"));
         assert!(script.contains("$LASTEXITCODE"));
         assert!(script.contains("exit $LASTEXITCODE"));
+        assert!(script.ends_with("else { exit 0 }"));
     }
 
     #[test]
-    fn windows_shell_resolution_canonicalizes_bare_names_and_preserves_paths() {
+    fn windows_shell_resolution_canonicalizes_bare_names_and_preserves_explicit_paths() {
         let comspec = r"D:\Custom Windows\System32\cmd.exe";
         for shell in ["cmd", "cmd.exe", "CMD.EXE"] {
             assert_eq!(
@@ -2066,6 +2069,8 @@ mod tests {
             explicit_cmd
         );
         let relative_cmd = r"tools\cmd.exe";
+        // Explicit paths, including relative ones, are intentionally operator-selected
+        // executables. Resolution only canonicalizes bare shell names.
         assert_eq!(
             windows_shell_executable(relative_cmd, ShellKind::Cmd, Some(comspec)),
             relative_cmd
@@ -2232,6 +2237,8 @@ mod tests {
             "sudo -n podman run --rm alpine true",
             "sudo --non-interactive /usr/bin/podman ps",
             "env FOO=1 sudo -n podman build .",
+            "rtk sudo -n podman run --rm alpine true",
+            "rtk podman ps",
         ] {
             assert!(invokes_podman(command), "{command}");
         }
@@ -2239,6 +2246,7 @@ mod tests {
             "sudo -n podman run --rm alpine true",
             "sudo --non-interactive /usr/bin/podman ps",
             "env FOO=1 sudo -n podman build .",
+            "rtk sudo -n podman run --rm alpine true",
         ] {
             assert!(invokes_sudo_podman(command), "{command}");
         }
@@ -2330,8 +2338,8 @@ mod tests {
         assert_eq!(args, ["-c"]);
         assert_eq!(script, "printf ok");
     }
-    #[test]
-    fn exec_env_additions_reject_malformed_keys_and_oversized_values() {
+    #[tokio::test]
+    async fn exec_env_additions_reject_malformed_keys_and_oversized_values() {
         let directory = tempfile::tempdir().unwrap();
         let config = ConfigBuilder::from_map(BTreeMap::from([
             (
@@ -2339,6 +2347,7 @@ mod tests {
                 directory.path().display().to_string(),
             ),
             ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
         ]))
         .build()
         .unwrap();
@@ -2375,7 +2384,27 @@ mod tests {
 
         // A well-formed addition must pass and reach the command environment.
         let mut valid = BTreeMap::new();
-        valid.insert("MY_TOOL_FLAG".to_owned(), "on".to_owned());
-        assert!(build(valid).is_ok());
+        valid.insert(
+            "CODEXBRIDGE_ENV_FORWARDING_PROBE".to_owned(),
+            "forwarded-exactly-42".to_owned(),
+        );
+        assert!(build(valid.clone()).is_ok());
+
+        let command_text = if cfg!(windows) {
+            "Write-Output $env:CODEXBRIDGE_ENV_FORWARDING_PROBE"
+        } else {
+            "printf '%s' \"$CODEXBRIDGE_ENV_FORWARDING_PROBE\""
+        };
+        let result = execute(
+            &config,
+            &project,
+            command_text,
+            Duration::from_secs(10),
+            &valid,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "forwarded-exactly-42");
     }
 }

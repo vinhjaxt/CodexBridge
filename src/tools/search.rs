@@ -576,13 +576,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
         std::fs::create_dir_all(temp.path().join("target")).unwrap();
-        std::fs::write(temp.path().join("src/a.rs"), "before\nNeedle\nafter\n").unwrap();
+        std::fs::write(
+            temp.path().join("src/a.rs"),
+            "before one\nNeedle one\nafter one\nbefore two\nNeedle two\nafter two\n",
+        )
+        .unwrap();
         std::fs::write(temp.path().join("target/hidden.rs"), "Needle\n").unwrap();
         let regex = RegexBuilder::new("needle")
             .case_insensitive(true)
             .build()
             .unwrap();
-        let value = scan_content(
+        let first = scan_content(
             temp.path(),
             temp.path(),
             &regex,
@@ -595,22 +599,71 @@ mod tests {
             4096,
         )
         .unwrap();
-        assert_eq!(value.count, 1);
-        assert_eq!(value.matches[0].path, "src/a.rs");
+        assert_eq!(first.count, 1);
+        assert_eq!(first.matches[0].path, "src/a.rs");
+        assert_eq!(first.matches[0].line, Some(2));
         assert_eq!(
-            value.matches[0].context_before.as_ref().unwrap()[0],
-            "before"
+            first.matches[0].context_before.as_ref().unwrap()[0],
+            "before one"
+        );
+        assert!(first.truncated);
+        assert_eq!(first.next_offset, Some(1));
+        assert_eq!(
+            first.continuation.as_deref(),
+            Some("Call the same search again with offset=1.")
+        );
+        assert!(
+            first
+                .matches
+                .iter()
+                .all(|item| item.path != "target/hidden.rs")
+        );
+
+        let second = scan_content(
+            temp.path(),
+            temp.path(),
+            &regex,
+            Some("**/*.rs"),
+            1,
+            false,
+            first.next_offset.unwrap(),
+            1,
+            100,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(second.count, 1);
+        assert_eq!(second.matches[0].path, "src/a.rs");
+        assert_eq!(second.matches[0].line, Some(5));
+        assert_eq!(second.matches[0].text.as_deref(), Some("Needle two"));
+        assert!(!second.truncated);
+        assert_eq!(second.next_offset, None);
+        assert_eq!(second.continuation, None);
+        assert!(
+            second
+                .matches
+                .iter()
+                .all(|item| item.path != "target/hidden.rs")
         );
     }
 
     #[test]
     fn glob_is_relative_to_base_and_sorted() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
-        std::fs::write(temp.path().join("src/nested/b.rs"), "").unwrap();
+        std::fs::create_dir_all(temp.path().join("src/a")).unwrap();
+        for path in ["src/z.rs", "src/a/z.rs", "src/a.rs", "src/m.rs"] {
+            std::fs::write(temp.path().join(path), "").unwrap();
+        }
+        std::fs::write(temp.path().join("outside.rs"), "").unwrap();
+
         let value =
             scan_glob(temp.path(), &temp.path().join("src"), "**/*.rs", 0, 10, 100).unwrap();
-        assert_eq!(value.paths[0], "src/nested/b.rs");
+
+        assert_eq!(
+            value.paths,
+            vec!["src/a.rs", "src/a/z.rs", "src/m.rs", "src/z.rs"]
+        );
+        assert!(value.paths.iter().all(|path| path.starts_with("src/")));
     }
 
     #[test]

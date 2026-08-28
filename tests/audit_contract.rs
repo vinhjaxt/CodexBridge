@@ -175,5 +175,9 @@ async fn shutdown_is_idempotent_and_does_not_leak_queue_permits() {
     logger.emit(json!({"event":"two"}));
     logger.shutdown().await;
     logger.shutdown().await;
-    assert!(logger.queue_bytes_available() <= initial);
+    assert_eq!(
+        logger.queue_bytes_available(),
+        initial,
+        "shutdown must release every byte permit acquired by queued events"
+    );
 }

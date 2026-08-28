@@ -730,18 +730,52 @@ mod tests {
     #[test]
     fn config_builds_are_independent_in_one_process() {
         let first = ConfigBuilder::from_map(BTreeMap::from([
-            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            (
+                "MCP_AUTH_TOKEN".to_owned(),
+                "first-env-token-0001".to_owned(),
+            ),
             ("MCP_BIND".to_owned(), "127.0.0.1:3201".to_owned()),
+            ("MCP_AUTH_MODE".to_owned(), "either".to_owned()),
+            ("OUTPUT_MAX_RESULTS".to_owned(), "101".to_owned()),
+            (
+                "MCP_PROJECT_DOC_FALLBACKS".to_owned(),
+                "FIRST.md,FIRST.local.md".to_owned(),
+            ),
         ]))
+        .override_value("MCP_AUTH_TOKEN", "first-override-token-0001")
+        .override_value("OUTPUT_MAX_RESULTS", "111")
         .build()
         .unwrap();
         let second = ConfigBuilder::from_map(BTreeMap::from([
-            ("MCP_AUTH_TOKEN".to_owned(), "fedcba0987654321".to_owned()),
+            (
+                "MCP_AUTH_TOKEN".to_owned(),
+                "second-env-token-0002".to_owned(),
+            ),
             ("MCP_BIND".to_owned(), "127.0.0.1:3202".to_owned()),
+            ("MCP_AUTH_MODE".to_owned(), "bearer".to_owned()),
+            ("OUTPUT_MAX_RESULTS".to_owned(), "222".to_owned()),
+            (
+                "MCP_PROJECT_DOC_FALLBACKS".to_owned(),
+                "SECOND.md".to_owned(),
+            ),
         ]))
         .build()
         .unwrap();
-        assert_ne!(first.bind, second.bind);
+
+        assert_eq!(first.auth_token, "first-override-token-0001");
+        assert_eq!(first.bind.to_string(), "127.0.0.1:3201");
+        assert_eq!(first.auth_mode, AuthMode::Either);
+        assert_eq!(first.output.results, 111);
+        assert_eq!(
+            first.project_doc_fallbacks,
+            vec!["FIRST.md".to_owned(), "FIRST.local.md".to_owned()]
+        );
+
+        assert_eq!(second.auth_token, "second-env-token-0002");
+        assert_eq!(second.bind.to_string(), "127.0.0.1:3202");
+        assert_eq!(second.auth_mode, AuthMode::Bearer);
+        assert_eq!(second.output.results, 222);
+        assert_eq!(second.project_doc_fallbacks, vec!["SECOND.md".to_owned()]);
     }
 
     #[test]

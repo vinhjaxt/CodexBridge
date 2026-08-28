@@ -67,12 +67,11 @@ pub(super) fn typed_output_schema(tool: &str) -> Option<Arc<serde_json::Map<Stri
                 "output_next_offset":{"type":"integer"},
                 "output_bytes":{"type":"integer"},
                 "truncated":{"type":"boolean"},
-                "timed_out":{"type":"boolean"},
-                "deadline_exceeded":{"type":"boolean"},
+                "process_deadline_exceeded":{"type":"boolean"},
                 "tty":{"type":"boolean"},
                 "continuation":{"type":["string","null"]}
             },
-            "required":["chunk_id","exit_code","completion_reason","signal","requested_signal","error","output","output_bytes","output_offset","output_next_offset","truncated","timed_out","deadline_exceeded","tty"],
+            "required":["chunk_id","exit_code","completion_reason","signal","requested_signal","error","output","output_bytes","output_offset","output_next_offset","truncated","process_deadline_exceeded","tty"],
             "additionalProperties":true
         }),
         "skills_list" => json!({

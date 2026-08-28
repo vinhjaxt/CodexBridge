@@ -585,14 +585,14 @@ grep -q 'NPROC_OK:' "$run_root/nproc-limit.json"
 call_tool write_stdin 54 '{"session_id":"missing-session","chars":""}' "$run_root/missing-session.json"
 jq -e '.result.isError == true and .result.structuredContent == null and (.result.content[0].text | startswith("FILE_NOT_FOUND:"))' "$run_root/missing-session.json" >/dev/null
 call_tool exec_command 76 '{"cmd":"exit 7","yield_time_ms":1000}' "$run_root/nonzero-exit.json"
-jq -e '.result.structuredContent.exit_code == 7 and .result.structuredContent.completion_reason == "exited" and .result.structuredContent.timed_out == false and .result.structuredContent.deadline_exceeded == false' "$run_root/nonzero-exit.json" >/dev/null
+jq -e '.result.structuredContent.exit_code == 7 and .result.structuredContent.completion_reason == "exited" and .result.structuredContent.process_deadline_exceeded == false and (.result.structuredContent | has("timed_out") | not) and (.result.structuredContent | has("deadline_exceeded") | not)' "$run_root/nonzero-exit.json" >/dev/null
 # If the deadline and normal process exit are adjacent, the one-second
 # completion grace preserves the real exit status while explicitly recording
 # that the requested deadline was crossed. It must not synthesize exit -1.
 call_tool exec_command 1009 '{"cmd":"sleep 0.3; exit 0","timeout_ms":250,"yield_time_ms":2000}' "$run_root/timeout-boundary.json"
-jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited" and .result.structuredContent.deadline_exceeded == true and .result.structuredContent.timed_out == false' "$run_root/timeout-boundary.json" >/dev/null
+jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited" and .result.structuredContent.process_deadline_exceeded == true and (.result.structuredContent | has("timed_out") | not) and (.result.structuredContent | has("deadline_exceeded") | not)' "$run_root/timeout-boundary.json" >/dev/null
 call_tool exec_command 77 '{"cmd":"sleep 2","timeout_ms":250,"yield_time_ms":1500}' "$run_root/process-timeout.json"
-jq -e '.result.structuredContent.timed_out == true and .result.structuredContent.deadline_exceeded == true and .result.structuredContent.completion_reason == "timed_out" and (.result.structuredContent.exit_code == null or .result.structuredContent.exit_code >= 0)' "$run_root/process-timeout.json" >/dev/null
+jq -e '.result.structuredContent.completion_reason == "timed_out" and .result.structuredContent.process_deadline_exceeded == true and (.result.structuredContent | has("timed_out") | not) and (.result.structuredContent | has("deadline_exceeded") | not) and (.result.structuredContent.exit_code == null or .result.structuredContent.exit_code >= 0)' "$run_root/process-timeout.json" >/dev/null
 
 # Chunked output is byte-cursored: each response delivers its range once, and
 # a lost response can be recovered with since_output_offset instead of
@@ -653,7 +653,7 @@ call_tool exec_command 111 '{"cmd":"sleep 30","yield_time_ms":250,"timeout_ms":1
 signal_session="$(jq -r '.result.structuredContent.session_id // empty' "$run_root/signal-start.json")"
 [[ -n "$signal_session" ]]
 call_tool write_stdin 112 "$(jq -cn --arg id "$signal_session" '{session_id:$id,signal:"interrupt",extensions:{wait_for_exit_ms:5000}}')" "$run_root/signal-finish.json"
-jq -e '.result.structuredContent.completion_reason == "signaled" and .result.structuredContent.requested_signal == "interrupt" and .result.structuredContent.timed_out == false and .result.structuredContent.session_id == null and (.result.structuredContent.exit_code == null or .result.structuredContent.exit_code >= 0)' "$run_root/signal-finish.json" >/dev/null
+jq -e '.result.structuredContent.completion_reason == "signaled" and .result.structuredContent.requested_signal == "interrupt" and .result.structuredContent.process_deadline_exceeded == false and .result.structuredContent.session_id == null and (.result.structuredContent.exit_code == null or .result.structuredContent.exit_code >= 0)' "$run_root/signal-finish.json" >/dev/null
 
 # Graceful shutdown can be evidenced in one lifecycle call: deliver SIGTERM,
 # wait for the child to run its handler, drain the final log line, and return
@@ -663,7 +663,7 @@ graceful_session="$(jq -r '.result.structuredContent.session_id // empty' "$run_
 [[ -n "$graceful_session" ]]
 grep -q 'SERVICE_READY' "$run_root/graceful-start.json"
 call_tool write_stdin 1012 "$(jq -cn --arg id "$graceful_session" '{session_id:$id,signal:"terminate",wait_for_exit_ms:5000}')" "$run_root/graceful-finish.json"
-jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.requested_signal == "terminate" and .result.structuredContent.exit_code == 0 and .result.structuredContent.session_id == null and .result.structuredContent.timed_out == false' "$run_root/graceful-finish.json" >/dev/null
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.requested_signal == "terminate" and .result.structuredContent.exit_code == 0 and .result.structuredContent.session_id == null and .result.structuredContent.process_deadline_exceeded == false' "$run_root/graceful-finish.json" >/dev/null
 grep -q 'GRACEFUL_SHUTDOWN_OK' "$run_root/graceful-finish.json"
 
 # Output can be bounded by an approximate token window independently of the

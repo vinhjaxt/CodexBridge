@@ -24,6 +24,39 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+      - name: Live Podman process-lifecycle regression
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+          socket="$RUNNER_TEMP/codexbridge-podman.sock"
+          sudo -n podman system service --time=0 "unix://$socket" >"$RUNNER_TEMP/podman-service.log" 2>&1 &
+          service_pid=$!
+          trap 'kill "$service_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 50); do
+            if sudo -n env CONTAINER_HOST="unix://$socket" podman info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/podman-service.log"
+            exit 1
+          fi
+          CODEXBRIDGE_PODMAN_TIMEOUT_PROBE=1 \
+          CODEXBRIDGE_PODMAN_ROOTFUL_PROBE=1 \
+          CODEXBRIDGE_PODMAN_TIMEOUT_SOCKET="$socket" \
+          cargo test --all-features --lib \
+            tools::process::tests::regression_podman_timeout_and_cancel_remove_daemon_managed_containers \
+            -- --ignored --exact --nocapture
+          leftovers="$(sudo -n env CONTAINER_HOST="unix://$socket" podman ps -aq --filter name=tmp-codexbridge-)"
+          if [ -n "$leftovers" ]; then
+            echo "live Podman regression left test containers behind: $leftovers" >&2
+            sudo -n env CONTAINER_HOST="unix://$socket" podman ps -a --filter name=tmp-codexbridge-
+            exit 1
+          fi
       - name: Build bins and examples
         run: cargo build --bins --examples
       - name: Validate smoke script

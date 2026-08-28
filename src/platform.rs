@@ -82,7 +82,7 @@ pub(crate) fn windows_system32_executable(name: &str) -> PathBuf {
 }
 
 #[cfg(windows)]
-pub(crate) fn windows_taskkill(pid: u32, force: bool) -> std::io::Result<std::process::ExitStatus> {
+fn windows_taskkill_command(pid: u32, force: bool) -> std::process::Command {
     use std::os::windows::process::CommandExt as _;
 
     let mut command = std::process::Command::new(windows_system32_executable("taskkill.exe"));
@@ -94,8 +94,20 @@ pub(crate) fn windows_taskkill(pid: u32, force: bool) -> std::io::Result<std::pr
         .creation_flags(windows_hidden_creation_flags(false))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_taskkill(pid: u32, force: bool) -> std::io::Result<std::process::ExitStatus> {
+    windows_taskkill_command(pid, force).status()
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn windows_taskkill_program_for_test(pid: u32, force: bool) -> OsString {
+    windows_taskkill_command(pid, force)
+        .get_program()
+        .to_os_string()
 }
 
 #[cfg(windows)]
@@ -165,17 +177,33 @@ mod tests {
     fn upstream_environment_is_platform_native() {
         let mut command = Command::new("placeholder");
         configure_upstream_stdio_environment(&mut command);
-        let path = command
+        let env = command
             .as_std()
             .get_envs()
-            .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
-            .and_then(|(_, value)| value)
-            .expect("PATH must be explicitly provided")
-            .to_string_lossy();
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| value.as_deref())
+        };
+        let path = get("PATH").expect("PATH must be explicitly provided");
         if cfg!(windows) {
             assert!(!path.contains("/usr/local/bin:/usr/bin:/bin"));
+            assert!(!path.trim().is_empty());
+            let system_root = get("SystemRoot").expect("SystemRoot baseline");
+            assert!(!system_root.trim().is_empty());
+            assert_eq!(get("WINDIR"), Some(system_root));
+            assert!(get("TEMP").is_some_and(|value| !value.trim().is_empty()));
+            assert!(get("TMP").is_some_and(|value| !value.trim().is_empty()));
         } else {
             assert_eq!(path, "/usr/local/bin:/usr/bin:/bin");
+            assert_eq!(get("LANG"), Some("C.UTF-8"));
         }
     }
 
@@ -210,6 +238,7 @@ mod tests {
             .args([
                 "--exact",
                 "platform::tests::non_tty_process_console_window_probe",
+                "--ignored",
                 "--nocapture",
             ])
             .env("CODEXBRIDGE_NO_WINDOW_PROBE", "1");
@@ -230,22 +259,25 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn non_tty_process_console_window_probe() {
-        if std::env::var_os("CODEXBRIDGE_NO_WINDOW_PROBE").is_none() {
-            return;
-        }
-
+    fn assert_current_process_has_no_console_window() {
         use windows_sys::Win32::System::Console::GetConsoleWindow;
-        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
         let window = unsafe { GetConsoleWindow() };
-        if !window.is_null() {
-            assert_eq!(
-                unsafe { IsWindowVisible(window) },
-                0,
-                "CREATE_NO_WINDOW process has a visible console window"
-            );
-        }
+        assert!(
+            window.is_null(),
+            "CREATE_NO_WINDOW process has a console window"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child harness: invoked by non_tty_process_does_not_show_a_console_window"]
+    fn non_tty_process_console_window_probe() {
+        assert_eq!(
+            std::env::var_os("CODEXBRIDGE_NO_WINDOW_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "child harness must only run under non_tty_process_does_not_show_a_console_window"
+        );
+        assert_current_process_has_no_console_window();
     }
 }

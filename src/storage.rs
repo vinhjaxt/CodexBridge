@@ -1907,6 +1907,8 @@ mod tests {
 
     #[test]
     fn schema_v4_memory_overflow_is_migrated_to_archive_without_loss() {
+        use std::collections::BTreeMap;
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         let connection = Connection::open(&path).unwrap();
@@ -1923,26 +1925,70 @@ mod tests {
                  PRAGMA user_version=4;",
             )
             .unwrap();
+        let mut seeded = Vec::new();
         for index in 0..MEMORY_MAX_ENTRIES + 2 {
+            let key = format!("key-{index:04}");
+            let value = match index {
+                1 => "value-0001-first-overflow-boundary".to_owned(),
+                2 => "value-0002-last-active-boundary".to_owned(),
+                _ => format!("value-{index:04}-payload"),
+            };
+            let updated_at = format!("2026-{:02}-{:02}T00:00:00Z", 1 + index / 28, 1 + index % 28);
             connection
                 .execute(
-                    "INSERT INTO memories(project_key,key,value,updated_at) VALUES('p',?1,'v',?2)",
-                    params![
-                        format!("key-{index:04}"),
-                        format!("2026-01-01T00:{index:02}:00Z")
-                    ],
+                    "INSERT INTO memories(project_key,key,value,updated_at) VALUES('p',?1,?2,?3)",
+                    params![&key, &value, &updated_at],
                 )
                 .unwrap();
+            seeded.push((key, value));
         }
         drop(connection);
 
         let storage = Storage::open(&path).unwrap();
-        assert_eq!(storage.memory_count("p").unwrap(), MEMORY_MAX_ENTRIES);
-        let (archive, _) = storage
-            .memory_archive_recall_page_from_snapshot("p", 0, 10, None)
+        let (active, _) = storage
+            .memory_recall_page_from_snapshot("p", 0, MEMORY_RECALL_MAX_ENTRIES, None)
             .unwrap();
+        let (archive, _) = storage
+            .memory_archive_recall_page_from_snapshot("p", 0, MEMORY_RECALL_MAX_ENTRIES, None)
+            .unwrap();
+
+        assert_eq!(active.total, MEMORY_MAX_ENTRIES);
         assert_eq!(archive.total, 2);
-        assert_eq!(archive.notes.len(), 2);
+        assert!(!active.truncated);
+        assert!(!archive.truncated);
+
+        let active_by_key = active
+            .notes
+            .iter()
+            .map(|note| (note.key.clone(), note.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let archive_by_key = archive
+            .notes
+            .iter()
+            .map(|note| (note.key.clone(), note.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_active = seeded.iter().skip(2).cloned().collect::<BTreeMap<_, _>>();
+        let expected_archive = seeded.iter().take(2).cloned().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(active_by_key, expected_active);
+        assert_eq!(archive_by_key, expected_archive);
+        assert_eq!(
+            active_by_key.get("key-0002").map(String::as_str),
+            Some("value-0002-last-active-boundary")
+        );
+        assert_eq!(
+            archive_by_key.get("key-0001").map(String::as_str),
+            Some("value-0001-first-overflow-boundary")
+        );
+
+        let mut combined = active_by_key.clone();
+        for (key, value) in &archive_by_key {
+            assert!(
+                combined.insert(key.clone(), value.clone()).is_none(),
+                "memory key {key} exists in both active and archive after migration"
+            );
+        }
+        assert_eq!(combined, seeded.into_iter().collect::<BTreeMap<_, _>>());
     }
 
     #[test]
@@ -2188,7 +2234,15 @@ mod tests {
 
     #[test]
     fn wal_read_pool_allows_parallel_reader_and_writer_progress() {
-        use std::sync::mpsc::RecvTimeoutError;
+        use std::{
+            sync::{Barrier, mpsc::RecvTimeoutError},
+            time::Instant,
+        };
+
+        enum Progress {
+            Reader(Result<usize>),
+            Writer(Result<()>),
+        }
 
         let (_directory, storage) = storage();
         storage.memory_set("p", "first", "value").unwrap();
@@ -2206,41 +2260,74 @@ mod tests {
                         |row| row.get(0),
                     )?;
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    release_rx.recv().unwrap();
                     connection.execute_batch("COMMIT")?;
                     Ok(())
                 })
                 .unwrap();
         });
-        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv().unwrap();
 
-        let (read_tx, read_rx) = mpsc::sync_channel(1);
+        let start = Arc::new(Barrier::new(3));
+        let (progress_tx, progress_rx) = mpsc::channel();
         let read_storage = storage.clone();
-        std::thread::spawn(move || {
-            let _ = read_tx.send(read_storage.memory_count("p"));
+        let read_start = start.clone();
+        let read_progress = progress_tx.clone();
+        let reader = std::thread::spawn(move || {
+            read_start.wait();
+            let _ = read_progress.send(Progress::Reader(read_storage.memory_count("p")));
         });
-        match read_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => assert_eq!(result.unwrap(), 1),
-            Err(RecvTimeoutError::Timeout) => panic!("second reader was serialized behind first"),
-            Err(error) => panic!("reader channel failed: {error}"),
-        }
 
-        let (write_tx, write_rx) = mpsc::sync_channel(1);
         let write_storage = storage.clone();
-        std::thread::spawn(move || {
-            let _ = write_tx.send(write_storage.memory_set("p", "second", "value"));
+        let write_start = start.clone();
+        let write_progress = progress_tx.clone();
+        let writer = std::thread::spawn(move || {
+            write_start.wait();
+            let _ = write_progress.send(Progress::Writer(write_storage.memory_set(
+                "p", "second", "value",
+            )));
         });
-        match write_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => result.unwrap(),
-            Err(RecvTimeoutError::Timeout) => {
-                panic!("WAL writer was blocked by an active read transaction")
+
+        start.wait();
+        drop(progress_tx);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut read_result = None;
+        let mut write_result = None;
+        while read_result.is_none() || write_result.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match progress_rx.recv_timeout(remaining) {
+                Ok(Progress::Reader(result)) => read_result = Some(result),
+                Ok(Progress::Writer(result)) => write_result = Some(result),
+                Err(RecvTimeoutError::Timeout) => {
+                    let reader_pending = read_result.is_none();
+                    let writer_pending = write_result.is_none();
+                    release_tx.send(()).unwrap();
+                    holder.join().unwrap();
+                    reader.join().unwrap();
+                    writer.join().unwrap();
+                    panic!(
+                        "read/write progress deadlocked while first read transaction was active (reader_pending={reader_pending}, writer_pending={writer_pending})"
+                    );
+                }
+                Err(error) => panic!("progress channel failed: {error}"),
             }
-            Err(error) => panic!("writer channel failed: {error}"),
         }
+        assert_eq!(read_result.unwrap().unwrap(), 1);
+        write_result.unwrap().unwrap();
 
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
         assert_eq!(storage.memory_count("p").unwrap(), 2);
+        assert_eq!(
+            storage.memory_get("p", "first").unwrap().as_deref(),
+            Some("value")
+        );
+        assert_eq!(
+            storage.memory_get("p", "second").unwrap().as_deref(),
+            Some("value")
+        );
     }
 
     #[test]
@@ -2333,20 +2420,20 @@ mod tests {
 
     #[test]
     fn archive_recall_page_has_entry_and_byte_bounds() {
-        let (_directory, storage) = storage();
+        let (_directory, entry_storage) = storage();
         for index in 0..MEMORY_RECALL_MAX_ENTRIES + 4 {
-            storage
+            entry_storage
                 .memory_archive_set("p", &format!("key-{index:04}"), "value")
                 .unwrap();
         }
-        let (page, hash) = storage
+        let (page, hash) = entry_storage
             .memory_archive_recall_page_from_snapshot("p", 0, MEMORY_RECALL_MAX_ENTRIES, None)
             .expect("recall");
         assert_eq!(page.notes.len(), MEMORY_RECALL_MAX_ENTRIES);
         assert_eq!(page.total, MEMORY_RECALL_MAX_ENTRIES + 4);
         assert!(page.truncated);
         assert_eq!(page.next_offset, Some(MEMORY_RECALL_MAX_ENTRIES));
-        let (tail, _) = storage
+        let (tail, _) = entry_storage
             .memory_archive_recall_page_from_snapshot(
                 "p",
                 page.next_offset.unwrap(),
@@ -2357,6 +2444,73 @@ mod tests {
         assert_eq!(tail.notes.len(), 4);
         assert!(!tail.truncated);
         assert_eq!(tail.next_offset, None);
+
+        let page_bytes = |page: &MemoryPage| {
+            page.notes
+                .iter()
+                .map(|note| note.key.len() + note.value.len())
+                .sum::<usize>()
+        };
+        let seed_to_bytes = |storage: &Storage, project: &str, target_bytes: usize| {
+            let max_value = "v".repeat(MEMORY_ARCHIVE_VALUE_MAX_BYTES);
+            for key in ["a", "b", "c"] {
+                storage
+                    .memory_archive_set(project, key, &max_value)
+                    .unwrap();
+            }
+            let final_value_bytes = target_bytes
+                .checked_sub(4 + 3 * MEMORY_ARCHIVE_VALUE_MAX_BYTES)
+                .expect("target accommodates three full values and four keys");
+            assert!(final_value_bytes <= MEMORY_ARCHIVE_VALUE_MAX_BYTES);
+            storage
+                .memory_archive_set(project, "d", &"v".repeat(final_value_bytes))
+                .unwrap();
+        };
+
+        let (_under_directory, under_storage) = storage();
+        seed_to_bytes(&under_storage, "under", MEMORY_RECALL_MAX_BYTES - 1);
+        let (under, _) = under_storage
+            .memory_archive_recall_page_from_snapshot("under", 0, MEMORY_RECALL_MAX_ENTRIES, None)
+            .expect("recall below byte budget");
+        assert_eq!(under.notes.len(), 4);
+        assert_eq!(page_bytes(&under), MEMORY_RECALL_MAX_BYTES - 1);
+        assert!(!under.truncated);
+        assert_eq!(under.next_offset, None);
+
+        let (_exact_directory, exact_storage) = storage();
+        seed_to_bytes(&exact_storage, "exact", MEMORY_RECALL_MAX_BYTES);
+        let (exact, _) = exact_storage
+            .memory_archive_recall_page_from_snapshot("exact", 0, MEMORY_RECALL_MAX_ENTRIES, None)
+            .expect("recall at exact byte budget");
+        assert_eq!(exact.notes.len(), 4);
+        assert_eq!(page_bytes(&exact), MEMORY_RECALL_MAX_BYTES);
+        assert!(!exact.truncated);
+        assert_eq!(exact.next_offset, None);
+
+        let (_over_directory, over_storage) = storage();
+        seed_to_bytes(&over_storage, "over", MEMORY_RECALL_MAX_BYTES);
+        over_storage.memory_archive_set("over", "e", "x").unwrap();
+        let (over, over_hash) = over_storage
+            .memory_archive_recall_page_from_snapshot("over", 0, MEMORY_RECALL_MAX_ENTRIES, None)
+            .expect("recall over byte budget");
+        assert_eq!(over.notes.len(), 4);
+        assert_eq!(over.total, 5);
+        assert_eq!(page_bytes(&over), MEMORY_RECALL_MAX_BYTES);
+        assert!(over.truncated);
+        assert_eq!(over.next_offset, Some(4));
+
+        let (over_tail, _) = over_storage
+            .memory_archive_recall_page_from_snapshot(
+                "over",
+                over.next_offset.unwrap(),
+                MEMORY_RECALL_MAX_ENTRIES,
+                Some(&over_hash),
+            )
+            .expect("recall over-budget continuation");
+        assert_eq!(over_tail.notes.len(), 1);
+        assert_eq!(page_bytes(&over_tail), 2);
+        assert!(!over_tail.truncated);
+        assert_eq!(over_tail.next_offset, None);
     }
 
     #[test]
@@ -2394,21 +2548,25 @@ mod tests {
     }
 
     #[test]
-    fn memory_aggregate_quota_is_enforced_without_loading_existing_values() {
+    fn memory_aggregate_quota_is_enforced_atomically() {
         let (_directory, storage) = storage();
+        let existing_key = "legacy";
+        let existing_value = "v".repeat(MEMORY_MAX_TOTAL_BYTES - existing_key.len());
         storage
-            .with_write(|connection| {
-                connection.execute(
-                    "INSERT INTO memories(project_key,key,value,updated_at) VALUES('p','legacy',zeroblob(?1),'now')",
-                    [MEMORY_MAX_TOTAL_BYTES as i64],
-                )?;
-                Ok(())
-            })
-            .expect("seed aggregate");
+            .memory_set("p", existing_key, &existing_value)
+            .expect("seed exact aggregate limit");
         let error = storage
             .memory_set("p", "new", "value")
             .expect_err("aggregate limit");
         assert_eq!(error.code(), "RESOURCE_LIMIT_EXCEEDED");
+        assert!(error.message().contains("aggregate limit"));
+        assert_eq!(
+            storage
+                .memory_get("p", existing_key)
+                .expect("existing memory"),
+            Some(existing_value)
+        );
+        assert_eq!(storage.memory_get("p", "new").expect("new memory"), None);
     }
 
     #[test]

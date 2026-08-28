@@ -253,6 +253,7 @@ fn scan_open_file_layout(
     let mut current_line = 0usize;
     let mut target_start = (target_line == 0).then_some(0u64);
     let mut target_end = None;
+    let mut previous_byte = None;
     let mut buffer = vec![0_u8; SCAN_CHUNK];
     loop {
         let read = file.read(&mut buffer)?;
@@ -261,16 +262,22 @@ fn scan_open_file_layout(
         }
         for (index, byte) in buffer[..read].iter().enumerate() {
             if *byte != b'\n' {
+                previous_byte = Some(*byte);
                 continue;
             }
             let position = absolute + index as u64;
             if current_line == target_line {
-                target_end = Some(position);
+                target_end = Some(if previous_byte == Some(b'\r') {
+                    position.saturating_sub(1)
+                } else {
+                    position
+                });
             }
             current_line = current_line.saturating_add(1);
             if current_line == target_line {
                 target_start = Some(position + 1);
             }
+            previous_byte = Some(*byte);
         }
         absolute = absolute.saturating_add(read as u64);
         if absolute >= total_bytes {
@@ -351,7 +358,11 @@ where
                 ));
             }
         };
-        let lines = content.split('\n').collect::<Vec<_>>();
+        let mut lines = content.split('\n').collect::<Vec<_>>();
+        let terminated_lines = lines.len().saturating_sub(1);
+        for line in &mut lines[..terminated_lines] {
+            *line = line.strip_suffix('\r').unwrap_or(line);
+        }
         let mut window =
             render_file_window_at(&lines, line_offset, 0, requested_lines, byte_budget)?;
         if window.next_offset == Some(line_offset)
@@ -841,11 +852,49 @@ mod tests {
 
     #[test]
     fn crlf_file_content_windows_preserve_logical_lines() {
-        // read windows operate on logical lines; a CRLF file yields the same
-        // line sequence as its LF twin after transport normalization.
-        let lines = vec!["alpha", "beta"];
-        let window = render_file_window(&lines, 0, 0, 10, 128).unwrap();
-        assert!(!window.truncated);
-        assert_eq!(window.content, "1\talpha\n2\tbeta");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("windows.txt"), b"alpha\r\nbeta\r\ngamma").unwrap();
+        let resolver = crate::sandbox::SecurePathResolver;
+
+        let (bytes, total_lines, first) = read_file_window_with_after_scan_hook(
+            &resolver,
+            temp.path(),
+            "windows.txt",
+            0,
+            0,
+            2,
+            128,
+            || {},
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"alpha\r\nbeta\r\ngamma".len() as u64);
+        assert_eq!(total_lines, 3);
+        assert_eq!(first.content, "1\talpha\n2\tbeta");
+        assert!(!first.content.contains('\r'));
+        assert!(first.truncated);
+        assert_eq!(first.next_offset, Some(2));
+        assert_eq!(first.next_line_byte_offset, None);
+        assert_eq!(
+            first.continuation.as_deref(),
+            Some("Call read_file again with offset=2.")
+        );
+
+        let (_, _, second) = read_file_window_with_after_scan_hook(
+            &resolver,
+            temp.path(),
+            "windows.txt",
+            first.next_offset.unwrap(),
+            first.next_line_byte_offset.unwrap_or(0),
+            2,
+            128,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(second.content, "3\tgamma");
+        assert!(!second.content.contains('\r'));
+        assert!(!second.truncated);
+        assert_eq!(second.next_offset, None);
+        assert_eq!(second.continuation, None);
     }
 }

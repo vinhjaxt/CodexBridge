@@ -11,9 +11,14 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -97,6 +102,36 @@ fn tool_contract_hash(router: &ToolRouter<AgentHandler>) -> String {
 fn server_contract_version(router: &ToolRouter<AgentHandler>) -> String {
     let hash = tool_contract_hash(router);
     format!("{}+contract.{}", env!("CARGO_PKG_VERSION"), &hash[..12])
+}
+
+const SERVER_ABOUT_RESOURCE_URI: &str = "codexbridge://about";
+const SERVER_ABOUT_RESOURCE_MIME_TYPE: &str = "text/plain";
+const SERVER_ABOUT_RESOURCE_TEXT: &str = "CodexBridge MCP server.";
+
+fn server_about_resource() -> Resource {
+    Resource::new(SERVER_ABOUT_RESOURCE_URI, "codexbridge-about")
+        .with_title("CodexBridge information")
+        .with_description("Identifies this MCP server and its purpose.")
+        .with_mime_type(SERVER_ABOUT_RESOURCE_MIME_TYPE)
+        .with_size(SERVER_ABOUT_RESOURCE_TEXT.len() as u64)
+}
+
+fn server_resources() -> ListResourcesResult {
+    ListResourcesResult::with_all_items(vec![server_about_resource()])
+}
+
+fn read_server_resource(uri: &str) -> std::result::Result<ReadResourceResult, ErrorData> {
+    if uri != SERVER_ABOUT_RESOURCE_URI {
+        return Err(ErrorData::resource_not_found(
+            "resource_not_found",
+            Some(json!({ "uri": uri })),
+        ));
+    }
+
+    Ok(ReadResourceResult::new(vec![
+        ResourceContents::text(SERVER_ABOUT_RESOURCE_TEXT, SERVER_ABOUT_RESOURCE_URI)
+            .with_mime_type(SERVER_ABOUT_RESOURCE_MIME_TYPE),
+    ]))
 }
 
 const INSTRUCTION_SCOPE_CACHE_MAX_ENTRIES: usize = 4096;
@@ -915,7 +950,12 @@ impl AgentHandler {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AgentHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
             .with_server_info(Implementation::new(
                 "CodexBridge",
                 server_contract_version(&self.tool_router),
@@ -924,6 +964,22 @@ impl ServerHandler for AgentHandler {
                 &self.shared.config,
                 &self.shared.upstream,
             ))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourcesResult, ErrorData> {
+        Ok(server_resources())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResponse, ErrorData> {
+        read_server_resource(&request.uri).map(Into::into)
     }
 }
 
@@ -1031,6 +1087,81 @@ pub(crate) fn capability_patch_transaction(
 mod tests {
     use super::*;
     use crate::tools::registry::PUBLIC_TOOL_NAMES;
+
+    #[tokio::test]
+    async fn regression_mcp_resource_catalog_is_listable_and_readable() {
+        use std::collections::BTreeMap;
+
+        use rmcp::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = Arc::new(
+            crate::config::ConfigBuilder::from_map(BTreeMap::from([
+                ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+                ("WORKSPACE_ROOT".to_owned(), workspace.display().to_string()),
+            ]))
+            .build()
+            .unwrap(),
+        );
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage.clone()).unwrap();
+        let audit = AuditLogger::new(config.logs.clone(), config.auth_token.clone())
+            .await
+            .unwrap();
+        let shared = SharedState::new(
+            config,
+            resolver,
+            storage,
+            audit,
+            crate::upstream::Aggregator::default(),
+        );
+        let handler = AgentHandler::new(shared);
+
+        assert!(handler.get_info().capabilities.resources.is_some());
+
+        let (server_transport, client_transport) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let server = handler.serve(server_transport).await.unwrap();
+            server.waiting().await.unwrap();
+        });
+        let client = ().serve(client_transport).await.unwrap();
+
+        let resources = client.list_all_resources().await.unwrap();
+        assert_eq!(resources.len(), 1);
+        let resource = &resources[0];
+        assert_eq!(resource.uri, SERVER_ABOUT_RESOURCE_URI);
+        assert_eq!(
+            resource.mime_type.as_deref(),
+            Some(SERVER_ABOUT_RESOURCE_MIME_TYPE)
+        );
+
+        let about = client
+            .read_resource(ReadResourceRequestParams::new(SERVER_ABOUT_RESOURCE_URI))
+            .await
+            .unwrap();
+        assert_eq!(about.contents.len(), 1);
+        match &about.contents[0] {
+            ResourceContents::TextResourceContents {
+                uri,
+                mime_type,
+                text,
+                ..
+            } => {
+                assert_eq!(uri, SERVER_ABOUT_RESOURCE_URI);
+                assert_eq!(
+                    mime_type.as_deref(),
+                    Some(SERVER_ABOUT_RESOURCE_MIME_TYPE)
+                );
+                assert_eq!(text, SERVER_ABOUT_RESOURCE_TEXT);
+            }
+            other => panic!("expected text resource contents, got {other:?}"),
+        }
+
+        client.cancel().await.unwrap();
+        server_task.await.unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2172,14 +2303,30 @@ mod tests {
 
     #[test]
     fn project_permit_registry_evicts_only_idle_entries_at_capacity() {
-        let registry = ProjectPermitRegistry::new(2, 3);
-        for index in 0..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
-            registry.get(&format!("project-{index}")).unwrap();
+        let registry = ProjectPermitRegistry::new(1, 1);
+        let active = registry.get("active").unwrap();
+        let held = active.0.clone().try_acquire_owned().unwrap();
+        let idle_projects = (1..PROJECT_PERMIT_CACHE_MAX_ENTRIES)
+            .map(|index| format!("idle-{index}"))
+            .collect::<Vec<_>>();
+        for project in &idle_projects {
+            registry.get(project).unwrap();
         }
         assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+
         registry.get("replacement").unwrap();
+
+        assert!(registry.entries.contains_key("active"));
+        assert_eq!(
+            idle_projects
+                .iter()
+                .filter(|project| registry.entries.contains_key(project.as_str()))
+                .count(),
+            idle_projects.len() - 1
+        );
         assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
         assert!(registry.entries.contains_key("replacement"));
+        drop(held);
     }
 
     #[test]

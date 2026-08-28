@@ -733,6 +733,30 @@ pub async fn connect_upstreams(config: &Config) -> ConnectedUpstreams {
 mod tests {
     use super::*;
 
+    fn windows_stdio_path_matches_contract(
+        actual: &std::ffi::OsStr,
+        inherited_path: Option<std::ffi::OsString>,
+        system_root: Option<std::ffi::OsString>,
+    ) -> bool {
+        if actual.is_empty() {
+            return false;
+        }
+        let system_root = system_root
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        let expected = inherited_path
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                std::ffi::OsString::from(format!(
+                    r"{}\System32;{};{}\System32\WindowsPowerShell\v1.0",
+                    system_root.to_string_lossy(),
+                    system_root.to_string_lossy(),
+                    system_root.to_string_lossy()
+                ))
+            });
+        actual == expected
+    }
+
     #[test]
     fn upstream_names_are_function_call_safe_and_unique() {
         assert_eq!(sanitize("ida-sql!"), "ida_sql_");
@@ -769,22 +793,31 @@ mod tests {
         assert_eq!(schema.get("additionalProperties"), Some(&Value::Bool(true)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn upstream_capacity_wait_is_bounded() {
+        let configured_wait = Duration::from_secs(1);
+        let watchdog = Duration::from_secs(5);
         let capacity = Arc::new(Semaphore::new(1));
-        let held = acquire_upstream_capacity(capacity.clone(), Duration::from_millis(10))
+        let held = acquire_upstream_capacity(capacity.clone(), configured_wait)
             .await
             .unwrap();
-        let error = acquire_upstream_capacity(capacity.clone(), Duration::from_millis(5))
-            .await
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            watchdog,
+            acquire_upstream_capacity(capacity.clone(), configured_wait),
+        )
+        .await
+        .expect("capacity acquisition must honor its configured wait")
+        .unwrap_err();
         assert_eq!(error.code(), "SERVER_BUSY");
         drop(held);
-        assert!(
-            acquire_upstream_capacity(capacity, Duration::from_millis(10))
-                .await
-                .is_ok()
-        );
+        let reacquired = tokio::time::timeout(
+            watchdog,
+            acquire_upstream_capacity(capacity, configured_wait),
+        )
+        .await
+        .expect("capacity acquisition must complete after the permit is released")
+        .unwrap();
+        drop(reacquired);
     }
 
     #[test]
@@ -855,12 +888,21 @@ mod tests {
             .get_envs()
             .find(|(key, _)| key.eq_ignore_ascii_case(OsStr::new("PATH")))
             .and_then(|(_, value)| value)
-            .expect("PATH baseline")
-            .to_string_lossy();
-        if cfg!(windows) {
-            assert_ne!(path, "/usr/local/bin:/usr/bin:/bin");
-        } else {
-            assert_eq!(path, "/usr/local/bin:/usr/bin:/bin");
+            .expect("PATH baseline");
+        #[cfg(windows)]
+        {
+            assert!(
+                windows_stdio_path_matches_contract(
+                    path,
+                    std::env::var_os("PATH"),
+                    std::env::var_os("SystemRoot")
+                ),
+                "Windows PATH baseline must match the native inherited/fallback contract: {path:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(path, OsStr::new("/usr/local/bin:/usr/bin:/bin"));
         }
 
         let mut overridden = spec;
@@ -891,6 +933,48 @@ mod tests {
             env.get("CODEXBRIDGE_TEST_ENV").and_then(Option::as_deref),
             Some("present")
         );
+    }
+
+    #[test]
+    fn windows_stdio_path_contract_rejects_empty_and_corrupt_baselines() {
+        use std::ffi::{OsStr, OsString};
+
+        let inherited = OsString::from(r"D:\tools;D:\Windows\System32");
+        let system_root = OsString::from(r"D:\Windows");
+        assert!(windows_stdio_path_matches_contract(
+            &inherited,
+            Some(inherited.clone()),
+            Some(system_root.clone())
+        ));
+        assert!(!windows_stdio_path_matches_contract(
+            OsStr::new(""),
+            Some(inherited.clone()),
+            Some(system_root.clone())
+        ));
+        assert!(!windows_stdio_path_matches_contract(
+            OsStr::new("corrupt-path"),
+            Some(inherited),
+            Some(system_root.clone())
+        ));
+
+        let fallback = OsString::from(
+            r"D:\Windows\System32;D:\Windows;D:\Windows\System32\WindowsPowerShell\v1.0",
+        );
+        assert!(windows_stdio_path_matches_contract(
+            &fallback,
+            None,
+            Some(system_root.clone())
+        ));
+        assert!(!windows_stdio_path_matches_contract(
+            OsStr::new(""),
+            None,
+            Some(system_root.clone())
+        ));
+        assert!(!windows_stdio_path_matches_contract(
+            OsStr::new(r"D:\Windows\System32"),
+            None,
+            Some(system_root)
+        ));
     }
 
     #[tokio::test]
