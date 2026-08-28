@@ -23,14 +23,96 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
 use crate::{
     audit::AuditLogger,
-    config::{AuthMode, Config},
+    config::{AuthMode, BindAddress, Config},
     error::{AppError, Result},
     project::ProjectResolver,
     storage::Storage,
     tools::{AgentHandler, SharedState},
 };
+
+enum BoundListener {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+async fn bind_listener(config: &Config) -> Result<BoundListener> {
+    match &config.bind {
+        BindAddress::Tcp(address) => tokio::net::TcpListener::bind(address)
+            .await
+            .map(BoundListener::Tcp)
+            .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string())),
+        BindAddress::Unix(path) => {
+            #[cfg(unix)]
+            {
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_socket() => {
+                        std::fs::remove_file(path).map_err(|error| {
+                            AppError::new(
+                                "PROCESS_FAILED",
+                                format!(
+                                    "cannot remove existing Unix socket {}: {error}",
+                                    path.display()
+                                ),
+                            )
+                        })?;
+                    }
+                    Ok(_) => {
+                        return Err(AppError::new(
+                            "PROCESS_FAILED",
+                            format!(
+                                "Unix socket path {} already exists and is not a socket",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::new(
+                            "PROCESS_FAILED",
+                            format!("cannot inspect Unix socket {}: {error}", path.display()),
+                        ));
+                    }
+                }
+
+                let listener = tokio::net::UnixListener::bind(path).map_err(|error| {
+                    AppError::new(
+                        "PROCESS_FAILED",
+                        format!("cannot bind Unix socket {}: {error}", path.display()),
+                    )
+                })?;
+                if let Err(error) = std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(config.unix_socket_mode),
+                ) {
+                    drop(listener);
+                    let _ = std::fs::remove_file(path);
+                    return Err(AppError::new(
+                        "PROCESS_FAILED",
+                        format!(
+                            "cannot chmod Unix socket {} to {:04o}: {error}",
+                            path.display(),
+                            config.unix_socket_mode
+                        ),
+                    ));
+                }
+                Ok(BoundListener::Unix(listener))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err(AppError::config(
+                    "Unix socket MCP_BIND values are not supported on this platform",
+                ))
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct HttpState {
@@ -353,9 +435,7 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/health", get(health))
         .with_state(http_state)
         .merge(protected);
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
+    let listener = bind_listener(&config).await?;
     let sandbox_backend = crate::sandbox::effective_default_sandbox_backend(&config);
     let auth_token_file = config.workspace_root.join(".metadata/auth-token");
     tracing::info!(
@@ -405,9 +485,19 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }))
     };
-    let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let serve = match listener {
+        BoundListener::Tcp(listener) => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+        }
+        #[cfg(unix)]
+        BoundListener::Unix(listener) => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+        }
+    };
     audit.emit(json!({"event":"server_stopping","active_requests":active_requests.load(Ordering::Relaxed),"active_processes":shared.active_processes(),"active_legacy_mcp_sessions":session_manager.sessions.read().await.len()}));
     cancellation.cancel();
     shared.interactive.shutdown();
@@ -446,6 +536,69 @@ pub async fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use crate::config::ConfigBuilder;
+    #[cfg(unix)]
+    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_replaces_stale_socket_and_applies_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("codexbridge.sock");
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_BIND".to_owned(), socket_path.display().to_string()),
+            ("MCP_UNIX_SOCKET_MODE".to_owned(), "0750".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+
+        let first = bind_listener(&config).await.unwrap();
+        assert!(matches!(first, BoundListener::Unix(_)));
+        assert_eq!(
+            std::fs::metadata(&socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        drop(first);
+
+        let second = bind_listener(&config).await.unwrap();
+        assert!(matches!(second, BoundListener::Unix(_)));
+        assert_eq!(
+            std::fs::metadata(&socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_preserves_existing_non_socket_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("codexbridge.sock");
+        std::fs::write(&socket_path, b"do not delete").unwrap();
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_BIND".to_owned(), socket_path.display().to_string()),
+        ]))
+        .build()
+        .unwrap();
+
+        let error = match bind_listener(&config).await {
+            Ok(_) => panic!("regular file must not be replaced by a Unix socket"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("is not a socket"));
+        assert_eq!(std::fs::read(&socket_path).unwrap(), b"do not delete");
+    }
 
     #[test]
     fn session_activity_touch_tracks_last_activity_not_creation_age() {

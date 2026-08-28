@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env,
+    env, fmt,
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
@@ -67,7 +67,8 @@ pub struct LogConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub config_source: String,
-    pub bind: SocketAddr,
+    pub bind: BindAddress,
+    pub unix_socket_mode: u32,
     pub auth_token: String,
     pub auth_mode: AuthMode,
     pub workspace_root: PathBuf,
@@ -93,6 +94,21 @@ pub struct Config {
     pub max_gateway_skill_bytes: usize,
     /// Optional project-local instruction filenames checked after AGENTS.md.
     pub project_doc_fallbacks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindAddress {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+impl fmt::Display for BindAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(address) => address.fmt(formatter),
+            Self::Unix(path) => path.display().fmt(formatter),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +361,19 @@ fn load_or_create_auth_token(workspace_root: &Path) -> Result<String> {
     }
 }
 
+fn parse_unix_socket_mode(value: &str) -> Result<u32> {
+    let digits = value.strip_prefix("0o").unwrap_or(value);
+    let mode = u32::from_str_radix(digits, 8).map_err(|_| {
+        AppError::config("MCP_UNIX_SOCKET_MODE must be an octal mode between 0000 and 0777")
+    })?;
+    if mode > 0o777 {
+        return Err(AppError::config(
+            "MCP_UNIX_SOCKET_MODE must be an octal mode between 0000 and 0777",
+        ));
+    }
+    Ok(mode)
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigBuilder {
     environment: BTreeMap<String, String>,
@@ -430,10 +459,17 @@ impl ConfigBuilder {
             ));
         }
 
-        let bind = self
-            .value("MCP_BIND", "0.0.0.0:3000")
-            .parse()
-            .map_err(|_| AppError::config("MCP_BIND must be a valid socket address"))?;
+        let bind_value = self.value("MCP_BIND", "0.0.0.0:3000");
+        let bind = if bind_value.contains('/') {
+            BindAddress::Unix(PathBuf::from(bind_value))
+        } else {
+            BindAddress::Tcp(
+                bind_value
+                    .parse()
+                    .map_err(|_| AppError::config("MCP_BIND must be a valid socket address"))?,
+            )
+        };
+        let unix_socket_mode = parse_unix_socket_mode(&self.value("MCP_UNIX_SOCKET_MODE", "0777"))?;
         let cpu_default = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(2)
@@ -481,6 +517,7 @@ impl ConfigBuilder {
         let config = Config {
             config_source: "builtins+environment+cli".to_owned(),
             bind,
+            unix_socket_mode,
             auth_token,
             auth_mode,
             logs: LogConfig {
@@ -725,6 +762,50 @@ mod tests {
         assert_eq!(config.bind.to_string(), "127.0.0.1:3103");
         assert_eq!(config.output.file_bytes, 65536);
         assert_eq!(config.output.results, 500);
+    }
+
+    #[test]
+    fn slash_bind_value_selects_unix_socket() {
+        let environment = BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_BIND".to_owned(), "/tmp/codexbridge.sock".to_owned()),
+        ]);
+        let config = ConfigBuilder::from_map(environment).build().unwrap();
+        assert_eq!(
+            config.bind,
+            BindAddress::Unix(PathBuf::from("/tmp/codexbridge.sock"))
+        );
+        assert_eq!(config.bind.to_string(), "/tmp/codexbridge.sock");
+        assert_eq!(config.unix_socket_mode, 0o777);
+    }
+
+    #[test]
+    fn unix_socket_mode_is_configured_as_octal() {
+        let environment = BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_UNIX_SOCKET_MODE".to_owned(), "0750".to_owned()),
+        ]);
+        let config = ConfigBuilder::from_map(environment).build().unwrap();
+        assert_eq!(config.unix_socket_mode, 0o750);
+
+        for value in ["0899", "1000", "invalid"] {
+            let environment = BTreeMap::from([
+                ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+                ("MCP_UNIX_SOCKET_MODE".to_owned(), value.to_owned()),
+            ]);
+            let error = ConfigBuilder::from_map(environment).build().unwrap_err();
+            assert!(error.message().contains("MCP_UNIX_SOCKET_MODE"), "{value}");
+        }
+    }
+
+    #[test]
+    fn invalid_non_path_bind_value_is_still_rejected() {
+        let environment = BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_BIND".to_owned(), "not-a-socket-address".to_owned()),
+        ]);
+        let error = ConfigBuilder::from_map(environment).build().unwrap_err();
+        assert!(error.message().contains("MCP_BIND"));
     }
 
     #[test]

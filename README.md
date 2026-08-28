@@ -271,7 +271,8 @@ No general application config file is read. For normal use, none of these are re
 | Variable | Default | Purpose |
 |---|---:|---|
 | `WORKSPACE_ROOT` | `/workspace` | Workspace root when no positional argument is given |
-| `MCP_BIND` | `0.0.0.0:3000` | Listener address |
+| `MCP_BIND` | `0.0.0.0:3000` | TCP listener address; values containing `/` bind a Unix socket path instead |
+| `MCP_UNIX_SOCKET_MODE` | `0777` | Octal permission mode applied to a Unix socket after bind |
 | `MCP_AUTH_TOKEN` | generated/persisted | Override the generated token |
 | `MCP_AUTH_MODE` | `path` | `path`, `bearer`, or `either` |
 | `MCP_EXEC_SANDBOX` | `auto` | `auto`, `bwrap`, or `none` |
@@ -350,6 +351,44 @@ An operator may still expose a Podman service socket explicitly with `MCP_CONTAI
 `/health` is intentionally unauthenticated and reports `status`, active HTTP requests, and active legacy MCP sessions. Detailed JSONL audit logs are written under `<workspace>/.metadata/logs` by default using bounded event/byte queues, rotation, and parameter/result excerpts. Normal tool data such as paths, patch/content text, commands, stdout/stderr, brief/state excerpts, and search/read results is retained up to the configured console/file byte budgets so the audit trail remains useful for debugging. MCP authentication tokens are replaced wherever they occur, and credential-shaped fields such as authorization/password/token/API-key values are redacted recursively. Set `STATUS_INTERVAL_SECS` above zero to emit periodic daemon-status audit events with request/process/session/tool/cache/log-queue counters.
 
 SIGTERM/SIGINT triggers graceful HTTP shutdown, process cleanup, legacy-session cleanup, audit flush, and interactive subprocess termination.
+
+## Troubleshooting OpenAI MCP `ExceptionGroup` / temporarily unavailable plugin
+
+An OpenAI/ChatGPT MCP connector may occasionally surface a generic error such as:
+
+```text
+ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+```
+
+or later report the MCP plugin/server as unavailable or return an upstream `502`. That message is not specific enough to identify a CodexBridge tool failure by itself. Production investigation of this repository found two distinct classes of integration issue that can present through the same generic client-side failure surface.
+
+First, MCP resource discovery must be valid. [OpenAI MCP integration reports](https://community.openai.com/t/mcp-integration-unhandled-errors-in-a-taskgroup-1-sub-exception/1362182/11) have shown failures when a server advertises an incomplete integration surface. CodexBridge therefore advertises the MCP `resources` capability and exposes one static, readable resource at `codexbridge://about`; `resources/list` and `resources/read` must remain mutually consistent. This is a compatibility workaround for resource discovery and is separate from transport outages.
+
+Second, and more importantly for intermittent failures during long-running commands, an upstream transport disconnect can cancel an otherwise healthy MCP request. The observed failure chain was:
+
+```text
+Cloudflare tunnel loses edge connectivity
+  -> in-flight MCP HTTP stream is cancelled
+  -> rmcp cannot deliver the pending tool response
+  -> the OpenAI/client transport surfaces ExceptionGroup or 502
+  -> subsequent plugin calls may be unavailable until transport recovery/reconnect
+```
+
+In the confirmed incidents, CodexBridge continued executing the tool and recorded a successful `tool_result`, while the corresponding HTTP request either never recorded `mcp_request_finished` or later calls never reached the CodexBridge daemon at all. Cloudflared simultaneously logged messages such as `Lost connection with the edge`, `connection with edge closed`, `Incoming request ended abruptly: context canceled`, and `Failed to proxy HTTP`. With QUIC, this was observed as `no recent network activity`; after switching the tunnel to HTTP/2, the same workload survived substantially longer but a later loss of all four edge connections still produced upstream `502` failures. HTTP/2 therefore improved observed stability in that deployment but did not prove that the underlying edge/connectivity failure was fixed.
+
+Long-running `exec_command` / `write_stdin` workflows are more likely to expose this failure, but investigation did **not** find that those tools cause the tunnel to drop. Short metadata/state calls commonly finish in a few milliseconds, while process calls may hold an HTTP request for one to five seconds and repeat that pattern for minutes. A random tunnel outage is therefore much more likely to overlap an active process poll. Counterexamples confirmed that Cloudflare edge connections could drop while there were zero MCP requests/tool calls, and controlled tests did not reproduce tunnel loss from Podman network churn, Cargo HTTPS downloads, offline Rust compilation, CPU/disk load, `write_stdin` polling, or CodexBridge's Podman timeout cleanup alone.
+
+When diagnosing this error, distinguish subprocess lifecycle from MCP transport lifecycle:
+
+- `completion_reason=timed_out` and `process_deadline_exceeded=true` describe the spawned process, not the HTTP/MCP request. A normal process timeout is valid tool data and should not be treated as proof of connector failure.
+- `serve finished quit_reason=Closed` after a stateless MCP request is normal for modern MCP protocol versions and is not evidence of a broken session.
+- An rmcp `task cancelled` line alone is also insufficient; cancellation can occur during normal stateless response cleanup. The stronger failure fingerprint is `channel closed` / `context canceled` together with a missing `mcp_request_finished`, or repeated connector `502` responses that never appear in CodexBridge's request audit.
+- If CodexBridge records `tool_result` success but the caller receives `ExceptionGroup`, inspect the reverse proxy/tunnel/client transport before changing the process implementation.
+- If even a trivial tool call fails immediately after the incident and no new request appears in CodexBridge logs, the plugin/connector path is unavailable upstream of CodexBridge. Wait for tunnel reconnection or reconnect/re-enable the MCP integration; if the deployment does not recover cleanly, restart the affected tunnel/connector stack according to the operator's deployment policy.
+
+For Cloudflare Tunnel deployments, correlate CodexBridge JSONL request timestamps with `cloudflared` logs rather than inferring causality from the tool that happened to be active. In the investigated deployment, a 600-second Cargo process deadline overlapped the tail of one HTTP/2 outage, but two edge connections had already been lost 7-10 seconds before CodexBridge began Podman cleanup, excluding cleanup as the initiating cause. Workspace WebSocket heartbeats and host interface counters remained healthy during that event, narrowing the fault domain to the cloudflared-to-Cloudflare-edge path rather than a complete host-network outage.
+
+Operationally, keep process polling bounded and repeat `write_stdin` instead of holding a single request for an unnecessarily long period. This reduces the time any individual HTTP request is exposed to a transient transport interruption, but it is resilience hardening rather than a fix for tunnel connectivity. Also monitor tunnel redundancy and resource limits independently; a near-limit cloudflared cgroup is worth correcting, but in the investigated incident there was no OOM, CPU throttling, meaningful memory-pressure stall, or host-interface packet-error evidence tying resource pressure to the edge disconnect.
 
 ## Verification
 
