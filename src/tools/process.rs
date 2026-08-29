@@ -2011,6 +2011,16 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_one_shot_exec_args(
+        command: impl Into<String>,
+        shell: Option<&str>,
+    ) -> ExecCommandArgs {
+        let mut args = windows_exec_args(command, shell);
+        args.close_stdin = true;
+        args
+    }
+
+    #[cfg(windows)]
     async fn windows_start_exec(
         config: &crate::config::Config,
         project: &ProjectContext,
@@ -2023,6 +2033,15 @@ mod tests {
             .start(config, project, args, global_permit, project_permit)
             .await
             .unwrap();
+        // `ProcessRegistry::start` only owns process creation. The public
+        // `exec_command` handler applies one-shot stdin/EOF options after start,
+        // so mirror that part of the production path in this test helper.
+        if let Some(stdin) = effective_exec_stdin(args).unwrap() {
+            session.write_input(stdin.into_bytes()).await.unwrap();
+        }
+        if effective_exec_close_stdin(args).unwrap() {
+            session.close_input().await;
+        }
         (registry, session)
     }
 
@@ -2062,14 +2081,14 @@ mod tests {
     fn write_windows_probe_cmd(project_dir: &tempfile::TempDir) {
         std::fs::write(
             project_dir.path().join("hidden-probe.cmd"),
-            "@echo off\r\n\"%CODEXBRIDGE_HIDDEN_PROBE_EXE%\" --exact tools::process::tests::windows_hidden_powershell_cmd_shim_console_probe_child --ignored --nocapture\r\nexit /b %ERRORLEVEL%\r\n",
+            "@echo off\r\n\"%CODEXBRIDGE_HIDDEN_PROBE_EXE%\" --exact tools::process::tests::windows_hidden_powershell_cmd_shim_console_probe_child --ignored --nocapture --test-threads=1\r\nset \"CODEXBRIDGE_HIDDEN_PROBE_EXIT=%ERRORLEVEL%\"\r\necho codexbridge-hidden-cmd-shim-child-exit=%CODEXBRIDGE_HIDDEN_PROBE_EXIT%\r\nexit /b %CODEXBRIDGE_HIDDEN_PROBE_EXIT%\r\n",
         )
         .unwrap();
     }
 
     #[cfg(windows)]
     fn windows_hidden_cmd_shim_probe_args() -> ExecCommandArgs {
-        let mut args = windows_exec_args("& .\\hidden-probe.cmd", None);
+        let mut args = windows_one_shot_exec_args("& .\\hidden-probe.cmd", None);
         args.env.insert(
             "CODEXBRIDGE_HIDDEN_PROBE_EXE".to_owned(),
             std::env::current_exe()
@@ -2087,8 +2106,30 @@ mod tests {
     #[cfg(windows)]
     fn assert_windows_exit_success(session: &Arc<InteractiveSession>) {
         let completion = session.completion().expect("hidden process completion");
-        assert_eq!(completion.reason, CompletionReason::Exited);
-        assert_eq!(completion.exit_code, Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert_eq!(
+            completion.reason,
+            CompletionReason::Exited,
+            "completion={completion:?}; output={output:?}"
+        );
+        assert_eq!(
+            completion.exit_code,
+            Some(0),
+            "completion={completion:?}; output={output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_hidden_probe_child_exit(output: &str) -> i32 {
+        output
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("codexbridge-hidden-cmd-shim-child-exit=")
+            })
+            .expect("generated .cmd must report the child harness exit status")
+            .parse()
+            .expect("reported child harness exit status must be numeric")
     }
 
     #[cfg(windows)]
@@ -2208,7 +2249,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let mut args = windows_exec_args(
+        let mut args = windows_one_shot_exec_args(
             "& $env:CODEXBRIDGE_NATIVE_EXIT_PROBE_EXE --exact tools::process::tests::windows_native_exit_probe_child --ignored --nocapture",
             None,
         );
@@ -2233,11 +2274,65 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn windows_default_powershell_uses_final_success_after_native_failure() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let mut args = windows_one_shot_exec_args(
+            "& $env:CODEXBRIDGE_NATIVE_EXIT_PROBE_EXE --exact tools::process::tests::windows_native_exit_probe_child --ignored --nocapture; Write-Output 'codexbridge-after-native-failure'",
+            None,
+        );
+        args.env.insert(
+            "CODEXBRIDGE_NATIVE_EXIT_PROBE_EXE".to_owned(),
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.env.insert(
+            "CODEXBRIDGE_NATIVE_EXIT_PROBE_CHILD".to_owned(),
+            "1".to_owned(),
+        );
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("native exit probe completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(0));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert!(
+            output.contains("codexbridge-after-native-failure"),
+            "{output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_default_powershell_preserves_powershell_command_failure() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let args = windows_one_shot_exec_args("Write-Error 'codexbridge-powershell-failure'", None);
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("PowerShell failure completion");
+        assert_eq!(completion.reason, CompletionReason::Exited);
+        assert_eq!(completion.exit_code, Some(1));
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert!(
+            output.contains("codexbridge-powershell-failure"),
+            "{output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn windows_non_tty_exec_explicit_cmd_keeps_stdout_and_stderr_pipes() {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_exec_args(
+        let args = windows_one_shot_exec_args(
             "echo codexbridge-hidden-stdout & echo codexbridge-hidden-stderr 1>&2",
             Some("cmd"),
         );
@@ -2253,7 +2348,7 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
-        let args = windows_exec_args(
+        let args = windows_one_shot_exec_args(
             "Write-Output 'codexbridge-hidden-stdout'; [Console]::Error.WriteLine('codexbridge-hidden-stderr')",
             None,
         );
@@ -2275,6 +2370,12 @@ mod tests {
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
         assert_windows_exit_success(&session);
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert!(
+            output.contains("codexbridge-hidden-cmd-shim-probe force-console-window=0"),
+            "normal child harness did not run with the expected environment: {output:?}"
+        );
+        assert_eq!(windows_hidden_probe_child_exit(&output), 0, "{output:?}");
     }
 
     #[cfg(windows)]
@@ -2290,9 +2391,14 @@ mod tests {
         use windows_sys::Win32::System::Console::GetConsoleWindow;
 
         let window = unsafe { GetConsoleWindow() };
-        let console_window_detected =
-            std::env::var_os("CODEXBRIDGE_HIDDEN_CMD_SHIM_FORCE_CONSOLE_WINDOW").is_some()
-                || !window.is_null();
+        let force_console_window =
+            std::env::var_os("CODEXBRIDGE_HIDDEN_CMD_SHIM_FORCE_CONSOLE_WINDOW").is_some();
+        println!(
+            "codexbridge-hidden-cmd-shim-probe force-console-window={} console-window={}",
+            u8::from(force_console_window),
+            u8::from(!window.is_null())
+        );
+        let console_window_detected = force_console_window || !window.is_null();
         assert!(
             !console_window_detected,
             "PowerShell .cmd shim inherited or created a console window"
@@ -2314,12 +2420,20 @@ mod tests {
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
-        let parent_accepts_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_windows_exit_success(&session);
-        }));
+        let completion = session.completion().expect("hidden process completion");
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert_eq!(completion.reason, CompletionReason::Exited, "{output:?}");
         assert!(
-            parent_accepts_failure.is_err(),
-            "parent must reject a console-probe child failure"
+            output.contains("codexbridge-hidden-cmd-shim-probe force-console-window=1"),
+            "forced child harness did not observe the force-failure environment: {output:?}"
+        );
+        assert!(
+            windows_hidden_probe_child_exit(&output) != 0,
+            "forced child harness unexpectedly succeeded: {output:?}"
+        );
+        assert!(
+            completion.exit_code.is_some_and(|code| code != 0),
+            "parent must propagate a nonzero console-probe child failure; completion={completion:?}; output={output:?}"
         );
     }
 
@@ -2360,12 +2474,32 @@ mod tests {
         let (args, pid_file) = windows_tree_probe_args(&project_dir);
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        let root_pid = session.pid.expect("hidden cmd parent PID");
         let descendant_pid = windows_wait_for_probe_pid(&pid_file).await;
-        assert!(windows_process_is_running(descendant_pid));
+        assert_ne!(
+            root_pid, descendant_pid,
+            "probe child reused the cmd parent PID"
+        );
+        assert!(
+            windows_process_is_running(root_pid),
+            "hidden cmd parent exited before Terminate"
+        );
+        assert!(
+            windows_process_is_running(descendant_pid),
+            "probe descendant exited before Terminate"
+        );
 
         session.signal(ProcessSignal::Terminate).await.unwrap();
         windows_wait_for_session(&session).await;
         assert!(session.is_finished());
+        assert!(
+            matches!(
+                *session.requested_signal.lock().unwrap(),
+                Some(ProcessSignal::Terminate)
+            ),
+            "session did not record the completed Terminate request"
+        );
+        windows_assert_process_exited(root_pid).await;
         windows_assert_process_exited(descendant_pid).await;
     }
 
@@ -2379,12 +2513,30 @@ mod tests {
         args.timeout_ms = Some(5_000);
 
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        let root_pid = session.pid.expect("hidden cmd parent PID");
         let descendant_pid = windows_wait_for_probe_pid(&pid_file).await;
-        assert!(windows_process_is_running(descendant_pid));
+        assert_ne!(
+            root_pid, descendant_pid,
+            "probe child reused the cmd parent PID"
+        );
+        assert!(
+            !session.process_deadline_exceeded.load(Ordering::Relaxed),
+            "probe child did not publish its PID before the process deadline"
+        );
+        assert!(
+            windows_process_is_running(root_pid),
+            "hidden cmd parent exited before its timeout"
+        );
+        assert!(
+            windows_process_is_running(descendant_pid),
+            "probe descendant exited before its timeout"
+        );
         windows_wait_for_session(&session).await;
+        assert!(session.is_finished());
         let completion = session.completion().expect("timed out hidden completion");
         assert_eq!(completion.reason, CompletionReason::TimedOut);
         assert!(session.process_deadline_exceeded.load(Ordering::Relaxed));
+        windows_assert_process_exited(root_pid).await;
         windows_assert_process_exited(descendant_pid).await;
     }
 
@@ -3203,6 +3355,32 @@ mod tests {
         })
         .await
         .expect("Podman user-cidfile probe container was never created before its deadline");
+        let user_cid_inspect =
+            podman_test_output(&config, &["inspect", "--format", "{{.Id}}", &user_cid_name]).await;
+        assert!(user_cid_inspect.status.success(), "{user_cid_inspect:?}");
+        let user_cid_container_id = String::from_utf8_lossy(&user_cid_inspect.stdout)
+            .trim()
+            .to_owned();
+        assert!(user_cid.exists(), "Podman did not honor the user cidfile");
+        assert_eq!(
+            std::fs::read_to_string(&user_cid).unwrap().trim(),
+            user_cid_container_id,
+            "user-provided cidfile did not identify the created container"
+        );
+        let bridge_track_dir = user_cid_session
+            .podman_tracker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("user-cidfile Podman session must retain its execution tracker while running")
+            .host_dir
+            .clone();
+        assert!(
+            podman_container_ids_from_cidfiles(&bridge_track_dir)
+                .unwrap()
+                .is_empty(),
+            "Bridge injected its own cidfile despite the user-provided --cidfile"
+        );
         tokio::time::timeout(Duration::from_secs(10), async {
             while !user_cid_session.is_finished() {
                 user_cid_session.changed.notified().await;
@@ -3214,7 +3392,6 @@ mod tests {
             user_cid_session.completion().unwrap().reason,
             CompletionReason::TimedOut
         );
-        assert!(user_cid.exists(), "Podman did not honor the user cidfile");
         assert!(
             podman_container_ids(&config, &user_cid_name)
                 .await

@@ -795,6 +795,26 @@ fn shell_command(
     Ok((shell, args, command_text))
 }
 
+fn append_shell_command_text(command: &mut Command, kind: ShellKind, command_text: &str) {
+    #[cfg(windows)]
+    if kind == ShellKind::Cmd {
+        use std::os::windows::process::CommandExt as _;
+
+        // `cmd.exe /s /c` parses the raw process command line rather than an argv
+        // reconstructed with CommandLineToArgvW rules. Rust's ordinary `.arg()`
+        // encoding quotes a script containing spaces and backslash-escapes every
+        // embedded `"`, which changes commands such as `echo ok & "tool.exe"`.
+        // Pass the command tail verbatim and provide the outer quotes that `/s`
+        // removes, leaving the user's command text (and its quotes) intact.
+        command.as_std_mut().raw_arg(format!("\"{command_text}\""));
+        return;
+    }
+
+    #[cfg(not(windows))]
+    let _ = kind;
+    command.arg(command_text);
+}
+
 fn valid_shell_executable(shell: &str) -> bool {
     !shell.is_empty() && shell.len() <= 4096 && !shell.contains(['\0', '\n', '\r'])
 }
@@ -861,8 +881,11 @@ fn default_shell() -> String {
 }
 
 fn powershell_script(command_text: &str) -> String {
+    // Capture both status variables before leaving the script block. In Windows
+    // PowerShell, the call-operator boundary does not reliably preserve the
+    // status needed to distinguish a native exit code from PowerShell failure.
     format!(
-        "& {{\n{command_text}\n}}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }} else {{ exit 0 }}"
+        "& {{\n{command_text}\n$codexbridge_success = $?; $codexbridge_exit_code = $LASTEXITCODE; if ($codexbridge_success) {{ exit 0 }} elseif (($null -ne $codexbridge_exit_code) -and ($codexbridge_exit_code -ne 0)) {{ exit $codexbridge_exit_code }} else {{ exit 1 }}\n}}"
     )
 }
 
@@ -1500,16 +1523,16 @@ pub(crate) fn build_command_with_options_and_runtime_bind(
     let sandbox_default_shell = (use_bwrap && shell.is_none()).then_some("/bin/sh");
     let (shell_bin, shell_args, shell_text) =
         shell_command(shell.or(sandbox_default_shell), command_text)?;
+    let kind = shell_kind(&shell_bin);
     let command = if use_bwrap {
         let mut command = bubblewrap_base_command(config, project, workdir, runtime_bind)?;
         command.arg(&shell_bin).args(&shell_args).arg(&shell_text);
         command
     } else if config.allow_unsandboxed_exec {
         let mut command = Command::new(&shell_bin);
-        command
-            .args(&shell_args)
-            .arg(&shell_text)
-            .current_dir(workdir);
+        command.args(&shell_args);
+        append_shell_command_text(&mut command, kind, &shell_text);
+        command.current_dir(workdir);
         command
     } else {
         return Err(AppError::new(
@@ -2153,8 +2176,12 @@ mod tests {
         }
         assert_eq!(args.last().map(String::as_str), Some("-Command"));
         assert!(script.contains("$LASTEXITCODE"));
-        assert!(script.contains("exit $LASTEXITCODE"));
-        assert!(script.ends_with("else { exit 0 }"));
+        assert!(script.contains("$codexbridge_success = $?"));
+        assert!(script.contains("$codexbridge_exit_code = $LASTEXITCODE"));
+        assert!(script.contains("if ($codexbridge_success) { exit 0 }"));
+        assert!(script.contains("exit $codexbridge_exit_code"));
+        assert!(script.contains("else { exit 1 }"));
+        assert!(script.ends_with("\n}"));
     }
 
     #[test]
@@ -2260,6 +2287,55 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("codexbridge-native-cmd"),
+            "{output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_explicit_cmd_preserves_quoted_executable_after_separator() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(std::collections::BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "none".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let quoted_executable = crate::platform::windows_system32_executable("where.exe");
+        let command_text = format!(
+            "echo codexbridge-before-quoted-child & \"{}\" cmd.exe",
+            quoted_executable.display()
+        );
+        let mut command = build_command_with_options(
+            &config,
+            &project,
+            &command_text,
+            false,
+            Duration::from_secs(5),
+            &BTreeMap::new(),
+            project_dir.path(),
+            Some("cmd"),
+        )
+        .unwrap();
+
+        let output = command.output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("codexbridge-before-quoted-child"),
+            "{output:?}"
+        );
+        assert!(
+            stdout.to_ascii_lowercase().contains("cmd.exe"),
             "{output:?}"
         );
     }
