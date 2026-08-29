@@ -123,7 +123,7 @@ fn unique_name(mut base: String, used: &HashSet<String>) -> String {
     if !used.contains(&base) {
         return base;
     }
-    for suffix in 2..10_000 {
+    for suffix in 2..=used.len().saturating_add(2) {
         let suffix = format!("_{suffix}");
         let mut candidate = base.clone();
         candidate.truncate(64usize.saturating_sub(suffix.len()));
@@ -132,7 +132,7 @@ fn unique_name(mut base: String, used: &HashSet<String>) -> String {
             return candidate;
         }
     }
-    base
+    unreachable!("suffix candidate count exceeds the used-name set")
 }
 
 fn gateway_schema(names: impl Iterator<Item = String>) -> Arc<Map<String, Value>> {
@@ -732,6 +732,71 @@ pub async fn connect_upstreams(config: &Config) -> ConnectedUpstreams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::{
+        ErrorData, RoleServer, ServerHandler,
+        model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
+        service::RequestContext,
+        transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Clone)]
+    struct CatalogueServer {
+        tool_count: usize,
+    }
+
+    impl ServerHandler for CatalogueServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult {
+                tools: (0..self.tool_count)
+                    .map(|index| {
+                        Tool::new(
+                            format!("tool_{index:04}"),
+                            "fixture tool",
+                            Arc::new(Map::new()),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn spawn_catalogue_server(tool_count: usize) -> (String, CancellationToken) {
+        let cancellation = CancellationToken::new();
+        let service: StreamableHttpService<CatalogueServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(CatalogueServer { tool_count }),
+                Default::default(),
+                StreamableHttpServerConfig::default()
+                    .with_legacy_session_mode(false)
+                    .with_json_response(true)
+                    .with_sse_keep_alive(None)
+                    .with_cancellation_token(cancellation.child_token()),
+            );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                let _ = axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { cancellation.cancelled_owned().await })
+                    .await;
+            }
+        });
+        (format!("http://{address}/mcp"), cancellation)
+    }
 
     fn windows_stdio_path_matches_contract(
         actual: &std::ffi::OsStr,
@@ -771,16 +836,93 @@ mod tests {
         let deduped = unique_name(base.clone(), &used);
         assert_ne!(deduped, base);
         assert!(deduped.len() <= 64);
+
+        let server_prefix = "s".repeat(55);
+        let mut collapsed = HashSet::new();
+        for server_index in 0..20 {
+            let server = format!("{server_prefix}-{server_index:02}");
+            assert!(server.len() <= 128);
+            assert!(!server.chars().any(char::is_control));
+            for tool_index in 0..MAX_TOOLS_PER_UPSTREAM {
+                let tool = format!("tool_{tool_index:03}");
+                let mut candidate = format!("upstream_{}__{}", sanitize(&server), sanitize(&tool));
+                candidate.truncate(64);
+                collapsed.insert(candidate);
+            }
+        }
+        assert_eq!(20 * MAX_TOOLS_PER_UPSTREAM, 10_240);
+        assert_eq!(collapsed.len(), 1);
+
+        let base = collapsed.into_iter().next().unwrap();
+        let mut used = HashSet::from([base.clone()]);
+        for suffix in 2..10_000 {
+            let suffix = format!("_{suffix}");
+            let mut candidate = base.clone();
+            candidate.truncate(64usize.saturating_sub(suffix.len()));
+            candidate.push_str(&suffix);
+            assert!(used.insert(candidate));
+        }
+        assert_eq!(used.len(), 9_999);
+        let deduped = unique_name(base, &used);
+        assert!(!used.contains(&deduped));
+        assert!(deduped.ends_with("_10000"));
+        assert!(deduped.len() <= 64);
     }
 
     #[test]
-    fn gateway_schema_is_bounded_and_requires_function() {
+    fn gateway_schema_requires_function_and_enumerates_names() {
         let schema = gateway_schema(["one".to_owned(), "two".to_owned()].into_iter());
         assert_eq!(schema["required"], json!(["function"]));
         assert_eq!(
             schema["properties"]["function"]["enum"],
             json!(["one", "two"])
         );
+    }
+
+    #[tokio::test]
+    async fn connect_upstreams_truncates_catalogue_before_gateway_schema() {
+        let (url, cancellation) = spawn_catalogue_server(MAX_TOOLS_PER_UPSTREAM + 1).await;
+        let mut config = upstream_test_config();
+        config.upstreams.insert(
+            "many".to_owned(),
+            crate::config::UpstreamSpec {
+                command: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                disabled: false,
+                transport: Some("streamable_http".to_owned()),
+                url: Some(url),
+                bearer_token_env_var: None,
+                env_http_headers: BTreeMap::new(),
+                tools: None,
+                mode: UpstreamMode::Gateway,
+            },
+        );
+
+        let connected = connect_upstreams(&config).await;
+        let gateway = connected
+            .aggregator
+            .gateways
+            .first()
+            .expect("gateway is connected");
+        assert_eq!(gateway.tools.len(), MAX_TOOLS_PER_UPSTREAM);
+        assert!(gateway.tools.contains_key("tool_0511"));
+        assert!(!gateway.tools.contains_key("tool_0512"));
+        assert_eq!(
+            gateway.model.input_schema["properties"]["function"]["enum"]
+                .as_array()
+                .expect("function enum")
+                .len(),
+            MAX_TOOLS_PER_UPSTREAM
+        );
+        assert!(connected.aggregator.report().iter().any(|line| {
+            line == &format!(
+                "many -> tool catalogue truncated from {} to {MAX_TOOLS_PER_UPSTREAM}",
+                MAX_TOOLS_PER_UPSTREAM + 1
+            )
+        }));
+
+        cancellation.cancel();
     }
 
     #[test]

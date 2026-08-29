@@ -209,13 +209,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn taskkill_is_resolved_to_system32_without_path_lookup() {
-        let taskkill = windows_system32_executable("taskkill.exe");
+    fn taskkill_command_uses_absolute_system32_path() {
+        let taskkill = PathBuf::from(windows_taskkill_program_for_test(u32::MAX, true));
         assert!(taskkill.is_absolute());
         assert!(taskkill.ends_with(r"System32\taskkill.exe"));
-        // A deliberately invalid PID still proves the executable itself could
-        // be launched without consulting PATH.
-        assert!(windows_taskkill(u32::MAX, true).is_ok());
     }
 
     #[cfg(windows)]

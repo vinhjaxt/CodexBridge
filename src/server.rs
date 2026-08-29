@@ -536,6 +536,8 @@ pub async fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LogConfig;
+    use tower::ServiceExt;
 
     #[cfg(unix)]
     use crate::config::ConfigBuilder;
@@ -648,16 +650,100 @@ mod tests {
             token
         ));
     }
-    #[test]
-    fn auth_rejects_wrong_prefix_and_unicode_lookalikes() {
+    #[tokio::test]
+    async fn auth_rejects_wrong_prefix_and_unicode_lookalikes() {
         let token = "1234567890abcdef";
-        // A correct-length but wrong-content candidate must fail; so must a
-        // longer candidate that merely starts with the token.
+        // Exact token matching rejects both ordinary mismatches and a Cyrillic
+        // small-a homoglyph in place of the ASCII `a`.
         assert!(!token_matches("9234567890abcdef", token));
+        assert!(!token_matches("1234567890\u{0430}bcdef", token));
         assert!(!token_matches(&format!("{token}extra"), token));
         assert!(token_matches(token, token));
-        // Empty candidates never authenticate any mode.
-        assert!(!auth_matches(AuthMode::Path, "", None, token));
-        assert!(!auth_matches(AuthMode::Bearer, "mcp", Some(""), token));
+
+        let directory = tempfile::tempdir().unwrap();
+        let audit = AuditLogger::new(
+            LogConfig {
+                root: directory.path().join("logs"),
+                queue_capacity: 32,
+                queue_max_bytes: 64 * 1024,
+                console_param_bytes: 64,
+                console_result_bytes: 64,
+                file_event_bytes: 4096,
+                max_file_bytes: 1024 * 1024,
+                max_files: 1,
+            },
+            token.to_owned(),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/mcp", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn_with_state(
+                HttpState {
+                    auth_token: Arc::new(token.to_owned()),
+                    auth_mode: AuthMode::Bearer,
+                    audit,
+                    active_requests: Arc::new(AtomicUsize::new(0)),
+                    max_active_requests: 4,
+                    session_manager: Arc::new(LocalSessionManager::default()),
+                    max_sessions: 4,
+                    session_activity: Arc::new(DashTimestamps::default()),
+                },
+                authenticate_and_observe,
+            ));
+
+        for authorization in [
+            format!("Basic {token}"),
+            format!("bearer {token}"),
+            format!("Bearer{token}"),
+            format!("Bearer\t{token}"),
+            format!("Bearer  {token}"),
+            "Bearer ".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/mcp")
+                        .header(AUTHORIZATION, &authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "authorization={authorization:?}"
+            );
+        }
+
+        let unicode_prefix = format!("B\u{0435}arer {token}");
+        let unicode_header =
+            axum::http::HeaderValue::from_bytes(unicode_prefix.as_bytes()).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp")
+                    .header(AUTHORIZATION, unicode_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }

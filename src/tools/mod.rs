@@ -956,14 +956,14 @@ impl ServerHandler for AgentHandler {
                 .enable_resources()
                 .build(),
         )
-            .with_server_info(Implementation::new(
-                "CodexBridge",
-                server_contract_version(&self.tool_router),
-            ))
-            .with_instructions(agent::pre_init_instructions(
-                &self.shared.config,
-                &self.shared.upstream,
-            ))
+        .with_server_info(Implementation::new(
+            "CodexBridge",
+            server_contract_version(&self.tool_router),
+        ))
+        .with_instructions(agent::pre_init_instructions(
+            &self.shared.config,
+            &self.shared.upstream,
+        ))
     }
 
     async fn list_resources(
@@ -1150,10 +1150,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(uri, SERVER_ABOUT_RESOURCE_URI);
-                assert_eq!(
-                    mime_type.as_deref(),
-                    Some(SERVER_ABOUT_RESOURCE_MIME_TYPE)
-                );
+                assert_eq!(mime_type.as_deref(), Some(SERVER_ABOUT_RESOURCE_MIME_TYPE));
                 assert_eq!(text, SERVER_ABOUT_RESOURCE_TEXT);
             }
             other => panic!("expected text resource contents, got {other:?}"),
@@ -2303,44 +2300,58 @@ mod tests {
 
     #[test]
     fn project_permit_registry_evicts_only_idle_entries_at_capacity() {
-        let registry = ProjectPermitRegistry::new(1, 1);
-        let active = registry.get("active").unwrap();
-        let held = active.0.clone().try_acquire_owned().unwrap();
-        let idle_projects = (1..PROJECT_PERMIT_CACHE_MAX_ENTRIES)
-            .map(|index| format!("idle-{index}"))
-            .collect::<Vec<_>>();
-        for project in &idle_projects {
-            registry.get(project).unwrap();
+        for active_permit in 0..3 {
+            let registry = ProjectPermitRegistry::new(1, 1);
+            let active = registry.get("active").unwrap();
+            let held = match active_permit {
+                0 => active.0.clone().try_acquire_owned().unwrap(),
+                1 => active.1.clone().try_acquire_owned().unwrap(),
+                2 => active.2.clone().try_acquire_owned().unwrap(),
+                _ => unreachable!(),
+            };
+            let idle_projects = (1..PROJECT_PERMIT_CACHE_MAX_ENTRIES)
+                .map(|index| format!("idle-{index}"))
+                .collect::<Vec<_>>();
+            for project in &idle_projects {
+                registry.get(project).unwrap();
+            }
+            assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+
+            registry.get("replacement").unwrap();
+
+            assert!(registry.entries.contains_key("active"));
+            assert_eq!(
+                idle_projects
+                    .iter()
+                    .filter(|project| registry.entries.contains_key(project.as_str()))
+                    .count(),
+                idle_projects.len() - 1
+            );
+            assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+            assert!(registry.entries.contains_key("replacement"));
+            drop(held);
         }
-        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
-
-        registry.get("replacement").unwrap();
-
-        assert!(registry.entries.contains_key("active"));
-        assert_eq!(
-            idle_projects
-                .iter()
-                .filter(|project| registry.entries.contains_key(project.as_str()))
-                .count(),
-            idle_projects.len() - 1
-        );
-        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
-        assert!(registry.entries.contains_key("replacement"));
-        drop(held);
     }
 
     #[test]
     fn project_permit_registry_fails_closed_when_every_entry_is_active() {
-        let registry = ProjectPermitRegistry::new(1, 1);
-        let mut held = Vec::with_capacity(PROJECT_PERMIT_CACHE_MAX_ENTRIES);
-        for index in 0..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
-            let permits = registry.get(&format!("project-{index}")).unwrap();
-            held.push(permits.0.clone().try_acquire_owned().unwrap());
+        for active_permit in 0..3 {
+            let registry = ProjectPermitRegistry::new(1, 1);
+            let mut held = Vec::with_capacity(PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+            for index in 0..PROJECT_PERMIT_CACHE_MAX_ENTRIES {
+                let permits = registry.get(&format!("project-{index}")).unwrap();
+                held.push(match active_permit {
+                    0 => permits.0.clone().try_acquire_owned().unwrap(),
+                    1 => permits.1.clone().try_acquire_owned().unwrap(),
+                    2 => permits.2.clone().try_acquire_owned().unwrap(),
+                    _ => unreachable!(),
+                });
+            }
+            let error = registry.get("overflow").unwrap_err();
+            assert_eq!(error.code(), "SERVER_BUSY");
+            assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
+            drop(held);
         }
-        let error = registry.get("overflow").unwrap_err();
-        assert_eq!(error.code(), "SERVER_BUSY");
-        assert_eq!(registry.entries.len(), PROJECT_PERMIT_CACHE_MAX_ENTRIES);
-        drop(held);
     }
 
     #[test]

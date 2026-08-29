@@ -2233,7 +2233,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_non_tty_exec_hides_explicit_cmd_and_keeps_pipes() {
+    async fn windows_non_tty_exec_explicit_cmd_keeps_stdout_and_stderr_pipes() {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
@@ -2249,7 +2249,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_non_tty_exec_hides_default_powershell_and_keeps_pipes() {
+    async fn windows_non_tty_exec_default_powershell_keeps_stdout_and_stderr_pipes() {
         let project_dir = tempfile::tempdir().unwrap();
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
@@ -3828,7 +3828,7 @@ mod tests {
         assert_eq!(replayed["completion_reason"], "exited");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn yield_result_wakes_when_process_completion_is_published() {
         let session = test_session(None);
         let finisher = session.clone();
@@ -3842,8 +3842,10 @@ mod tests {
             });
             finisher.changed.notify_waiters();
         });
+        // This is a virtual-time deadlock guard, not a wall-clock latency contract.
+        // A completion notification must wake the waiter well before its 30s yield deadline.
         let value = tokio::time::timeout(
-            Duration::from_millis(250),
+            Duration::from_secs(1),
             yield_result("running", &session, 30_000, None, None),
         )
         .await
@@ -3889,7 +3891,7 @@ mod tests {
     #[test]
     fn regression_poll_yield_is_below_common_transport_deadline() {
         assert_eq!(MAX_POLL_YIELD_MS, MAX_INITIAL_YIELD_MS);
-        assert!(MAX_POLL_YIELD_MS <= 20_000);
+        assert_eq!(MAX_POLL_YIELD_MS, 20_000);
     }
 
     #[test]

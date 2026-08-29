@@ -584,6 +584,15 @@ fn discover_skill_documents(
     source: &str,
     warnings: &mut Vec<SkillWarning>,
 ) -> Vec<PathBuf> {
+    discover_skill_documents_with_max_dirs(root, source, warnings, SKILL_SCAN_MAX_DIRS_PER_ROOT)
+}
+
+fn discover_skill_documents_with_max_dirs(
+    root: &Path,
+    source: &str,
+    warnings: &mut Vec<SkillWarning>,
+    max_dirs_per_root: usize,
+) -> Vec<PathBuf> {
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Vec::new(),
@@ -605,14 +614,14 @@ fn discover_skill_documents(
     let mut visited = HashSet::new();
     let mut inspected = 0usize;
     while let Some((directory, depth)) = stack.pop() {
-        if inspected >= SKILL_SCAN_MAX_DIRS_PER_ROOT {
+        if inspected >= max_dirs_per_root {
             push_skill_warning(
                 warnings,
                 "SKILL_SCOPE_TRUNCATED",
                 source,
                 "",
                 format!(
-                    "recursive skill discovery is limited to {SKILL_SCAN_MAX_DIRS_PER_ROOT} directories per root"
+                    "recursive skill discovery is limited to {max_dirs_per_root} directories per root"
                 ),
             );
             break;
@@ -1213,10 +1222,42 @@ mod tests {
     }
 
     #[test]
-    fn skill_scope_scan_and_catalogue_are_bounded() {
+    fn skill_scope_scan_is_bounded_independently_of_catalogue() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join(".agents/skills");
-        for index in 0..260 {
+        let max_dirs_per_root = 3;
+        for index in 0..max_dirs_per_root {
+            write_skill(
+                &root,
+                &format!("pkg-{index:03}"),
+                &format!("---\nname: skill-{index:03}\ndescription: D\n---\n"),
+            );
+        }
+
+        let mut warnings = Vec::new();
+        let documents =
+            discover_skill_documents_with_max_dirs(&root, "test", &mut warnings, max_dirs_per_root);
+
+        assert_eq!(documents.len(), max_dirs_per_root - 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "SKILL_SCOPE_TRUNCATED")
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.code == "SKILL_CATALOG_TRUNCATED")
+        );
+    }
+
+    #[test]
+    fn skill_catalogue_is_bounded_independently_of_scan_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".agents/skills");
+        let skill_count = SKILL_CATALOG_MAX + 4;
+        assert!(skill_count + 1 < SKILL_SCAN_MAX_DIRS_PER_ROOT);
+        for index in 0..skill_count {
             write_skill(
                 &root,
                 &format!("pkg-{index:03}"),
@@ -1224,12 +1265,18 @@ mod tests {
             );
         }
         let catalog = skill_catalog_from_sources(&project(temp.path()), None, &[], &[]).unwrap();
-        assert!(catalog.skills.len() <= SKILL_CATALOG_MAX);
+        assert_eq!(catalog.skills.len(), SKILL_CATALOG_MAX);
         assert!(
             catalog
                 .warnings
                 .iter()
                 .any(|warning| warning.code == "SKILL_CATALOG_TRUNCATED")
+        );
+        assert!(
+            !catalog
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "SKILL_SCOPE_TRUNCATED")
         );
     }
 

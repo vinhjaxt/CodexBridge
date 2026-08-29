@@ -694,10 +694,16 @@ impl Config {
                 "MAX_PROJECT_PROCESSES cannot exceed MAX_CONCURRENT_PROCESSES",
             ));
         }
-        if self.max_sessions == 0 || self.max_interactive_processes == 0 {
-            return Err(AppError::config(
-                "session and interactive process limits must be greater than zero",
-            ));
+        if let Some((name, _)) = [
+            ("MAX_LEGACY_MCP_SESSIONS", self.max_sessions),
+            ("MAX_INTERACTIVE_PROCESSES", self.max_interactive_processes),
+        ]
+        .into_iter()
+        .find(|(_, amount)| *amount == 0)
+        {
+            return Err(AppError::config(format!(
+                "{name} must be greater than zero"
+            )));
         }
         if self.max_concurrent_upstream_calls == 0 {
             return Err(AppError::config(
@@ -709,19 +715,29 @@ impl Config {
                 "EXEC_DEFAULT_TIMEOUT_MS cannot exceed EXEC_MAX_TIMEOUT_MS",
             ));
         }
-        if self.logs.max_files == 0 || self.logs.max_file_bytes == 0 {
-            return Err(AppError::config(
-                "log rotation limits must be greater than zero",
-            ));
-        }
-        if self.output.file_bytes == 0
-            || self.output.multi_file_bytes == 0
-            || self.output.results == 0
-            || self.output.search_bytes == 0
+        if let Some((name, _)) = [
+            ("LOG_MAX_FILES", self.logs.max_files as u64),
+            ("LOG_MAX_FILE_SIZE_MB", self.logs.max_file_bytes),
+        ]
+        .into_iter()
+        .find(|(_, amount)| *amount == 0)
         {
-            return Err(AppError::config(
-                "output presentation limits must be greater than zero",
-            ));
+            return Err(AppError::config(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+        if let Some((name, _)) = [
+            ("OUTPUT_FILE_BYTES", self.output.file_bytes),
+            ("OUTPUT_MULTI_FILE_BYTES", self.output.multi_file_bytes),
+            ("OUTPUT_MAX_RESULTS", self.output.results),
+            ("OUTPUT_SEARCH_BYTES", self.output.search_bytes),
+        ]
+        .into_iter()
+        .find(|(_, amount)| *amount == 0)
+        {
+            return Err(AppError::config(format!(
+                "{name} must be greater than zero"
+            )));
         }
         if self.output.file_bytes > limits.write_bytes
             || self.output.multi_file_bytes > limits.write_bytes
@@ -969,11 +985,29 @@ mod tests {
     fn zero_positive_limits_are_rejected_with_the_specific_variable_name() {
         for name in [
             "MAX_REQUEST_BODY_BYTES",
+            "MAX_INPUT_STRING_BYTES",
             "MAX_WRITE_BYTES",
+            "MAX_PATCH_BYTES",
+            "MAX_MULTI_PATHS",
             "MAX_RESULTS",
+            "MAX_TRAVERSED_ENTRIES",
+            "MAX_PROCESS_OUTPUT_BYTES",
             "MAX_CONCURRENT_TOOL_CALLS",
+            "MAX_CONCURRENT_CPU_TASKS",
             "MAX_CONCURRENT_PROCESSES",
+            "MAX_CONCURRENT_SEARCHES",
+            "MAX_CONCURRENT_PATCHES",
             "MAX_PROJECT_TOOL_CALLS",
+            "MAX_PROJECT_PROCESSES",
+            "MAX_LEGACY_MCP_SESSIONS",
+            "MAX_INTERACTIVE_PROCESSES",
+            "MAX_CONCURRENT_UPSTREAM_CALLS",
+            "LOG_MAX_FILES",
+            "LOG_MAX_FILE_SIZE_MB",
+            "OUTPUT_FILE_BYTES",
+            "OUTPUT_MULTI_FILE_BYTES",
+            "OUTPUT_MAX_RESULTS",
+            "OUTPUT_SEARCH_BYTES",
         ] {
             let mut environment = base_environment();
             environment.insert(name.to_owned(), "0".to_owned());

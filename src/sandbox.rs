@@ -1826,8 +1826,10 @@ mod tests {
         use std::os::unix::fs::symlink;
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
         symlink(outside.path(), project.path().join("link")).unwrap();
         let resolver = SecurePathResolver;
+
         assert_eq!(
             resolver
                 .write_file_atomic(project.path(), "link/escaped.txt", b"no")
@@ -1842,20 +1844,142 @@ mod tests {
                 .code(),
             "SYMLINK_ESCAPE"
         );
+        assert_eq!(
+            resolver
+                .read_file_range(project.path(), "link/secret.txt", 0, 100)
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+
+        std::fs::write(project.path().join("source.txt"), b"source").unwrap();
+        assert_eq!(
+            resolver
+                .copy_file_secure(project.path(), "link/secret.txt", "copy-from-link.txt", 100)
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert_eq!(
+            resolver
+                .copy_file_secure(project.path(), "source.txt", "link/copied.txt", 100)
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert_eq!(
+            resolver
+                .move_path_secure(project.path(), "link/secret.txt", "moved-from-link.txt")
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert_eq!(
+            resolver
+                .move_path_secure(project.path(), "source.txt", "link/moved.txt")
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert!(project.path().join("source.txt").is_file());
+        assert_eq!(
+            resolver
+                .create_directory_all(project.path(), "link/new/directory")
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert_eq!(
+            resolver
+                .remove_path_secure(project.path(), "link/secret.txt")
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+
         assert!(!outside.path().join("escaped.txt").exists());
+        assert!(!outside.path().join("copied.txt").exists());
+        assert!(!outside.path().join("moved.txt").exists());
+        assert!(!outside.path().join("new").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("secret.txt")).unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
-    fn capability_api_rejects_cross_platform_absolute_forms() {
+    fn capability_apis_reject_cross_platform_absolute_and_traversal_forms() {
         let project = tempfile::tempdir().unwrap();
         let resolver = SecurePathResolver;
+        std::fs::write(project.path().join("source.txt"), b"source").unwrap();
+
         for path in ["../x", "/etc/passwd", r"C:\Windows\x", r"\\host\share"] {
-            assert!(
+            let assert_rejected = |operation: &str, error: AppError| {
+                assert_eq!(
+                    error.code(),
+                    "PATH_OUTSIDE_WORKSPACE",
+                    "{operation} accepted {path}"
+                );
+            };
+
+            assert_rejected(
+                "bounded read",
+                resolver
+                    .read_file_bounded(project.path(), path, 100)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "ranged read",
+                resolver
+                    .read_file_range(project.path(), path, 0, 100)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "write",
                 resolver
                     .write_file_atomic(project.path(), path, b"no")
-                    .is_err(),
-                "{path}"
+                    .unwrap_err(),
             );
+            assert_rejected(
+                "copy source",
+                resolver
+                    .copy_file_secure(project.path(), path, "copy.txt", 100)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "copy destination",
+                resolver
+                    .copy_file_secure(project.path(), "source.txt", path, 100)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "move source",
+                resolver
+                    .move_path_secure(project.path(), path, "moved.txt")
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "move destination",
+                resolver
+                    .move_path_secure(project.path(), "source.txt", path)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "remove",
+                resolver
+                    .remove_path_secure(project.path(), path)
+                    .unwrap_err(),
+            );
+            assert_rejected(
+                "directory creation",
+                resolver
+                    .create_directory_all(project.path(), path)
+                    .unwrap_err(),
+            );
+
+            assert!(project.path().join("source.txt").is_file(), "{path}");
+            assert!(!project.path().join("copy.txt").exists(), "{path}");
+            assert!(!project.path().join("moved.txt").exists(), "{path}");
         }
     }
 
@@ -2020,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn powershell_invocation_propagates_native_exit_code() {
+    fn powershell_script_emits_native_exit_code_propagation_logic() {
         let (shell, args, script) = shell_command(Some("pwsh"), "native-command").unwrap();
         if cfg!(windows) {
             assert_eq!(shell, "pwsh.exe");

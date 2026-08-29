@@ -128,4 +128,77 @@ fn windows_junction_components_cannot_escape_capability_paths() {
             .code(),
         "PATH_OUTSIDE_WORKSPACE"
     );
+    assert_eq!(
+        resolver
+            .read_file_range(temp.path(), "linked/secret.txt", 0, 16)
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert_eq!(
+        resolver
+            .write_file_atomic(temp.path(), "linked/escaped.txt", b"nope")
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+
+    std::fs::write(temp.path().join("source.txt"), b"source").unwrap();
+    assert_eq!(
+        resolver
+            .copy_file_secure(
+                temp.path(),
+                "linked/secret.txt",
+                "copy-from-linked.txt",
+                1024,
+            )
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert_eq!(
+        resolver
+            .copy_file_secure(temp.path(), "source.txt", "linked/copied.txt", 1024)
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert_eq!(
+        resolver
+            .move_path_secure(temp.path(), "linked/secret.txt", "moved-from-linked.txt")
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert_eq!(
+        resolver
+            .move_path_secure(temp.path(), "source.txt", "linked/moved.txt")
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert!(temp.path().join("source.txt").is_file());
+    assert_eq!(
+        resolver
+            .create_directory_all(temp.path(), "linked/new/directory")
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    assert_eq!(
+        resolver
+            .remove_path_secure(temp.path(), "linked/secret.txt")
+            .unwrap_err()
+            .code(),
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+
+    assert!(!outside.path().join("escaped.txt").exists());
+    assert!(!outside.path().join("copied.txt").exists());
+    assert!(!outside.path().join("moved.txt").exists());
+    assert!(!outside.path().join("new").exists());
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"secret"
+    );
 }

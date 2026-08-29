@@ -229,6 +229,8 @@ fn render_file_window_at(
 
 type FileLayout = (u64, usize, Option<(u64, u64)>);
 
+const FILE_LAYOUT_SCAN_CHUNK: usize = 256 * 1024;
+
 #[cfg(test)]
 fn scan_file_layout(
     paths: &crate::sandbox::SecurePathResolver,
@@ -237,24 +239,27 @@ fn scan_file_layout(
     target_line: usize,
 ) -> Result<FileLayout, AppError> {
     let mut file = paths.open_regular_file(root, input)?;
-    scan_open_file_layout(&mut file, target_line)
+    let total_bytes = file.metadata()?.len();
+    scan_open_file_layout(&mut file, total_bytes, target_line)
 }
 
-fn scan_open_file_layout(
-    file: &mut std::fs::File,
+fn scan_open_file_layout<R>(
+    file: &mut R,
+    total_bytes: u64,
     target_line: usize,
-) -> Result<FileLayout, AppError> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+) -> Result<FileLayout, AppError>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    use std::io::SeekFrom;
 
-    const SCAN_CHUNK: usize = 256 * 1024;
     file.seek(SeekFrom::Start(0))?;
-    let total_bytes = file.metadata()?.len();
     let mut absolute = 0u64;
     let mut current_line = 0usize;
     let mut target_start = (target_line == 0).then_some(0u64);
     let mut target_end = None;
     let mut previous_byte = None;
-    let mut buffer = vec![0_u8; SCAN_CHUNK];
+    let mut buffer = vec![0_u8; FILE_LAYOUT_SCAN_CHUNK];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -316,7 +321,9 @@ where
     // pathname replacement after the scan must not splice bytes from a new
     // inode into metadata derived from the old one.
     let mut file = paths.open_regular_file(root, input)?;
-    let (total_bytes, total_lines, target) = scan_open_file_layout(&mut file, line_offset)?;
+    let total_bytes = file.metadata()?.len();
+    let (total_bytes, total_lines, target) =
+        scan_open_file_layout(&mut file, total_bytes, line_offset)?;
     after_scan();
     let window = if let Some((line_start, line_end)) = target {
         let line_length = line_end.saturating_sub(line_start);
@@ -681,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn file_layout_scans_files_larger_than_write_limit_without_whole_file_read() {
+    fn file_layout_scans_files_larger_than_write_limit() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large.txt");
         let mut file = std::fs::File::create(&path).unwrap();
@@ -702,6 +709,43 @@ mod tests {
             .read_file_range(temp.path(), "large.txt", start, (end - start) as usize)
             .unwrap();
         assert_eq!(line, b"last");
+    }
+
+    #[test]
+    fn file_layout_scan_requests_bounded_chunks() {
+        struct TrackingReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            largest_request: usize,
+            read_requests: usize,
+        }
+
+        impl std::io::Read for TrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                self.read_requests += 1;
+                self.inner.read(buffer)
+            }
+        }
+
+        impl std::io::Seek for TrackingReader {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let bytes = vec![b'x'; FILE_LAYOUT_SCAN_CHUNK * 3 + 17];
+        let total_bytes = bytes.len() as u64;
+        let mut reader = TrackingReader {
+            inner: std::io::Cursor::new(bytes),
+            largest_request: 0,
+            read_requests: 0,
+        };
+
+        let (scanned_bytes, _, _) = scan_open_file_layout(&mut reader, total_bytes, 0).unwrap();
+
+        assert_eq!(scanned_bytes, total_bytes);
+        assert_eq!(reader.largest_request, FILE_LAYOUT_SCAN_CHUNK);
+        assert!(reader.read_requests > 1);
     }
 
     #[test]

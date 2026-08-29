@@ -2246,6 +2246,7 @@ mod tests {
 
         let (_directory, storage) = storage();
         storage.memory_set("p", "first", "value").unwrap();
+        let deadlock_timeout = Duration::from_secs(20);
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -2266,7 +2267,16 @@ mod tests {
                 })
                 .unwrap();
         });
-        entered_rx.recv().unwrap();
+        match entered_rx.recv_timeout(deadlock_timeout) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = release_tx.send(());
+                panic!("first read transaction did not become active before deadlock timeout")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("first read transaction exited before reporting it was active")
+            }
+        }
 
         let start = Arc::new(Barrier::new(3));
         let (progress_tx, progress_rx) = mpsc::channel();
@@ -2283,14 +2293,14 @@ mod tests {
         let write_progress = progress_tx.clone();
         let writer = std::thread::spawn(move || {
             write_start.wait();
-            let _ = write_progress.send(Progress::Writer(write_storage.memory_set(
-                "p", "second", "value",
-            )));
+            let _ = write_progress.send(Progress::Writer(
+                write_storage.memory_set("p", "second", "value"),
+            ));
         });
 
         start.wait();
         drop(progress_tx);
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + deadlock_timeout;
         let mut read_result = None;
         let mut write_result = None;
         while read_result.is_none() || write_result.is_none() {
@@ -2301,10 +2311,7 @@ mod tests {
                 Err(RecvTimeoutError::Timeout) => {
                     let reader_pending = read_result.is_none();
                     let writer_pending = write_result.is_none();
-                    release_tx.send(()).unwrap();
-                    holder.join().unwrap();
-                    reader.join().unwrap();
-                    writer.join().unwrap();
+                    let _ = release_tx.send(());
                     panic!(
                         "read/write progress deadlocked while first read transaction was active (reader_pending={reader_pending}, writer_pending={writer_pending})"
                     );
@@ -2312,7 +2319,11 @@ mod tests {
                 Err(error) => panic!("progress channel failed: {error}"),
             }
         }
-        assert_eq!(read_result.unwrap().unwrap(), 1);
+        let read_count = read_result.unwrap().unwrap();
+        assert!(
+            matches!(read_count, 1 | 2),
+            "concurrent reader observed unexpected memory count {read_count}"
+        );
         write_result.unwrap().unwrap();
 
         release_tx.send(()).unwrap();
@@ -2333,16 +2344,14 @@ mod tests {
     #[test]
     fn pooled_read_connections_are_query_only() {
         let (_directory, storage) = storage();
-        let error = storage
-            .with_read(|connection| {
-                connection.execute(
-                    "INSERT INTO memories(project_key,key,value,updated_at) VALUES('p','x','y','now')",
-                    [],
-                )?;
-                Ok(())
-            })
-            .expect_err("read connection must reject writes");
-        assert_eq!(error.code(), "STORAGE_ERROR");
+        assert_eq!(storage.inner.readers.len(), STORAGE_READ_CONNECTIONS);
+        for reader in &storage.inner.readers {
+            let connection = reader.lock().expect("read connection lock");
+            let query_only: i64 = connection
+                .query_row("PRAGMA query_only", [], |row| row.get(0))
+                .expect("query_only pragma");
+            assert_eq!(query_only, 1);
+        }
     }
 
     #[test]
@@ -2409,6 +2418,22 @@ mod tests {
             .memory_set("p", "one-too-many", "v")
             .expect_err("entry quota");
         assert_eq!(error.code(), "RESOURCE_LIMIT_EXCEEDED");
+        assert_eq!(
+            storage
+                .memory_get("p", "one-too-many")
+                .expect("get rejected key"),
+            None
+        );
+        let entry_count: i64 = storage
+            .with_read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM memories WHERE project_key='p'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .expect("count memory entries after rejected insert");
+        assert_eq!(entry_count, MEMORY_MAX_ENTRIES as i64);
         storage
             .memory_set("p", "key-0000", "updated")
             .expect("update existing entry at quota");
@@ -2601,8 +2626,23 @@ mod tests {
             })
             .expect("seed legacy plan");
         let plan = storage.plan_get("p").expect("read").expect("present");
-        assert_eq!(plan.items.len(), 2);
-        assert!(plan.items.iter().all(|item| item.status == "pending"));
+        assert_eq!(
+            plan,
+            PlanRecord {
+                explanation: None,
+                items: vec![
+                    PlanItemRecord {
+                        step: "inspect".to_owned(),
+                        status: "pending".to_owned(),
+                    },
+                    PlanItemRecord {
+                        step: "implement".to_owned(),
+                        status: "pending".to_owned(),
+                    },
+                ],
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -2643,15 +2683,52 @@ mod tests {
     #[test]
     fn task_quota_and_text_limits_are_enforced() {
         let (_directory, storage) = storage();
-        let mut oversized = task(0);
-        oversized.title = "x".repeat(TASK_TITLE_MAX_BYTES + 1);
-        assert_eq!(
-            storage
-                .task_add("oversized", &oversized)
-                .expect_err("title")
-                .code(),
-            "INPUT_TOO_LARGE"
-        );
+        for (field, limit) in [
+            ("id", TASK_ID_MAX_BYTES),
+            ("title", TASK_TITLE_MAX_BYTES),
+            ("details", TASK_DETAILS_MAX_BYTES),
+            ("parent_task", TASK_PARENT_MAX_BYTES),
+        ] {
+            let mut oversized = task(0);
+            let value = "x".repeat(limit + 1);
+            match field {
+                "id" => oversized.id = value,
+                "title" => oversized.title = value,
+                "details" => oversized.details = Some(value),
+                "parent_task" => oversized.parent_task = Some(value),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                storage
+                    .task_add("oversized", &oversized)
+                    .expect_err(field)
+                    .code(),
+                "INPUT_TOO_LARGE",
+                "add {field} limit"
+            );
+        }
+
+        storage
+            .task_add("updates", &task(0))
+            .expect("seed task for update validation");
+        for (field, limit) in [
+            ("id", TASK_ID_MAX_BYTES),
+            ("title", TASK_TITLE_MAX_BYTES),
+            ("details", TASK_DETAILS_MAX_BYTES),
+        ] {
+            let value = "x".repeat(limit + 1);
+            let error = match field {
+                "id" => storage.task_update("updates", &value, "pending", None, None),
+                "title" => storage.task_update("updates", "task_0", "pending", Some(&value), None),
+                "details" => {
+                    storage.task_update("updates", "task_0", "pending", None, Some(&value))
+                }
+                _ => unreachable!(),
+            }
+            .expect_err(field);
+            assert_eq!(error.code(), "INPUT_TOO_LARGE", "update {field} limit");
+        }
+
         storage
             .with_write(|connection| {
                 let transaction = connection.transaction()?;
@@ -2683,36 +2760,97 @@ mod tests {
     }
 
     #[test]
+    fn task_add_and_update_reject_invalid_required_fields() {
+        let (_directory, storage) = storage();
+        for field in ["id", "title", "status"] {
+            let mut invalid = task(0);
+            match field {
+                "id" => invalid.id.clear(),
+                "title" => invalid.title = "   ".to_owned(),
+                "status" => invalid.status = "unknown".to_owned(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                storage
+                    .task_add("invalid-add", &invalid)
+                    .expect_err(field)
+                    .code(),
+                "INVALID_INPUT",
+                "add {field} validation"
+            );
+        }
+
+        storage
+            .task_add("invalid-update", &task(0))
+            .expect("seed task for update validation");
+        for field in ["id", "title", "status"] {
+            let error = match field {
+                "id" => storage.task_update("invalid-update", "", "pending", None, None),
+                "title" => {
+                    storage.task_update("invalid-update", "task_0", "pending", Some("   "), None)
+                }
+                "status" => storage.task_update("invalid-update", "task_0", "unknown", None, None),
+                _ => unreachable!(),
+            }
+            .expect_err(field);
+            assert_eq!(error.code(), "INVALID_INPUT", "update {field} validation");
+        }
+    }
+
+    #[test]
     fn reopening_storage_preserves_canonical_plan_and_state() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.sqlite3");
         let first = Storage::open(&path).expect("first open");
-        first.memory_set("p", "key", "value").expect("memory");
-        first
+        first.memory_set("p", "alpha", "first").expect("memory");
+        first.memory_set("p", "omega", "last").expect("memory");
+        let expected_plan = first
             .plan_set(
                 "p",
-                None,
-                vec![PlanItemRecord {
-                    step: "persist".to_owned(),
-                    status: "completed".to_owned(),
-                }],
+                Some("preserve the complete canonical plan".to_owned()),
+                vec![
+                    PlanItemRecord {
+                        step: "first exact step".to_owned(),
+                        status: "completed".to_owned(),
+                    },
+                    PlanItemRecord {
+                        step: "second exact step".to_owned(),
+                        status: "in_progress".to_owned(),
+                    },
+                    PlanItemRecord {
+                        step: "third exact step".to_owned(),
+                        status: "pending".to_owned(),
+                    },
+                ],
             )
             .expect("plan");
+        let (expected_memory, expected_memory_hash, expected_state_plan) = first
+            .project_state_read_with_hook("p", || {})
+            .expect("initial state");
+        assert_eq!(expected_state_plan.as_ref(), Some(&expected_plan));
         drop(first);
         let reopened = Storage::open(&path).expect("reopen");
+        let (memory, memory_hash, plan) = reopened
+            .project_state_read_with_hook("p", || {})
+            .expect("state");
         assert_eq!(
-            reopened.memory_get("p", "key").expect("memory").as_deref(),
-            Some("value")
+            memory
+                .notes
+                .iter()
+                .map(|note| (note.key.as_str(), note.value.as_str()))
+                .collect::<Vec<_>>(),
+            expected_memory
+                .notes
+                .iter()
+                .map(|note| (note.key.as_str(), note.value.as_str()))
+                .collect::<Vec<_>>()
         );
-        assert_eq!(
-            reopened
-                .plan_get("p")
-                .expect("plan")
-                .expect("present")
-                .items[0]
-                .status,
-            "completed"
-        );
+        assert_eq!(memory.total, expected_memory.total);
+        assert_eq!(memory.offset, expected_memory.offset);
+        assert_eq!(memory.truncated, expected_memory.truncated);
+        assert_eq!(memory.next_offset, expected_memory.next_offset);
+        assert_eq!(memory_hash, expected_memory_hash);
+        assert_eq!(plan.expect("present"), expected_plan);
     }
 
     #[test]

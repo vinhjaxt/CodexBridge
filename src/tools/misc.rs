@@ -271,10 +271,18 @@ mod tests {
 
     #[test]
     fn detects_every_supported_image_family() {
-        assert_eq!(image_mime(b"\xff\xd8\xffrest"), Some("image/jpeg"));
-        assert_eq!(image_mime(b"GIF87arest"), Some("image/gif"));
-        assert_eq!(image_mime(b"BMrest"), Some("image/bmp"));
-        assert_eq!(image_mime(b"RIFFxxxxWEBPrest"), Some("image/webp"));
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x89PNG\r\n\x1a\nrest", "image/png"),
+            (b"\xff\xd8\xffrest", "image/jpeg"),
+            (b"GIF87arest", "image/gif"),
+            (b"GIF89arest", "image/gif"),
+            (b"BMrest", "image/bmp"),
+            (b"RIFFxxxxWEBPrest", "image/webp"),
+        ];
+
+        for (bytes, expected) in cases {
+            assert_eq!(image_mime(bytes), Some(*expected));
+        }
     }
 
     #[test]

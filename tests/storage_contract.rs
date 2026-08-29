@@ -32,7 +32,7 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
     assert!(first.truncated);
     assert_eq!(first.next_offset, Some(2));
 
-    let (second, _) = storage
+    let (second, second_snapshot_hash) = storage
         .memory_archive_recall_page_from_snapshot(
             "project",
             first.next_offset.unwrap(),
@@ -49,8 +49,9 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
         vec!["charlie", "delta"]
     );
     assert_eq!(second.next_offset, Some(4));
+    assert_eq!(second_snapshot_hash, snapshot_hash);
 
-    let (third, _) = storage
+    let (third, third_snapshot_hash) = storage
         .memory_archive_recall_page_from_snapshot(
             "project",
             second.next_offset.unwrap(),
@@ -62,6 +63,33 @@ fn memory_pagination_is_sorted_lossless_and_stable() {
     assert_eq!(third.notes[0].key, "echo");
     assert!(!third.truncated);
     assert_eq!(third.next_offset, None);
+    assert_eq!(third_snapshot_hash, snapshot_hash);
+
+    let records = first
+        .notes
+        .iter()
+        .chain(&second.notes)
+        .chain(&third.notes)
+        .map(|note| (note.key.as_str(), note.value.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        vec![
+            ("alpha", "1"),
+            ("bravo", "2"),
+            ("charlie", "3"),
+            ("delta", "4"),
+            ("echo", "5"),
+        ]
+    );
+
+    storage
+        .memory_archive_set("project", "alpha", "updated")
+        .unwrap();
+    let error = storage
+        .memory_archive_recall_page_from_snapshot("project", 2, 2, Some(&snapshot_hash))
+        .unwrap_err();
+    assert_eq!(error.code(), "PAGINATION_STALE");
 }
 
 #[test]

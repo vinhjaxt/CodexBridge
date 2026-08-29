@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use codex_bridge::{
     audit::AuditLogger,
     config::LogConfig,
@@ -33,24 +31,19 @@ fn project(root: &std::path::Path) -> ProjectContext {
     }
 }
 
-async fn wait_for_log(root: &std::path::Path, needle: &str) -> String {
-    for _ in 0..100 {
-        let mut combined = String::new();
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                if entry.path().is_file()
-                    && let Ok(content) = std::fs::read_to_string(entry.path())
-                {
-                    combined.push_str(&content);
-                }
-            }
-        }
-        if combined.contains(needle) {
-            return combined;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+fn read_logs(root: &std::path::Path) -> String {
+    let mut paths: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .collect();
+    paths.sort();
+
+    let mut combined = String::new();
+    for path in paths {
+        combined.push_str(&std::fs::read_to_string(path).unwrap());
     }
-    panic!("audit output never contained {needle}");
+    combined
 }
 
 #[tokio::test]
@@ -62,9 +55,11 @@ async fn emitted_events_are_persisted_and_auth_token_is_redacted() {
         .await
         .unwrap();
     logger.emit(json!({"event":"integration_event","text":format!("prefix-{token}-suffix")}));
-    let content = wait_for_log(&logs, "integration_event").await;
-    assert!(!content.contains(token));
     logger.shutdown().await;
+
+    let content = read_logs(&logs);
+    assert!(content.contains("integration_event"));
+    assert!(!content.contains(token));
 }
 
 #[tokio::test]
