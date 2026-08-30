@@ -881,11 +881,13 @@ fn default_shell() -> String {
 }
 
 fn powershell_script(command_text: &str) -> String {
-    // Capture both status variables before leaving the script block. In Windows
-    // PowerShell, the call-operator boundary does not reliably preserve the
-    // status needed to distinguish a native exit code from PowerShell failure.
+    // PowerShell process status is based on the final command, but a non-zero
+    // native exit code is otherwise collapsed to 1. Keep the user command in the
+    // top-level command scope, inspect `$?` immediately after it, and only use
+    // `$LASTEXITCODE` when that final command failed. Initializing `$LASTEXITCODE`
+    // avoids reusing a value inherited from an earlier PowerShell session state.
     format!(
-        "& {{\n{command_text}\n$codexbridge_success = $?; $codexbridge_exit_code = $LASTEXITCODE; if ($codexbridge_success) {{ exit 0 }} elseif (($null -ne $codexbridge_exit_code) -and ($codexbridge_exit_code -ne 0)) {{ exit $codexbridge_exit_code }} else {{ exit 1 }}\n}}"
+        "$global:LASTEXITCODE = $null\n{command_text}\nif ($?) {{ exit 0 }}\nif ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}\nexit 1"
     )
 }
 
@@ -2175,13 +2177,12 @@ mod tests {
             assert_eq!(shell, "pwsh");
         }
         assert_eq!(args.last().map(String::as_str), Some("-Command"));
+        assert!(script.starts_with("$global:LASTEXITCODE = $null\n"));
         assert!(script.contains("$LASTEXITCODE"));
-        assert!(script.contains("$codexbridge_success = $?"));
-        assert!(script.contains("$codexbridge_exit_code = $LASTEXITCODE"));
-        assert!(script.contains("if ($codexbridge_success) { exit 0 }"));
-        assert!(script.contains("exit $codexbridge_exit_code"));
-        assert!(script.contains("else { exit 1 }"));
-        assert!(script.ends_with("\n}"));
+        assert!(script.contains("if ($?) { exit 0 }"));
+        assert!(script.contains("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"));
+        assert!(script.ends_with("\nexit 1"));
+        assert!(!script.starts_with("& {"));
     }
 
     #[test]

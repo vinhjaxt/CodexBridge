@@ -5,15 +5,85 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(windows))]
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::error::{AppError, Result as AppResult};
 
-pub(super) type SharedPtyMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+pub(super) trait PtyMasterControl: Send {
+    fn resize(&mut self, rows: u16, cols: u16) -> AppResult<()>;
+}
+
+#[cfg(not(windows))]
+struct PortablePtyMaster(Box<dyn MasterPty + Send>);
+
+#[cfg(not(windows))]
+impl PtyMasterControl for PortablePtyMaster {
+    fn resize(&mut self, rows: u16, cols: u16) -> AppResult<()> {
+        self.0
+            .resize(portable_pty_size(rows, cols))
+            .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
+    }
+}
+
+#[cfg(windows)]
+struct WindowsPtyMaster(conpty_oxide::PtyController);
+
+#[cfg(windows)]
+impl PtyMasterControl for WindowsPtyMaster {
+    fn resize(&mut self, rows: u16, cols: u16) -> AppResult<()> {
+        let size = conpty_oxide::Size::try_new(cols, rows)
+            .map_err(|error| AppError::new("INVALID_INPUT", error.to_string()))?;
+        self.0
+            .resize(size)
+            .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
+    }
+}
+
+pub(super) type SharedPtyMaster = Arc<Mutex<Option<Box<dyn PtyMasterControl>>>>;
+
+#[cfg(not(windows))]
+type PtyChild = Box<dyn portable_pty::Child + Send>;
+
+#[cfg(windows)]
+type PtyChild = conpty_oxide::blocking::Child;
+
+pub(super) struct PtyKiller {
+    #[cfg(not(windows))]
+    inner: Box<dyn ChildKiller + Send + Sync>,
+    #[cfg(windows)]
+    pid: u32,
+}
+
+impl PtyKiller {
+    pub(super) fn kill(&mut self) -> AppResult<()> {
+        #[cfg(not(windows))]
+        {
+            self.inner
+                .kill()
+                .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
+        }
+        #[cfg(windows)]
+        {
+            let status = crate::platform::windows_taskkill(self.pid, true)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(AppError::new(
+                    "PROCESS_FAILED",
+                    format!(
+                        "taskkill failed for ConPTY process tree {} with status {status}",
+                        self.pid
+                    ),
+                ))
+            }
+        }
+    }
+}
 
 pub(super) struct PtyProcess {
-    pub child: Box<dyn portable_pty::Child + Send>,
-    pub killer: Box<dyn ChildKiller + Send + Sync>,
+    pub child: PtyChild,
+    pub killer: PtyKiller,
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
     pub master: SharedPtyMaster,
@@ -26,10 +96,8 @@ pub(super) struct PtyExitStatus {
     pub signal: Option<i32>,
 }
 
-pub(super) fn wait_pty_process(
-    mut child: Box<dyn portable_pty::Child + Send>,
-    pid: Option<u32>,
-) -> AppResult<PtyExitStatus> {
+#[cfg(not(windows))]
+pub(super) fn wait_pty_process(mut child: PtyChild, pid: Option<u32>) -> AppResult<PtyExitStatus> {
     #[cfg(not(unix))]
     let _ = pid;
     #[cfg(unix)]
@@ -68,6 +136,18 @@ pub(super) fn wait_pty_process(
     })
 }
 
+#[cfg(windows)]
+pub(super) fn wait_pty_process(mut child: PtyChild, pid: Option<u32>) -> AppResult<PtyExitStatus> {
+    let _ = pid;
+    let status = child
+        .wait()
+        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
+    Ok(PtyExitStatus {
+        exit_code: Some(status.code().min(i32::MAX as u32) as i32),
+        signal: None,
+    })
+}
+
 pub(super) fn terminal_dimensions(rows: Option<u16>, cols: Option<u16>) -> AppResult<(u16, u16)> {
     match (rows, cols) {
         (None, None) => Ok((24, 80)),
@@ -85,7 +165,8 @@ pub(super) fn terminal_dimensions(rows: Option<u16>, cols: Option<u16>) -> AppRe
     }
 }
 
-pub(super) fn pty_size(rows: u16, cols: u16) -> PtySize {
+#[cfg(not(windows))]
+fn portable_pty_size(rows: u16, cols: u16) -> PtySize {
     PtySize {
         rows,
         cols,
@@ -94,17 +175,7 @@ pub(super) fn pty_size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
-fn pty_bootstrap_input_for_platform(windows: bool) -> &'static [u8] {
-    if windows {
-        // portable-pty 0.9 creates ConPTY with PSEUDOCONSOLE_INHERIT_CURSOR.
-        // A headless host must answer ConPTY's initial cursor-position query or
-        // cmd.exe/PowerShell can remain blocked waiting for the terminal reply.
-        b"\x1b[1;1R"
-    } else {
-        &[]
-    }
-}
-
+#[cfg(not(windows))]
 fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsString> {
     #[cfg(not(unix))]
     let _ = timeout;
@@ -145,12 +216,47 @@ fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsStrin
     original
 }
 
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsPtyCommandLine {
+    program: OsString,
+    args: Vec<OsString>,
+    raw_arg: Option<OsString>,
+}
+
+#[cfg(windows)]
+fn windows_pty_command_line(
+    command: &tokio::process::Command,
+    shell_command_text: &str,
+) -> WindowsPtyCommandLine {
+    use std::path::Path;
+
+    let command = command.as_std();
+    let program = command.get_program().to_os_string();
+    let args = command.get_args().map(ToOwned::to_owned).collect();
+    let is_cmd = Path::new(command.get_program())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        });
+    let raw_arg = is_cmd.then(|| OsString::from(format!("\"{shell_command_text}\"")));
+    WindowsPtyCommandLine {
+        program,
+        args,
+        raw_arg,
+    }
+}
+
+#[cfg(not(windows))]
 pub(super) fn spawn_pty_process(
     command: &tokio::process::Command,
     timeout: Duration,
     rows: u16,
     cols: u16,
+    shell_command_text: &str,
 ) -> AppResult<PtyProcess> {
+    let _ = shell_command_text;
     let command_std = command.as_std();
     let argv = pty_argv(command, timeout);
     let mut builder = CommandBuilder::from_argv(argv);
@@ -164,34 +270,21 @@ pub(super) fn spawn_pty_process(
         builder.cwd(cwd);
     }
     let pair = native_pty_system()
-        .openpty(pty_size(rows, cols))
+        .openpty(portable_pty_size(rows, cols))
         .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))?;
-    let bootstrap = pty_bootstrap_input_for_platform(cfg!(windows));
-    if !bootstrap.is_empty() {
-        writer
-            .write_all(bootstrap)
-            .and_then(|_| writer.flush())
-            .map_err(|error| {
-                AppError::new(
-                    "PROCESS_FAILED",
-                    format!("failed to initialize PTY input: {error}"),
-                )
-            })?;
-    }
-    // Seed the ConPTY cursor response before spawning the child. On Windows the
-    // inherited-cursor handshake can otherwise block shell startup inside
-    // spawn_command, which is too early for a post-spawn writer to recover it.
     let child = pair
         .slave
         .spawn_command(builder)
         .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
     drop(pair.slave);
     let pid = child.process_id();
-    let killer = child.clone_killer();
+    let killer = PtyKiller {
+        inner: child.clone_killer(),
+    };
     let reader = pair
         .master
         .try_clone_reader()
@@ -201,8 +294,56 @@ pub(super) fn spawn_pty_process(
         killer,
         reader,
         writer,
-        master: Arc::new(Mutex::new(Some(pair.master))),
+        master: Arc::new(Mutex::new(Some(Box::new(PortablePtyMaster(pair.master))))),
         pid,
+    })
+}
+
+#[cfg(windows)]
+pub(super) fn spawn_pty_process(
+    command: &tokio::process::Command,
+    timeout: Duration,
+    rows: u16,
+    cols: u16,
+    shell_command_text: &str,
+) -> AppResult<PtyProcess> {
+    let _ = timeout;
+    let command_std = command.as_std();
+    let command_line = windows_pty_command_line(command, shell_command_text);
+    let mut builder = conpty_oxide::blocking::Command::new(&command_line.program);
+    builder.args(&command_line.args);
+    if let Some(raw_arg) = &command_line.raw_arg {
+        builder.raw_arg(raw_arg);
+    }
+    builder.env_clear();
+    for (key, value) in command_std.get_envs() {
+        if let Some(value) = value {
+            builder.env(key, value);
+        }
+    }
+    if let Some(cwd) = command_std.get_current_dir() {
+        builder.current_dir(cwd);
+    }
+    let size = conpty_oxide::Size::try_new(cols, rows)
+        .map_err(|error| AppError::new("INVALID_INPUT", error.to_string()))?;
+    let session = builder
+        .spawn_with(conpty_oxide::SessionOptions::new().size(size))
+        .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
+    let conpty_oxide::blocking::SessionParts {
+        child,
+        output,
+        input,
+        controller,
+        ..
+    } = session.into_parts();
+    let pid = child.id();
+    Ok(PtyProcess {
+        child,
+        killer: PtyKiller { pid },
+        reader: Box::new(output),
+        writer: Box::new(input),
+        master: Arc::new(Mutex::new(Some(Box::new(WindowsPtyMaster(controller))))),
+        pid: Some(pid),
     })
 }
 
@@ -211,6 +352,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn pty_wrapper_does_not_apply_uid_wide_nproc_limit() {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg("true");
@@ -224,9 +366,32 @@ mod tests {
         assert!(!rendered.contains("ulimit -u"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn windows_conpty_bootstrap_answers_inherited_cursor_query() {
-        assert_eq!(pty_bootstrap_input_for_platform(true), b"\x1b[1;1R");
-        assert!(pty_bootstrap_input_for_platform(false).is_empty());
+    fn windows_cmd_pty_conversion_preserves_raw_command_tail() {
+        use std::ffi::OsStr;
+        use std::os::windows::process::CommandExt as _;
+
+        let command_text = r#"echo ok & "C:\Program Files\tool.exe" --probe"#;
+        let expected_raw_arg = format!("\"{command_text}\"");
+        let mut command = tokio::process::Command::new(r"C:\Windows\System32\cmd.exe");
+        command.args(["/d", "/s", "/c"]);
+        command.as_std_mut().raw_arg(&expected_raw_arg);
+
+        let visible_args = command
+            .as_std()
+            .get_args()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_args,
+            [OsStr::new("/d"), OsStr::new("/s"), OsStr::new("/c")],
+            "std::process::Command must keep raw_arg outside get_args() for this regression to exercise the lossy PTY boundary"
+        );
+
+        let converted = windows_pty_command_line(&command, command_text);
+        assert_eq!(converted.program, command.as_std().get_program());
+        assert_eq!(converted.args, visible_args);
+        assert_eq!(converted.raw_arg, Some(OsString::from(expected_raw_arg)));
     }
 }

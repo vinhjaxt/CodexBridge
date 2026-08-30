@@ -29,9 +29,7 @@ use uuid::Uuid;
 mod output;
 mod pty;
 use output::{OutputBuffer, token_window};
-use pty::{
-    PtyProcess, SharedPtyMaster, pty_size, spawn_pty_process, terminal_dimensions, wait_pty_process,
-};
+use pty::{PtyProcess, SharedPtyMaster, spawn_pty_process, terminal_dimensions, wait_pty_process};
 
 use super::AgentHandler;
 use crate::{
@@ -920,8 +918,7 @@ impl InteractiveSession {
             master
                 .as_mut()
                 .ok_or_else(|| AppError::new("PROCESS_FAILED", "PTY is closed"))?
-                .resize(pty_size(rows, cols))
-                .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))
+                .resize(rows, cols)
         })
         .await
         .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
@@ -1315,10 +1312,12 @@ impl ProcessRegistry {
         podman_tracker: Option<PodmanExecutionTracker>,
     ) -> AppResult<(String, Arc<InteractiveSession>)> {
         let (rows, cols) = terminal_dimensions(args.rows, args.cols)?;
-        let pty =
-            tokio::task::spawn_blocking(move || spawn_pty_process(&command, timeout, rows, cols))
-                .await
-                .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
+        let shell_command_text = args.command.clone();
+        let pty = tokio::task::spawn_blocking(move || {
+            spawn_pty_process(&command, timeout, rows, cols, &shell_command_text)
+        })
+        .await
+        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
         let PtyProcess {
             child,
             mut killer,
@@ -2590,6 +2589,42 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_tty_cmd_preserves_quoted_executable_after_separator() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = windows_test_config();
+        let project = windows_test_project(&project_dir);
+        let quoted_executable = crate::platform::windows_system32_executable("where.exe");
+        let command_text = format!(
+            "echo codexbridge-conpty-before-quoted-child & \"{}\" cmd.exe",
+            quoted_executable.display()
+        );
+        let mut args = windows_exec_args(command_text, Some("cmd"));
+        args.tty = true;
+        args.rows = Some(24);
+        args.cols = Some(80);
+
+        let (_registry, session) = windows_start_exec(&config, &project, &args).await;
+        assert!(
+            session.tty,
+            "tty=true did not select the ConPTY session path"
+        );
+        windows_wait_for_session(&session).await;
+        let completion = session.completion().expect("ConPTY completion");
+        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
+        assert_eq!(completion.reason, CompletionReason::Exited, "{output:?}");
+        assert_eq!(completion.exit_code, Some(0), "{output:?}");
+        assert!(
+            output.contains("codexbridge-conpty-before-quoted-child"),
+            "{output:?}"
+        );
+        assert!(
+            output.to_ascii_lowercase().contains("cmd.exe"),
+            "{output:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn regression_pty_external_signal_is_reported_as_signaled() {
@@ -2667,13 +2702,27 @@ mod tests {
                 "--nocapture",
             ])
             .env("CODEXBRIDGE_CONPTY_CMD_PROBE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let started = Instant::now();
         loop {
             match child.try_wait().unwrap() {
                 Some(status) => {
-                    assert!(status.success(), "ConPTY child probe failed: {status}");
+                    if !status.success() {
+                        let mut stdout = String::new();
+                        let mut stderr = String::new();
+                        if let Some(mut pipe) = child.stdout.take() {
+                            std::io::Read::read_to_string(&mut pipe, &mut stdout).unwrap();
+                        }
+                        if let Some(mut pipe) = child.stderr.take() {
+                            std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
+                        }
+                        panic!(
+                            "ConPTY child probe failed: {status}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}"
+                        );
+                    }
                     break;
                 }
                 None if started.elapsed() < Duration::from_secs(15) => {

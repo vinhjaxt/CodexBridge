@@ -47,6 +47,7 @@ vt100 = "0.15"
 walkdir = "2"
 
 [target.'cfg(windows)'.dependencies]
+conpty-oxide = "0.1.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
