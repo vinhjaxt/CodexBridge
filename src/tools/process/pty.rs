@@ -239,11 +239,6 @@ fn windows_pty_command_line(
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
         });
-    // `std::process::Command` does not expose which portion of its Windows
-    // command line came from `raw_arg()`, and that representation has changed
-    // across Rust releases. Do not reverse-engineer it through `get_args()`.
-    // The shell builder owns the cmd.exe contract, so rebuild only the stable
-    // switches here and append the command text exactly once as a raw tail.
     let args = if is_cmd {
         ["/d", "/s", "/c"].into_iter().map(OsString::from).collect()
     } else {
@@ -255,6 +250,34 @@ fn windows_pty_command_line(
         args,
         raw_arg,
     }
+}
+
+#[cfg(windows)]
+fn windows_conpty_current_dir(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if !wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
+        return path.to_path_buf();
+    }
+
+    let rest = &wide[4..];
+    let is_unc = rest.len() >= 4
+        && matches!(rest[0], value if value == b'U' as u16 || value == b'u' as u16)
+        && matches!(rest[1], value if value == b'N' as u16 || value == b'n' as u16)
+        && matches!(rest[2], value if value == b'C' as u16 || value == b'c' as u16)
+        && rest[3] == BACKSLASH;
+    let normalized = if is_unc {
+        let mut value = Vec::with_capacity(rest.len().saturating_sub(2));
+        value.extend_from_slice(&[BACKSLASH, BACKSLASH]);
+        value.extend_from_slice(&rest[4..]);
+        value
+    } else {
+        rest.to_vec()
+    };
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&normalized))
 }
 
 #[cfg(not(windows))]
@@ -331,7 +354,7 @@ pub(super) fn spawn_pty_process(
         }
     }
     if let Some(cwd) = command_std.get_current_dir() {
-        builder.current_dir(cwd);
+        builder.current_dir(windows_conpty_current_dir(cwd));
     }
     let size = conpty_oxide::Size::try_new(cols, rows)
         .map_err(|error| AppError::new("INVALID_INPUT", error.to_string()))?;
@@ -397,5 +420,22 @@ mod tests {
             ]
         );
         assert_eq!(converted.raw_arg, Some(OsString::from(expected_raw_arg)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_current_dir_removes_verbatim_prefixes() {
+        assert_eq!(
+            windows_conpty_current_dir(std::path::Path::new(r"\\?\C:\Temp\codexbridge")),
+            std::path::PathBuf::from(r"C:\Temp\codexbridge")
+        );
+        assert_eq!(
+            windows_conpty_current_dir(std::path::Path::new(r"\\?\UNC\server\share\codexbridge")),
+            std::path::PathBuf::from(r"\\server\share\codexbridge")
+        );
+        assert_eq!(
+            windows_conpty_current_dir(std::path::Path::new(r"C:\Temp\codexbridge")),
+            std::path::PathBuf::from(r"C:\Temp\codexbridge")
+        );
     }
 }

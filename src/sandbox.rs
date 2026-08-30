@@ -7,9 +7,11 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use tokio::{io::AsyncReadExt, process::Command};
+
+#[cfg(windows)]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::{
     config::Config,
@@ -779,14 +781,30 @@ fn shell_command(
     let kind = shell_kind(&shell);
     let shell = resolve_shell_executable(shell, kind);
     let (args, command_text) = match kind {
-        ShellKind::PowerShell => (
-            vec![
-                "-NoLogo".to_owned(),
-                "-NoProfile".to_owned(),
-                "-EncodedCommand".to_owned(),
-            ],
-            powershell_encoded_command(command_text),
-        ),
+        ShellKind::PowerShell => {
+            #[cfg(windows)]
+            {
+                (
+                    vec![
+                        "-NoLogo".to_owned(),
+                        "-NoProfile".to_owned(),
+                        "-EncodedCommand".to_owned(),
+                    ],
+                    powershell_encoded_command(command_text),
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                (
+                    vec![
+                        "-NoLogo".to_owned(),
+                        "-NoProfile".to_owned(),
+                        "-Command".to_owned(),
+                    ],
+                    powershell_script(command_text),
+                )
+            }
+        }
         ShellKind::Cmd => (
             vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned()],
             command_text.to_owned(),
@@ -892,6 +910,7 @@ fn powershell_script(command_text: &str) -> String {
     )
 }
 
+#[cfg(windows)]
 fn powershell_encoded_command(command_text: &str) -> String {
     let script = powershell_script(command_text);
     let mut bytes = Vec::with_capacity(script.len().saturating_mul(2));
@@ -899,50 +918,6 @@ fn powershell_encoded_command(command_text: &str) -> String {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     STANDARD.encode(bytes)
-}
-
-#[cfg(any(windows, test))]
-fn windows_application_path_units(wide: &[u16]) -> Vec<u16> {
-    const BACKSLASH: u16 = b'\\' as u16;
-    const QUESTION: u16 = b'?' as u16;
-    if !wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
-        return wide.to_vec();
-    }
-
-    let rest = &wide[4..];
-    let is_verbatim_unc = rest.len() >= 4
-        && matches!(rest[0], value if value == b'U' as u16 || value == b'u' as u16)
-        && matches!(rest[1], value if value == b'N' as u16 || value == b'n' as u16)
-        && matches!(rest[2], value if value == b'C' as u16 || value == b'c' as u16)
-        && rest[3] == BACKSLASH;
-    if is_verbatim_unc {
-        let mut value = Vec::with_capacity(rest.len().saturating_sub(2));
-        value.extend_from_slice(&[BACKSLASH, BACKSLASH]);
-        value.extend_from_slice(&rest[4..]);
-        value
-    } else {
-        rest.to_vec()
-    }
-}
-
-#[cfg(windows)]
-fn windows_application_path(path: &Path) -> PathBuf {
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-
-    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    let normalized = windows_application_path_units(&wide);
-    PathBuf::from(std::ffi::OsString::from_wide(&normalized))
-}
-
-fn application_process_path(path: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        windows_application_path(path)
-    }
-    #[cfg(not(windows))]
-    {
-        path.to_path_buf()
-    }
 }
 
 fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
@@ -1276,11 +1251,24 @@ pub(crate) fn default_exec_shell(config: &Config) -> (String, &'static str, Vec<
     };
     let kind = shell_kind(&shell);
     let args = match kind {
-        ShellKind::PowerShell => vec![
-            "-NoLogo".to_owned(),
-            "-NoProfile".to_owned(),
-            "-EncodedCommand".to_owned(),
-        ],
+        ShellKind::PowerShell => {
+            #[cfg(windows)]
+            {
+                vec![
+                    "-NoLogo".to_owned(),
+                    "-NoProfile".to_owned(),
+                    "-EncodedCommand".to_owned(),
+                ]
+            }
+            #[cfg(not(windows))]
+            {
+                vec![
+                    "-NoLogo".to_owned(),
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                ]
+            }
+        }
         ShellKind::Cmd => vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned()],
         ShellKind::Posix => vec!["-c".to_owned()],
     };
@@ -1588,7 +1576,7 @@ pub(crate) fn build_command_with_options_and_runtime_bind(
         let mut command = Command::new(&shell_bin);
         command.args(&shell_args);
         append_shell_command_text(&mut command, kind, &shell_text);
-        command.current_dir(application_process_path(workdir));
+        command.current_dir(workdir);
         command
     } else {
         return Err(AppError::new(
@@ -1643,9 +1631,7 @@ pub(crate) fn build_argv_command(
         command
     } else if config.allow_unsandboxed_exec {
         let mut command = Command::new(executable);
-        command
-            .args(arguments)
-            .current_dir(application_process_path(&project.project_root));
+        command.args(arguments).current_dir(&project.project_root);
         command
     } else {
         return Err(AppError::new(
@@ -2226,47 +2212,34 @@ mod tests {
 
     #[test]
     fn powershell_script_emits_native_exit_code_propagation_logic() {
-        let (shell, args, encoded_script) = shell_command(Some("pwsh"), "native-command").unwrap();
+        let (shell, args, command_payload) = shell_command(Some("pwsh"), "native-command").unwrap();
         if cfg!(windows) {
             assert_eq!(shell, "pwsh.exe");
         } else {
             assert_eq!(shell, "pwsh");
         }
-        assert_eq!(args.last().map(String::as_str), Some("-EncodedCommand"));
-        let bytes = STANDARD.decode(encoded_script).unwrap();
-        assert_eq!(bytes.len() % 2, 0);
-        let utf16 = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        let script = String::from_utf16(&utf16).unwrap();
+        #[cfg(windows)]
+        let script = {
+            assert_eq!(args.last().map(String::as_str), Some("-EncodedCommand"));
+            let bytes = STANDARD.decode(command_payload).unwrap();
+            assert_eq!(bytes.len() % 2, 0);
+            let utf16 = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            String::from_utf16(&utf16).unwrap()
+        };
+        #[cfg(not(windows))]
+        let script = {
+            assert_eq!(args.last().map(String::as_str), Some("-Command"));
+            command_payload
+        };
         assert!(script.starts_with("$global:LASTEXITCODE = $null\n"));
         assert!(script.contains("$LASTEXITCODE"));
         assert!(script.contains("if ($?) { exit 0 }"));
         assert!(script.contains("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"));
         assert!(script.ends_with("\nexit 1"));
         assert!(!script.starts_with("& {"));
-    }
-
-    #[test]
-    fn windows_application_path_units_remove_verbatim_prefixes() {
-        let drive = r"\\?\C:\Temp\codexbridge"
-            .encode_utf16()
-            .collect::<Vec<_>>();
-        let drive = windows_application_path_units(&drive);
-        assert_eq!(String::from_utf16(&drive).unwrap(), r"C:\Temp\codexbridge");
-
-        let unc = r"\\?\UNC\server\share\codexbridge"
-            .encode_utf16()
-            .collect::<Vec<_>>();
-        let unc = windows_application_path_units(&unc);
-        assert_eq!(
-            String::from_utf16(&unc).unwrap(),
-            r"\\server\share\codexbridge"
-        );
-
-        let ordinary = r"C:\Temp\codexbridge".encode_utf16().collect::<Vec<_>>();
-        assert_eq!(windows_application_path_units(&ordinary), ordinary);
     }
 
     #[test]
@@ -2432,7 +2405,10 @@ mod tests {
             if shell.to_ascii_lowercase().starts_with("cmd") {
                 assert_eq!(args.last().map(String::as_str), Some("/c"));
             } else {
+                #[cfg(windows)]
                 assert_eq!(args.last().map(String::as_str), Some("-EncodedCommand"));
+                #[cfg(not(windows))]
+                assert_eq!(args.last().map(String::as_str), Some("-Command"));
             }
         }
     }
@@ -2467,18 +2443,26 @@ mod tests {
         assert_eq!(posix_args, ["-c"]);
         assert_eq!(posix_script, "echo ok");
 
-        let (_, powershell_args, powershell_encoded) =
+        let (_, powershell_args, powershell_payload) =
             shell_command(Some("powershell.exe"), "native-command").unwrap();
-        assert_eq!(
-            powershell_args,
-            ["-NoLogo", "-NoProfile", "-EncodedCommand"]
-        );
-        let powershell_bytes = STANDARD.decode(powershell_encoded).unwrap();
-        let powershell_utf16 = powershell_bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        let powershell_script = String::from_utf16(&powershell_utf16).unwrap();
+        #[cfg(windows)]
+        let powershell_script = {
+            assert_eq!(
+                powershell_args,
+                ["-NoLogo", "-NoProfile", "-EncodedCommand"]
+            );
+            let bytes = STANDARD.decode(powershell_payload).unwrap();
+            let utf16 = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            String::from_utf16(&utf16).unwrap()
+        };
+        #[cfg(not(windows))]
+        let powershell_script = {
+            assert_eq!(powershell_args, ["-NoLogo", "-NoProfile", "-Command"]);
+            powershell_payload
+        };
         assert!(powershell_script.contains("$LASTEXITCODE"));
 
         let (_, cmd_args, cmd_script) = shell_command(Some("cmd.exe"), "echo ok").unwrap();
@@ -2515,7 +2499,10 @@ mod tests {
         assert_eq!(shell_kind(&shell).as_str(), kind);
         match kind {
             "powershell" => {
-                assert_eq!(args.last().map(String::as_str), Some("-EncodedCommand"))
+                #[cfg(windows)]
+                assert_eq!(args.last().map(String::as_str), Some("-EncodedCommand"));
+                #[cfg(not(windows))]
+                assert_eq!(args.last().map(String::as_str), Some("-Command"));
             }
             "cmd" => assert_eq!(args.last().map(String::as_str), Some("/c")),
             _ => assert_eq!(args, ["-c"]),
