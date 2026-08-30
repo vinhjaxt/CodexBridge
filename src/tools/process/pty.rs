@@ -233,13 +233,22 @@ fn windows_pty_command_line(
 
     let command = command.as_std();
     let program = command.get_program().to_os_string();
-    let args = command.get_args().map(ToOwned::to_owned).collect();
     let is_cmd = Path::new(command.get_program())
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
         });
+    // `std::process::Command` does not expose which portion of its Windows
+    // command line came from `raw_arg()`, and that representation has changed
+    // across Rust releases. Do not reverse-engineer it through `get_args()`.
+    // The shell builder owns the cmd.exe contract, so rebuild only the stable
+    // switches here and append the command text exactly once as a raw tail.
+    let args = if is_cmd {
+        ["/d", "/s", "/c"].into_iter().map(OsString::from).collect()
+    } else {
+        command.get_args().map(ToOwned::to_owned).collect()
+    };
     let raw_arg = is_cmd.then(|| OsString::from(format!("\"{shell_command_text}\"")));
     WindowsPtyCommandLine {
         program,
@@ -369,7 +378,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_cmd_pty_conversion_preserves_raw_command_tail() {
-        use std::ffi::OsStr;
         use std::os::windows::process::CommandExt as _;
 
         let command_text = r#"echo ok & "C:\Program Files\tool.exe" --probe"#;
@@ -378,20 +386,16 @@ mod tests {
         command.args(["/d", "/s", "/c"]);
         command.as_std_mut().raw_arg(&expected_raw_arg);
 
-        let visible_args = command
-            .as_std()
-            .get_args()
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            visible_args,
-            [OsStr::new("/d"), OsStr::new("/s"), OsStr::new("/c")],
-            "std::process::Command must keep raw_arg outside get_args() for this regression to exercise the lossy PTY boundary"
-        );
-
         let converted = windows_pty_command_line(&command, command_text);
         assert_eq!(converted.program, command.as_std().get_program());
-        assert_eq!(converted.args, visible_args);
+        assert_eq!(
+            converted.args,
+            [
+                OsString::from("/d"),
+                OsString::from("/s"),
+                OsString::from("/c")
+            ]
+        );
         assert_eq!(converted.raw_arg, Some(OsString::from(expected_raw_arg)));
     }
 }
