@@ -109,8 +109,32 @@ jobs:
           $script = "Write-Output 'codexbridge-direct-stdout'; [Console]::Error.WriteLine('codexbridge-direct-stderr'); exit 0"
           $bytes = [Text.Encoding]::Unicode.GetBytes($script)
           $encoded = [Convert]::ToBase64String($bytes)
+          $directWatch = [Diagnostics.Stopwatch]::StartNew()
           & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
-          Write-Host "direct-powershell-exit=$LASTEXITCODE"
+          $directWatch.Stop()
+          Write-Host "direct-powershell-exit=$LASTEXITCODE elapsed_ms=$($directWatch.ElapsedMilliseconds)"
+
+          Write-Host '=== Isolated LOCALAPPDATA Windows PowerShell smoke ==='
+          $originalLocalAppData = $env:LOCALAPPDATA
+          $isolatedLocalAppData = Join-Path $env:TEMP ("codexbridge-powershell-diag-" + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $isolatedLocalAppData -Force | Out-Null
+          try {
+            $env:CODEXBRIDGE_DIAG_RESTORE_LOCALAPPDATA = $originalLocalAppData
+            $env:LOCALAPPDATA = $isolatedLocalAppData
+            $isolatedScript = "[Environment]::SetEnvironmentVariable('LOCALAPPDATA', `$env:CODEXBRIDGE_DIAG_RESTORE_LOCALAPPDATA, 'Process'); Write-Output 'codexbridge-isolated-cache-stdout'; [Console]::Error.WriteLine('codexbridge-isolated-cache-stderr'); exit 0"
+            $isolatedBytes = [Text.Encoding]::Unicode.GetBytes($isolatedScript)
+            $isolatedEncoded = [Convert]::ToBase64String($isolatedBytes)
+            $isolatedWatch = [Diagnostics.Stopwatch]::StartNew()
+            & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $isolatedEncoded
+            $isolatedWatch.Stop()
+            Write-Host "direct-isolated-powershell-exit=$LASTEXITCODE elapsed_ms=$($isolatedWatch.ElapsedMilliseconds)"
+            Get-ChildItem -Path $isolatedLocalAppData -Recurse -Force -ErrorAction SilentlyContinue |
+              Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
+          } finally {
+            $env:LOCALAPPDATA = $originalLocalAppData
+            Remove-Item Env:CODEXBRIDGE_DIAG_RESTORE_LOCALAPPDATA -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $isolatedLocalAppData -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
           Write-Host '=== Isolated CodexBridge regressions ==='
           $tests = @(

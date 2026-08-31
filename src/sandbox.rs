@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::OnceLock,
@@ -9,6 +9,8 @@ use std::{
 
 use serde::Serialize;
 use tokio::{io::AsyncReadExt, process::Command};
+#[cfg(windows)]
+use uuid::Uuid;
 
 #[cfg(windows)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -18,6 +20,10 @@ use crate::{
     error::{AppError, Result},
     project::ProjectContext,
 };
+
+const POWERSHELL_STARTUP_CACHE_ROOT_ENV: &str = "CODEXBRIDGE_POWERSHELL_STARTUP_CACHE_ROOT";
+const POWERSHELL_RESTORE_LOCALAPPDATA_ENV: &str = "CODEXBRIDGE_POWERSHELL_RESTORE_LOCALAPPDATA";
+const POWERSHELL_LOCALAPPDATA_PRESENT_ENV: &str = "CODEXBRIDGE_POWERSHELL_LOCALAPPDATA_PRESENT";
 
 #[derive(Debug, Clone, Copy)]
 pub enum PathOperation {
@@ -907,7 +913,7 @@ fn powershell_script(command_text: &str) -> String {
     // `$LASTEXITCODE` when that final command failed. Initializing `$LASTEXITCODE`
     // avoids reusing a value inherited from an earlier PowerShell session state.
     format!(
-        "$global:LASTEXITCODE = $null\n{command_text}\n$codexbridge_success = $?\n$codexbridge_exit_code = $LASTEXITCODE\nif ($codexbridge_success) {{ exit 0 }}\nif ($null -ne $codexbridge_exit_code) {{ exit $codexbridge_exit_code }}\nexit 1"
+        "if ($null -ne $env:{POWERSHELL_STARTUP_CACHE_ROOT_ENV}) {{\n$codexbridge_restore_localappdata = $env:{POWERSHELL_RESTORE_LOCALAPPDATA_ENV}\nif ($env:{POWERSHELL_LOCALAPPDATA_PRESENT_ENV} -eq '1') {{ [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $codexbridge_restore_localappdata, 'Process') }} else {{ [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $null, 'Process') }}\n[Environment]::SetEnvironmentVariable('{POWERSHELL_STARTUP_CACHE_ROOT_ENV}', $null, 'Process')\n[Environment]::SetEnvironmentVariable('{POWERSHELL_RESTORE_LOCALAPPDATA_ENV}', $null, 'Process')\n[Environment]::SetEnvironmentVariable('{POWERSHELL_LOCALAPPDATA_PRESENT_ENV}', $null, 'Process')\n}}\n$global:LASTEXITCODE = $null\n{command_text}\n$codexbridge_success = $?\n$codexbridge_exit_code = $LASTEXITCODE\nif ($codexbridge_success) {{ exit 0 }}\nif ($null -ne $codexbridge_exit_code) {{ exit $codexbridge_exit_code }}\nexit 1"
     )
 }
 
@@ -992,6 +998,72 @@ fn is_windows_powershell_5_1_executable(executable: &str) -> bool {
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("powershell.exe")
         })
+}
+
+fn command_environment_value(command: &Command, name: &str) -> Option<OsString> {
+    command.as_std().get_envs().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(OsStr::new(name))
+            .then(|| value.map(OsStr::to_os_string))
+            .flatten()
+    })
+}
+
+#[cfg(windows)]
+fn isolate_windows_powershell_startup_cache(command: &mut Command) -> Result<()> {
+    let original_local_app_data = command_environment_value(command, "LOCALAPPDATA");
+    let cache_root = std::env::temp_dir().join(format!(
+        "codexbridge-powershell-{}",
+        Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir(&cache_root).map_err(|error| {
+        AppError::new(
+            "SANDBOX_UNAVAILABLE",
+            format!("failed to create isolated PowerShell startup cache: {error}"),
+        )
+    })?;
+
+    command.env(POWERSHELL_STARTUP_CACHE_ROOT_ENV, &cache_root);
+    match original_local_app_data.as_ref() {
+        Some(value) => {
+            command.env(POWERSHELL_LOCALAPPDATA_PRESENT_ENV, "1");
+            command.env(POWERSHELL_RESTORE_LOCALAPPDATA_ENV, value);
+        }
+        None => {
+            command.env(POWERSHELL_LOCALAPPDATA_PRESENT_ENV, "0");
+            command.env_remove(POWERSHELL_RESTORE_LOCALAPPDATA_ENV);
+        }
+    }
+    // Windows PowerShell resolves StartupProfileData-NonInteractive from
+    // LOCALAPPDATA during process startup. Point only that startup phase at an
+    // invocation-private root; powershell_script() restores the intended value
+    // before the user command runs.
+    command.env("LOCALAPPDATA", &cache_root);
+    #[cfg(all(test, windows))]
+    if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "codexbridge-windows-powershell-cache startup-localappdata={cache_root:?}; restore-localappdata={original_local_app_data:?}"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) struct PowerShellStartupCacheGuard {
+    root: Option<PathBuf>,
+}
+
+impl Drop for PowerShellStartupCacheGuard {
+    fn drop(&mut self) {
+        if let Some(root) = self.root.take() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+pub(crate) fn powershell_startup_cache_guard(command: &Command) -> PowerShellStartupCacheGuard {
+    PowerShellStartupCacheGuard {
+        root: command_environment_value(command, POWERSHELL_STARTUP_CACHE_ROOT_ENV)
+            .map(PathBuf::from),
+    }
 }
 
 static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
@@ -1526,14 +1598,13 @@ fn finalize_process_command(
             "PSModulePath",
             format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules"),
         );
-        // Windows PowerShell 5.1 normally shares a per-user ModuleAnalysisCache
-        // under LOCALAPPDATA. That cache is populated for the parent's full
-        // PSModulePath, while the sanitized child deliberately has a much narrower
-        // module universe. Reusing the shared cache can make command discovery
-        // spend the whole exec deadline reconciling entries that are outside the
-        // sanitized path. Microsoft documents `nul` as the supported way to
-        // disable this file cache for a child process. Keep this scoped to legacy
-        // powershell.exe; pwsh.exe has a different module/cache model.
+        // Windows PowerShell 5.1 normally shares ModuleAnalysisCache state across
+        // processes. The sanitized child deliberately has a narrower module
+        // universe than its parent, so do not couple command discovery to cache
+        // entries produced for the parent's PSModulePath. Microsoft documents
+        // `nul` as the supported way to disable this file cache. This is separate
+        // from the StartupProfileData isolation applied after explicit env
+        // additions below. Keep both behaviors scoped to legacy powershell.exe.
         command.env("PSModuleAnalysisCachePath", "NUL");
     }
     if let Some(socket) = &config.container_socket {
@@ -1558,6 +1629,10 @@ fn finalize_process_command(
             ));
         }
         command.env(key, value);
+    }
+    #[cfg(windows)]
+    if windows_powershell_5_1 {
+        isolate_windows_powershell_startup_cache(&mut command)?;
     }
     process_limits(&mut command, timeout);
     command
@@ -1722,6 +1797,7 @@ async fn execute_prepared(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<ProcessResult> {
+    let _powershell_startup_cache_guard = powershell_startup_cache_guard(&command);
     #[cfg(all(test, windows))]
     if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
         eprintln!("codexbridge-windows-sandbox spawn-command={command:?}");
@@ -2315,7 +2391,20 @@ mod tests {
             assert_eq!(args.last().map(String::as_str), Some("-Command"));
             command_payload
         };
-        assert!(script.starts_with("$global:LASTEXITCODE = $null\n"));
+        assert!(script.starts_with(&format!(
+            "if ($null -ne $env:{POWERSHELL_STARTUP_CACHE_ROOT_ENV}) {{\n"
+        )));
+        let restore_position = script
+            .find("[Environment]::SetEnvironmentVariable('LOCALAPPDATA'")
+            .expect("LOCALAPPDATA restoration must be emitted");
+        let reset_position = script
+            .find("$global:LASTEXITCODE = $null")
+            .expect("LASTEXITCODE reset must be emitted");
+        let command_position = script
+            .find("native-command")
+            .expect("user command must be emitted");
+        assert!(restore_position < reset_position);
+        assert!(reset_position < command_position);
         assert!(script.contains("$codexbridge_success = $?"));
         assert!(script.contains("$codexbridge_exit_code = $LASTEXITCODE"));
         assert!(script.contains("if ($codexbridge_success) { exit 0 }"));
@@ -2771,7 +2860,8 @@ mod tests {
             "CODEXBRIDGE_ENV_FORWARDING_PROBE".to_owned(),
             "forwarded-exactly-42".to_owned(),
         );
-        assert!(build(valid.clone()).is_ok());
+        let valid_command = build(valid.clone()).unwrap();
+        drop(powershell_startup_cache_guard(&valid_command));
         #[cfg(windows)]
         {
             let command = build(valid.clone()).unwrap();
@@ -2790,6 +2880,38 @@ mod tests {
                     .flatten()
             });
             assert_eq!(analysis_cache.as_deref(), Some("NUL"));
+            let cache_root = command_environment_value(&command, POWERSHELL_STARTUP_CACHE_ROOT_ENV)
+                .expect("PowerShell startup cache root");
+            let cache_root = PathBuf::from(cache_root);
+            assert!(cache_root.starts_with(std::env::temp_dir()));
+            assert!(cache_root.is_dir());
+            assert_eq!(
+                command_environment_value(&command, "LOCALAPPDATA").as_deref(),
+                Some(cache_root.as_os_str())
+            );
+            match std::env::var_os("LOCALAPPDATA") {
+                Some(expected_local_app_data) => {
+                    assert_eq!(
+                        command_environment_value(&command, POWERSHELL_LOCALAPPDATA_PRESENT_ENV)
+                            .as_deref(),
+                        Some(OsStr::new("1"))
+                    );
+                    assert_eq!(
+                        command_environment_value(&command, POWERSHELL_RESTORE_LOCALAPPDATA_ENV)
+                            .as_deref(),
+                        Some(expected_local_app_data.as_os_str())
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        command_environment_value(&command, POWERSHELL_LOCALAPPDATA_PRESENT_ENV)
+                            .as_deref(),
+                        Some(OsStr::new("0"))
+                    );
+                }
+            }
+            drop(powershell_startup_cache_guard(&command));
+            assert!(!cache_root.exists());
         }
 
         let command_text = if cfg!(windows) {

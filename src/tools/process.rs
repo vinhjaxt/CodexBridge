@@ -37,8 +37,8 @@ use crate::{
     project::ProjectContext,
     request_context::ProjectRequestContext,
     sandbox::{
-        PathOperation, build_command_with_options_and_runtime_bind, invokes_direct_podman,
-        invokes_podman, invokes_sudo_podman,
+        PathOperation, PowerShellStartupCacheGuard, build_command_with_options_and_runtime_bind,
+        invokes_direct_podman, invokes_podman, invokes_sudo_podman, powershell_startup_cache_guard,
     },
 };
 
@@ -1175,12 +1175,14 @@ impl ProcessRegistry {
         if let Some(tracker) = podman_tracker.as_mut() {
             tracker.configure_command(&mut command, use_bwrap, &args.env);
         }
+        let powershell_cache_guard = powershell_startup_cache_guard(&command);
         if args.tty {
             return self
                 .start_pty(
                     project,
                     args,
                     command,
+                    powershell_cache_guard,
                     timeout,
                     registry_permit,
                     global_process_permit,
@@ -1255,6 +1257,7 @@ impl ProcessRegistry {
         tasks.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _task = TaskGuard(tasks);
+            let _powershell_cache_guard = powershell_cache_guard;
             let (status, forced_reason, mut wait_error) = tokio::select! {
                 wait = child.wait() => match wait {
                     Ok(status) => (Some(status), None, None),
@@ -1322,6 +1325,7 @@ impl ProcessRegistry {
         project: &ProjectContext,
         args: &ExecCommandArgs,
         command: tokio::process::Command,
+        powershell_cache_guard: PowerShellStartupCacheGuard,
         timeout: Duration,
         registry_permit: OwnedSemaphorePermit,
         global_process_permit: OwnedSemaphorePermit,
@@ -1383,6 +1387,7 @@ impl ProcessRegistry {
         tasks.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _task = TaskGuard(tasks);
+            let _powershell_cache_guard = powershell_cache_guard;
             let mut wait = tokio::task::spawn_blocking(move || wait_pty_process(child, pid));
             let (status, forced_reason, mut wait_error) = tokio::select! {
                 result = &mut wait => match result {
@@ -2742,6 +2747,7 @@ mod tests {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg("kill -TERM $$");
         command.current_dir(project_dir.path());
+        let powershell_cache_guard = powershell_startup_cache_guard(&command);
 
         let registry = ProcessRegistry::new(4, Duration::from_secs(60), 4096);
         let registry_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
@@ -2752,6 +2758,7 @@ mod tests {
                 &project,
                 &args,
                 command,
+                powershell_cache_guard,
                 Duration::from_secs(5),
                 registry_permit,
                 global_permit,
@@ -2876,6 +2883,7 @@ mod tests {
             args.shell.as_deref(),
         )
         .unwrap();
+        let powershell_cache_guard = powershell_startup_cache_guard(&command);
 
         let registry = ProcessRegistry::new(4, Duration::from_secs(60), 4096);
         let registry_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
@@ -2886,6 +2894,7 @@ mod tests {
                 &project,
                 &args,
                 command,
+                powershell_cache_guard,
                 Duration::from_secs(5),
                 registry_permit,
                 global_permit,
