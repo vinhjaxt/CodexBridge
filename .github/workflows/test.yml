@@ -114,8 +114,8 @@ jobs:
           $directWatch.Stop()
           Write-Host "direct-powershell-exit=$LASTEXITCODE elapsed_ms=$($directWatch.ElapsedMilliseconds)"
 
-          Write-Host '=== Sanitized Windows environment PowerShell A/B ==='
-          function Invoke-SanitizedPowerShellSmoke([bool] $CriticalIdentity) {
+          Write-Host '=== Sanitized Windows PowerShell module-bootstrap A/B ==='
+          function Invoke-SanitizedPowerShellSmoke([bool] $BootstrapModules) {
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
             $startInfo.FileName = (Get-Command powershell.exe).Source
             $startInfo.UseShellExecute = $false
@@ -129,16 +129,32 @@ jobs:
               'HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA','ProgramData',
               'ProgramFiles','ProgramFiles(x86)','ProgramW6432','SystemDrive','TEMP','TMP'
             )
-            if ($CriticalIdentity) {
-              $baseline += @('LOGONSERVER','USERDOMAIN','USERNAME')
-            }
             foreach ($name in $baseline) {
               $value = [Environment]::GetEnvironmentVariable($name)
               if (-not [string]::IsNullOrEmpty($value)) {
                 $startInfo.Environment[$name] = $value
               }
             }
-            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)) {
+            $payload = $script
+            if ($BootstrapModules) {
+              $bootstrap = @'
+          if ([string]::IsNullOrEmpty($PSHOME)) {
+            [Console]::Error.WriteLine('diagnostic: Windows PowerShell PSHOME is unavailable')
+            exit 1
+          }
+          try {
+            Import-Module -Name ([System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')) -ErrorAction Stop
+            Import-Module -Name ([System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop
+          } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+            exit 1
+          }
+          '@
+              $payload = "$bootstrap`n$script"
+            }
+            $payloadBytes = [Text.Encoding]::Unicode.GetBytes($payload)
+            $payloadEncoded = [Convert]::ToBase64String($payloadBytes)
+            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $payloadEncoded)) {
               [void] $startInfo.ArgumentList.Add($argument)
             }
             $process = [Diagnostics.Process]::new()
@@ -156,7 +172,7 @@ jobs:
             $watch.Stop()
             $stdout = $stdoutTask.GetAwaiter().GetResult()
             $stderr = $stderrTask.GetAwaiter().GetResult()
-            $label = if ($CriticalIdentity) { 'with-critical-identity' } else { 'without-critical-identity' }
+            $label = if ($BootstrapModules) { 'with-module-bootstrap' } else { 'without-module-bootstrap' }
             Write-Host ("sanitized-{0} exited={1} exit={2} elapsed_ms={3} stdout={4} stderr={5}" -f $label, $exited, $process.ExitCode, $watch.ElapsedMilliseconds, ($stdout | ConvertTo-Json -Compress), ($stderr | ConvertTo-Json -Compress))
             $process.Dispose()
           }

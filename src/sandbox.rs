@@ -791,7 +791,7 @@ fn shell_command(
                         "-NonInteractive".to_owned(),
                         "-EncodedCommand".to_owned(),
                     ],
-                    powershell_encoded_command(command_text),
+                    powershell_encoded_command(&shell, command_text),
                 )
             }
             #[cfg(not(windows))]
@@ -912,8 +912,45 @@ fn powershell_script(command_text: &str) -> String {
 }
 
 #[cfg(windows)]
-fn powershell_encoded_command(command_text: &str) -> String {
-    let script = powershell_script(command_text);
+fn is_windows_powershell_desktop_executable(shell: &str) -> bool {
+    shell
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|base| base.eq_ignore_ascii_case("powershell.exe"))
+}
+
+#[cfg(windows)]
+fn windows_powershell_desktop_script(command_text: &str) -> String {
+    // Windows PowerShell 5.1 leaves Microsoft.PowerShell.Management and
+    // Microsoft.PowerShell.Utility to module auto-loading. PowerShell documents
+    // that an intermediate process can make 5.1 see incompatible PowerShell 7
+    // copies of these shared modules; our native CI failures likewise begin at
+    // the first Utility cmdlet while native executables still work. Bypass module
+    // discovery for these built-ins by importing their manifests from this
+    // process's own PSHOME, matching the hardened bootstrap used by established
+    // Windows CI agents. Import-Module belongs to Microsoft.PowerShell.Core,
+    // which is available before module auto-loading.
+    let bootstrap = r#"if ([string]::IsNullOrEmpty($PSHOME)) {
+[Console]::Error.WriteLine('CodexBridge: Windows PowerShell PSHOME is unavailable')
+exit 1
+}
+try {
+Import-Module -Name ([System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')) -ErrorAction Stop
+Import-Module -Name ([System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop
+} catch {
+[Console]::Error.WriteLine($_.Exception.Message)
+exit 1
+}"#;
+    powershell_script(&format!("{bootstrap}\n{command_text}"))
+}
+
+#[cfg(windows)]
+fn powershell_encoded_command(shell: &str, command_text: &str) -> String {
+    let script = if is_windows_powershell_desktop_executable(shell) {
+        windows_powershell_desktop_script(command_text)
+    } else {
+        powershell_script(command_text)
+    };
     let mut bytes = Vec::with_capacity(script.len().saturating_mul(2));
     for unit in script.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
@@ -953,13 +990,6 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
             "USERPROFILE",
             "HOMEDRIVE",
             "HOMEPATH",
-            // libuv treats these logon identity variables as part of the
-            // required Windows child-process environment when an explicit
-            // environment block is supplied. Rust's env_clear() does not
-            // restore them automatically.
-            "LOGONSERVER",
-            "USERDOMAIN",
-            "USERNAME",
             "LOCALAPPDATA",
             "APPDATA",
             "ProgramData",
@@ -2292,6 +2322,41 @@ mod tests {
         assert!(!script.starts_with("& {"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_desktop_preloads_builtin_modules_before_user_command() {
+        let decode = |payload: String| {
+            let bytes = STANDARD.decode(payload).unwrap();
+            let (chunks, remainder) = bytes.as_chunks::<2>();
+            assert!(remainder.is_empty());
+            let utf16 = chunks
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
+                .collect::<Vec<_>>();
+            String::from_utf16(&utf16).unwrap()
+        };
+
+        let (_, _, desktop_payload) =
+            shell_command(Some("powershell.exe"), "codexbridge-user-command").unwrap();
+        let desktop_script = decode(desktop_payload);
+        let management =
+            "Modules\\Microsoft.PowerShell.Management\\Microsoft.PowerShell.Management.psd1";
+        let utility = "Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1";
+        let management_index = desktop_script.find(management).unwrap();
+        let utility_index = desktop_script.find(utility).unwrap();
+        let command_index = desktop_script.find("codexbridge-user-command").unwrap();
+        assert!(management_index < command_index);
+        assert!(utility_index < command_index);
+        assert!(desktop_script.contains("[System.IO.Path]::Combine($PSHOME"));
+        assert!(desktop_script.contains("Import-Module -Name"));
+
+        let (_, _, core_payload) =
+            shell_command(Some("pwsh.exe"), "codexbridge-user-command").unwrap();
+        let core_script = decode(core_payload);
+        assert!(!core_script.contains(management));
+        assert!(!core_script.contains(utility));
+    }
+
     #[test]
     fn windows_shell_resolution_canonicalizes_bare_names_and_preserves_explicit_paths() {
         let comspec = r"D:\Custom Windows\System32\cmd.exe";
@@ -2736,21 +2801,6 @@ mod tests {
             "CODEXBRIDGE_ENV_FORWARDING_PROBE".to_owned(),
             "forwarded-exactly-42".to_owned(),
         );
-        #[cfg(windows)]
-        {
-            let valid_command = build(valid.clone()).unwrap();
-            for name in ["LOGONSERVER", "USERDOMAIN", "USERNAME"] {
-                if let Some(expected) = std::env::var_os(name).filter(|value| !value.is_empty()) {
-                    let actual = valid_command.as_std().get_envs().find_map(|(key, value)| {
-                        key.eq_ignore_ascii_case(OsStr::new(name))
-                            .then(|| value.map(OsStr::to_os_string))
-                            .flatten()
-                    });
-                    assert_eq!(actual.as_deref(), Some(expected.as_os_str()), "{name}");
-                }
-            }
-        }
-        #[cfg(not(windows))]
         assert!(build(valid.clone()).is_ok());
 
         let command_text = if cfg!(windows) {
@@ -2801,9 +2851,6 @@ mod tests {
                 "USERPROFILE",
                 "HOMEDRIVE",
                 "HOMEPATH",
-                "LOGONSERVER",
-                "USERDOMAIN",
-                "USERNAME",
                 "LOCALAPPDATA",
                 "APPDATA",
                 "ProgramData",
