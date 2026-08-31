@@ -933,6 +933,17 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         if let Ok(comspec) = std::env::var("ComSpec") {
             command.env("ComSpec", comspec);
         }
+        for name in [
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "APPDATA",
+        ] {
+            if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+                command.env(name, value);
+            }
+        }
         command.env("TEMP", &temporary);
         command.env("TMP", &temporary);
     } else {
@@ -951,6 +962,34 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         command.env("TMPDIR", "/tmp");
         command.env("LANG", "C.UTF-8");
     }
+}
+
+#[cfg(windows)]
+fn windows_process_current_dir(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if !wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
+        return path.to_path_buf();
+    }
+
+    let rest = &wide[4..];
+    let is_unc = rest.len() >= 4
+        && matches!(rest[0], value if value == b'U' as u16 || value == b'u' as u16)
+        && matches!(rest[1], value if value == b'N' as u16 || value == b'n' as u16)
+        && matches!(rest[2], value if value == b'C' as u16 || value == b'c' as u16)
+        && rest[3] == BACKSLASH;
+    let normalized = if is_unc {
+        let mut value = Vec::with_capacity(rest.len().saturating_sub(2));
+        value.extend_from_slice(&[BACKSLASH, BACKSLASH]);
+        value.extend_from_slice(&rest[4..]);
+        value
+    } else {
+        rest.to_vec()
+    };
+    PathBuf::from(std::ffi::OsString::from_wide(&normalized))
 }
 
 static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
@@ -1576,6 +1615,9 @@ pub(crate) fn build_command_with_options_and_runtime_bind(
         let mut command = Command::new(&shell_bin);
         command.args(&shell_args);
         append_shell_command_text(&mut command, kind, &shell_text);
+        #[cfg(windows)]
+        command.current_dir(windows_process_current_dir(workdir));
+        #[cfg(not(windows))]
         command.current_dir(workdir);
         command
     } else {
