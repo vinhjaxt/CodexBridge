@@ -965,13 +965,6 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
                 command.env(name, value);
             }
         }
-        // Windows PowerShell 5.1 reads and asynchronously updates its module-analysis
-        // cache during startup/command discovery. Bridge can launch several shell
-        // processes concurrently, so keep those short-lived sessions independent of
-        // the shared per-user cache. Microsoft documents NUL as the supported way to
-        // disable this cache for child PowerShell processes.
-        command.env("PSModuleAnalysisCachePath", "NUL");
-        command.env("PSDisableModuleAnalysisCacheCleanup", "1");
         command.env("TEMP", &temporary);
         command.env("TMP", &temporary);
     } else {
