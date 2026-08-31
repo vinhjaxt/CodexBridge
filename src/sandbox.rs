@@ -1526,6 +1526,15 @@ fn finalize_process_command(
             "PSModulePath",
             format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules"),
         );
+        // Windows PowerShell 5.1 normally shares a per-user ModuleAnalysisCache
+        // under LOCALAPPDATA. That cache is populated for the parent's full
+        // PSModulePath, while the sanitized child deliberately has a much narrower
+        // module universe. Reusing the shared cache can make command discovery
+        // spend the whole exec deadline reconciling entries that are outside the
+        // sanitized path. Microsoft documents `nul` as the supported way to
+        // disable this file cache for a child process. Keep this scoped to legacy
+        // powershell.exe; pwsh.exe has a different module/cache model.
+        command.env("PSModuleAnalysisCachePath", "NUL");
     }
     if let Some(socket) = &config.container_socket {
         let uri = if use_bwrap {
@@ -2775,6 +2784,12 @@ mod tests {
                     .flatten()
             });
             assert_eq!(actual.as_deref(), Some(expected.as_str()));
+            let analysis_cache = command.as_std().get_envs().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("PSModuleAnalysisCachePath")
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            });
+            assert_eq!(analysis_cache.as_deref(), Some("NUL"));
         }
 
         let command_text = if cfg!(windows) {
