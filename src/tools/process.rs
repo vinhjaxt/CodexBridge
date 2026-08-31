@@ -2188,8 +2188,30 @@ mod tests {
     fn assert_windows_command_success(session: &Arc<InteractiveSession>) {
         assert_windows_exit_success(session);
         let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
-        assert!(output.contains("codexbridge-hidden-stdout"), "{output:?}");
-        assert!(output.contains("codexbridge-hidden-stderr"), "{output:?}");
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "codexbridge-hidden-stdout"),
+            "stdout marker was not retained as stdout: {output:?}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "[stderr] codexbridge-hidden-stderr"),
+            "stderr marker was not retained with stderr provenance: {output:?}"
+        );
+        assert!(
+            !output
+                .lines()
+                .any(|line| line == "[stderr] codexbridge-hidden-stdout"),
+            "stdout marker was incorrectly routed through stderr: {output:?}"
+        );
+        assert!(
+            !output
+                .lines()
+                .any(|line| line == "codexbridge-hidden-stderr"),
+            "stderr marker lost its stderr provenance: {output:?}"
+        );
     }
 
     #[cfg(windows)]

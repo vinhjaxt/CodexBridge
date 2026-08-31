@@ -72,20 +72,34 @@ fn capability_writes_reject_symlinked_parent_directories() {
 #[test]
 fn capability_copy_and_move_reject_parent_traversal() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("source.txt"), "source").unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("source.txt"), "source").unwrap();
     let resolver = SecurePathResolver;
 
-    assert!(
-        resolver
-            .copy_file_secure(temp.path(), "source.txt", "../copy.txt", 1024)
-            .is_err()
+    let copy_error = resolver
+        .copy_file_secure(&project, "source.txt", "../copy.txt", 1024)
+        .unwrap_err();
+    assert_eq!(
+        copy_error.code(),
+        "PATH_OUTSIDE_WORKSPACE",
+        "copy traversal returned unexpected error: {copy_error}"
     );
-    assert!(
-        resolver
-            .move_path_secure(temp.path(), "source.txt", "../move.txt")
-            .is_err()
+    assert!(!temp.path().join("copy.txt").exists());
+
+    let move_error = resolver
+        .move_path_secure(&project, "source.txt", "../move.txt")
+        .unwrap_err();
+    assert_eq!(
+        move_error.code(),
+        "PATH_OUTSIDE_WORKSPACE",
+        "move traversal returned unexpected error: {move_error}"
     );
-    assert!(temp.path().join("source.txt").is_file());
+    assert!(!temp.path().join("move.txt").exists());
+    assert_eq!(
+        std::fs::read(project.join("source.txt")).unwrap(),
+        b"source"
+    );
 }
 
 #[cfg(windows)]

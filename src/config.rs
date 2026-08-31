@@ -1053,6 +1053,7 @@ mod tests {
                 environment.insert(name.to_owned(), value.to_owned());
             }
             let error = ConfigBuilder::from_map(environment).build().unwrap_err();
+            assert_eq!(error.code(), "CONFIG_ERROR", "{expected}");
             assert!(error.message().contains(expected), "{}", error.message());
         }
     }
@@ -1063,6 +1064,7 @@ mod tests {
         environment.insert("EXEC_DEFAULT_TIMEOUT_MS".to_owned(), "2000".to_owned());
         environment.insert("EXEC_MAX_TIMEOUT_MS".to_owned(), "1000".to_owned());
         let error = ConfigBuilder::from_map(environment).build().unwrap_err();
+        assert_eq!(error.code(), "CONFIG_ERROR");
         assert!(error.message().contains("EXEC_DEFAULT_TIMEOUT_MS"));
     }
 
