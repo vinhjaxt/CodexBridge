@@ -91,6 +91,8 @@ fn capability_copy_and_move_reject_parent_traversal() {
 #[cfg(windows)]
 #[test]
 fn windows_junction_components_cannot_escape_capability_paths() {
+    use std::os::windows::process::CommandExt as _;
+
     let temp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
@@ -98,12 +100,17 @@ fn windows_junction_components_cannot_escape_capability_paths() {
     let system_root = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    let command = format!("mklink /J linked \"{}\"", outside.path().display());
-    let output = std::process::Command::new(system_root.join("System32/cmd.exe"))
-        .args(["/d", "/s", "/c", &command])
-        .current_dir(temp.path())
-        .output()
-        .unwrap();
+    let command = format!("mklink /J \"linked\" \"{}\"", outside.path().display());
+    let mut cmd = std::process::Command::new(system_root.join("System32/cmd.exe"));
+    cmd.args(["/d", "/s", "/c"])
+        // cmd.exe does not use the standard Windows argv parser. In particular,
+        // `/s /c` expects the complete command string to be surrounded by one
+        // extra pair of quotes. Rust's normal `.arg()` escaping can backslash-
+        // escape the embedded path quotes and make `mklink` report a syntax
+        // error. Match the production cmd path and pass the command tail verbatim.
+        .raw_arg(format!("\"{command}\""))
+        .current_dir(temp.path());
+    let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
         "failed to create Windows junction: stdout={} stderr={}",
