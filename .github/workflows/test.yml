@@ -110,12 +110,12 @@ jobs:
           $bytes = [Text.Encoding]::Unicode.GetBytes($script)
           $encoded = [Convert]::ToBase64String($bytes)
           $directWatch = [Diagnostics.Stopwatch]::StartNew()
-          & powershell.exe -NoLogo -NoProfile -InputFormat Text -OutputFormat Text -NonInteractive -EncodedCommand $encoded
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
           $directWatch.Stop()
           Write-Host "direct-powershell-exit=$LASTEXITCODE elapsed_ms=$($directWatch.ElapsedMilliseconds)"
 
-          Write-Host '=== Redirected stdio PowerShell A/B ==='
-          function Invoke-RedirectedPowerShellSmoke([bool] $TextFormats) {
+          Write-Host '=== Sanitized Windows environment PowerShell A/B ==='
+          function Invoke-SanitizedPowerShellSmoke([bool] $CriticalIdentity) {
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
             $startInfo.FileName = (Get-Command powershell.exe).Source
             $startInfo.UseShellExecute = $false
@@ -123,15 +123,22 @@ jobs:
             $startInfo.RedirectStandardInput = $true
             $startInfo.RedirectStandardOutput = $true
             $startInfo.RedirectStandardError = $true
-            foreach ($argument in @('-NoLogo', '-NoProfile')) {
-              [void] $startInfo.ArgumentList.Add($argument)
+            $startInfo.Environment.Clear()
+            $baseline = @(
+              'PATH','PATHEXT','SystemRoot','WINDIR','ComSpec','USERPROFILE',
+              'HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA','ProgramData',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','SystemDrive','TEMP','TMP'
+            )
+            if ($CriticalIdentity) {
+              $baseline += @('LOGONSERVER','USERDOMAIN','USERNAME')
             }
-            if ($TextFormats) {
-              foreach ($argument in @('-InputFormat', 'Text', '-OutputFormat', 'Text')) {
-                [void] $startInfo.ArgumentList.Add($argument)
+            foreach ($name in $baseline) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if (-not [string]::IsNullOrEmpty($value)) {
+                $startInfo.Environment[$name] = $value
               }
             }
-            foreach ($argument in @('-NonInteractive', '-EncodedCommand', $encoded)) {
+            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)) {
               [void] $startInfo.ArgumentList.Add($argument)
             }
             $process = [Diagnostics.Process]::new()
@@ -149,12 +156,12 @@ jobs:
             $watch.Stop()
             $stdout = $stdoutTask.GetAwaiter().GetResult()
             $stderr = $stderrTask.GetAwaiter().GetResult()
-            $label = if ($TextFormats) { 'text-formats' } else { 'default-formats' }
-            Write-Host ("redirected-{0} exited={1} exit={2} elapsed_ms={3} stdout={4} stderr={5}" -f $label, $exited, $process.ExitCode, $watch.ElapsedMilliseconds, ($stdout | ConvertTo-Json -Compress), ($stderr | ConvertTo-Json -Compress))
+            $label = if ($CriticalIdentity) { 'with-critical-identity' } else { 'without-critical-identity' }
+            Write-Host ("sanitized-{0} exited={1} exit={2} elapsed_ms={3} stdout={4} stderr={5}" -f $label, $exited, $process.ExitCode, $watch.ElapsedMilliseconds, ($stdout | ConvertTo-Json -Compress), ($stderr | ConvertTo-Json -Compress))
             $process.Dispose()
           }
-          Invoke-RedirectedPowerShellSmoke $false
-          Invoke-RedirectedPowerShellSmoke $true
+          Invoke-SanitizedPowerShellSmoke $false
+          Invoke-SanitizedPowerShellSmoke $true
 
           Write-Host '=== Isolated CodexBridge regressions ==='
           $tests = @(

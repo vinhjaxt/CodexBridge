@@ -788,10 +788,6 @@ fn shell_command(
                     vec![
                         "-NoLogo".to_owned(),
                         "-NoProfile".to_owned(),
-                        "-InputFormat".to_owned(),
-                        "Text".to_owned(),
-                        "-OutputFormat".to_owned(),
-                        "Text".to_owned(),
                         "-NonInteractive".to_owned(),
                         "-EncodedCommand".to_owned(),
                     ],
@@ -957,6 +953,13 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
             "USERPROFILE",
             "HOMEDRIVE",
             "HOMEPATH",
+            // libuv treats these logon identity variables as part of the
+            // required Windows child-process environment when an explicit
+            // environment block is supplied. Rust's env_clear() does not
+            // restore them automatically.
+            "LOGONSERVER",
+            "USERDOMAIN",
+            "USERNAME",
             "LOCALAPPDATA",
             "APPDATA",
             "ProgramData",
@@ -2507,10 +2510,6 @@ mod tests {
                 [
                     "-NoLogo",
                     "-NoProfile",
-                    "-InputFormat",
-                    "Text",
-                    "-OutputFormat",
-                    "Text",
                     "-NonInteractive",
                     "-EncodedCommand"
                 ]
@@ -2737,6 +2736,21 @@ mod tests {
             "CODEXBRIDGE_ENV_FORWARDING_PROBE".to_owned(),
             "forwarded-exactly-42".to_owned(),
         );
+        #[cfg(windows)]
+        {
+            let valid_command = build(valid.clone()).unwrap();
+            for name in ["LOGONSERVER", "USERDOMAIN", "USERNAME"] {
+                if let Some(expected) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+                    let actual = valid_command.as_std().get_envs().find_map(|(key, value)| {
+                        key.eq_ignore_ascii_case(OsStr::new(name))
+                            .then(|| value.map(OsStr::to_os_string))
+                            .flatten()
+                    });
+                    assert_eq!(actual.as_deref(), Some(expected.as_os_str()), "{name}");
+                }
+            }
+        }
+        #[cfg(not(windows))]
         assert!(build(valid.clone()).is_ok());
 
         let command_text = if cfg!(windows) {
@@ -2787,6 +2801,9 @@ mod tests {
                 "USERPROFILE",
                 "HOMEDRIVE",
                 "HOMEPATH",
+                "LOGONSERVER",
+                "USERDOMAIN",
+                "USERNAME",
                 "LOCALAPPDATA",
                 "APPDATA",
                 "ProgramData",
