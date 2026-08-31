@@ -187,6 +187,8 @@ mod tests {
             "apply_patch",
             "exec_command",
             "write_stdin",
+            "still running, keep polling that session until completion_reason is terminal",
+            "Never leave a live long-running command behind",
             "skills_list",
             "skills_read",
             "update_plan",
