@@ -91,31 +91,21 @@ fn capability_copy_and_move_reject_parent_traversal() {
 #[cfg(windows)]
 #[test]
 fn windows_junction_components_cannot_escape_capability_paths() {
-    use std::os::windows::process::CommandExt as _;
-
     let temp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
-    let system_root = std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    let command = format!("mklink /J \"linked\" \"{}\"", outside.path().display());
-    let mut cmd = std::process::Command::new(system_root.join("System32/cmd.exe"));
-    cmd.args(["/d", "/s", "/c"])
-        // cmd.exe does not use the standard Windows argv parser. In particular,
-        // Rust's normal `.arg()` escaping can backslash-escape the embedded path
-        // quotes. This command starts with the unquoted `mklink` token, so adding
-        // another outer quote pair is also wrong: cmd.exe can reparse the embedded
-        // quoted arguments. Pass this trusted fixture command verbatim.
-        .raw_arg(&command)
-        .current_dir(temp.path());
-    let output = cmd.output().unwrap();
+    // Build the fixture through the reparse-point API rather than cmd.exe/mklink.
+    // Rust paths can use Win32 verbatim syntax (`\\?\`), which is not a stable
+    // command-line input contract for external applications. The junction crate
+    // normalizes the target, strips a verbatim prefix when present, and writes an
+    // IO_REPARSE_TAG_MOUNT_POINT directly, so this test exercises the resolver
+    // rather than shell quoting or mklink path parsing.
+    let linked = temp.path().join("linked");
+    junction::create(outside.path(), &linked).unwrap();
     assert!(
-        output.status.success(),
-        "failed to create Windows junction: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        junction::exists(&linked).unwrap(),
+        "fixture is not a junction"
     );
 
     let resolver = SecurePathResolver;
