@@ -931,8 +931,39 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         command.env("PATH", path);
         command.env("SystemRoot", &system_root);
         command.env("WINDIR", &system_root);
-        if let Ok(comspec) = std::env::var("ComSpec") {
-            command.env("ComSpec", comspec);
+        let comspec = std::env::var("ComSpec")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!(r"{system_root}\System32\cmd.exe"));
+        command.env("ComSpec", comspec);
+        // `env_clear()` must not erase the Windows process contract that
+        // PowerShell itself relies on. In particular, PATHEXT determines whether
+        // `.exe`/`.cmd` files are launched as synchronous native commands. Without
+        // it, PowerShell can route a batch file through a file association/new
+        // console instead, disconnecting the child from our pipes and exit status.
+        // The user/profile paths are also used to initialize `$HOME`, PSModulePath,
+        // and other Windows PowerShell 5.1 startup state. Keep this allowlist narrow
+        // rather than inheriting the complete (potentially secret-bearing) parent
+        // environment.
+        let pathext = std::env::var_os("PATHEXT")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        command.env("PATHEXT", pathext);
+        for name in [
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "ProgramData",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "SystemDrive",
+        ] {
+            if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+                command.env(name, value);
+            }
         }
         // Windows PowerShell 5.1 reads and asynchronously updates its module-analysis
         // cache during startup/command discovery. Bridge can launch several shell

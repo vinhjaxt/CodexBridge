@@ -158,6 +158,18 @@ fn effective_exec_close_stdin(args: &ExecCommandArgs) -> AppResult<bool> {
     Ok(super::extension_arg::<bool>(&args.extensions, "close_stdin")?.unwrap_or(false))
 }
 
+fn exec_requires_stdin_pipe(args: &ExecCommandArgs) -> AppResult<bool> {
+    // A TTY owns its input through the PTY master. For non-TTY one-shot commands
+    // with no initial input and close_stdin=true, create the process with stdin
+    // already disconnected instead of briefly giving Windows PowerShell a live
+    // pipe and racing to close it after spawn. Commands that may receive later
+    // write_stdin calls, or that need an initial payload, still require a pipe.
+    if args.tty {
+        return Ok(true);
+    }
+    Ok(effective_exec_stdin(args)?.is_some() || !effective_exec_close_stdin(args)?)
+}
+
 fn effective_since_output_offset(args: &WriteStdinArgs) -> AppResult<Option<usize>> {
     if args.since_output_offset.is_some() {
         return Ok(args.since_output_offset);
@@ -1148,11 +1160,12 @@ impl ProcessRegistry {
         let runtime_bind = podman_tracker
             .as_ref()
             .map(PodmanExecutionTracker::runtime_bind);
+        let stdin_pipe = exec_requires_stdin_pipe(args)?;
         let (mut command, use_bwrap) = build_command_with_options_and_runtime_bind(
             config,
             project,
             &args.command,
-            true,
+            stdin_pipe,
             timeout,
             &args.env,
             &workdir,
@@ -2032,9 +2045,9 @@ mod tests {
             .start(config, project, args, global_permit, project_permit)
             .await
             .unwrap();
-        // `ProcessRegistry::start` only owns process creation. The public
-        // `exec_command` handler applies one-shot stdin/EOF options after start,
-        // so mirror that part of the production path in this test helper.
+        // `ProcessRegistry::start` chooses whether stdin must be piped at spawn.
+        // The public `exec_command` handler still writes any initial payload and
+        // closes a remaining pipe after start, so mirror that part here.
         if let Some(stdin) = effective_exec_stdin(args).unwrap() {
             session.write_input(stdin.into_bytes()).await.unwrap();
         }
@@ -3936,6 +3949,38 @@ mod tests {
         );
         assert_eq!(effective_wait_for_exit_ms(&typed_stdin).unwrap(), Some(700));
         assert!(effective_write_close_stdin(&typed_stdin).unwrap());
+    }
+
+    #[test]
+    fn exec_stdin_pipe_requirement_matches_one_shot_contract() {
+        let one_shot: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"true",
+            "close_stdin":true
+        }))
+        .unwrap();
+        assert!(!exec_requires_stdin_pipe(&one_shot).unwrap());
+
+        let one_shot_with_input: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "stdin":"payload",
+            "close_stdin":true
+        }))
+        .unwrap();
+        assert!(exec_requires_stdin_pipe(&one_shot_with_input).unwrap());
+
+        let reusable: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat"
+        }))
+        .unwrap();
+        assert!(exec_requires_stdin_pipe(&reusable).unwrap());
+
+        let tty_one_shot: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "tty":true,
+            "close_stdin":true
+        }))
+        .unwrap();
+        assert!(exec_requires_stdin_pipe(&tty_one_shot).unwrap());
     }
 
     #[test]
