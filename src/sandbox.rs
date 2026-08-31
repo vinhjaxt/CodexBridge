@@ -788,6 +788,7 @@ fn shell_command(
                     vec![
                         "-NoLogo".to_owned(),
                         "-NoProfile".to_owned(),
+                        "-NonInteractive".to_owned(),
                         "-EncodedCommand".to_owned(),
                     ],
                     powershell_encoded_command(command_text),
@@ -906,7 +907,7 @@ fn powershell_script(command_text: &str) -> String {
     // `$LASTEXITCODE` when that final command failed. Initializing `$LASTEXITCODE`
     // avoids reusing a value inherited from an earlier PowerShell session state.
     format!(
-        "$global:LASTEXITCODE = $null\n{command_text}\nif ($?) {{ exit 0 }}\nif ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}\nexit 1"
+        "$global:LASTEXITCODE = $null\n{command_text}\n$codexbridge_success = $?\n$codexbridge_exit_code = $LASTEXITCODE\nif ($codexbridge_success) {{ exit 0 }}\nif ($null -ne $codexbridge_exit_code) {{ exit $codexbridge_exit_code }}\nexit 1"
     )
 }
 
@@ -933,17 +934,13 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         if let Ok(comspec) = std::env::var("ComSpec") {
             command.env("ComSpec", comspec);
         }
-        for name in [
-            "USERPROFILE",
-            "HOMEDRIVE",
-            "HOMEPATH",
-            "LOCALAPPDATA",
-            "APPDATA",
-        ] {
-            if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
-                command.env(name, value);
-            }
-        }
+        // Windows PowerShell 5.1 reads and asynchronously updates its module-analysis
+        // cache during startup/command discovery. Bridge can launch several shell
+        // processes concurrently, so keep those short-lived sessions independent of
+        // the shared per-user cache. Microsoft documents NUL as the supported way to
+        // disable this cache for child PowerShell processes.
+        command.env("PSModuleAnalysisCachePath", "NUL");
+        command.env("PSDisableModuleAnalysisCacheCleanup", "1");
         command.env("TEMP", &temporary);
         command.env("TMP", &temporary);
     } else {
@@ -962,34 +959,6 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         command.env("TMPDIR", "/tmp");
         command.env("LANG", "C.UTF-8");
     }
-}
-
-#[cfg(windows)]
-fn windows_process_current_dir(path: &Path) -> PathBuf {
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-
-    const BACKSLASH: u16 = b'\\' as u16;
-    const QUESTION: u16 = b'?' as u16;
-    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if !wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]) {
-        return path.to_path_buf();
-    }
-
-    let rest = &wide[4..];
-    let is_unc = rest.len() >= 4
-        && matches!(rest[0], value if value == b'U' as u16 || value == b'u' as u16)
-        && matches!(rest[1], value if value == b'N' as u16 || value == b'n' as u16)
-        && matches!(rest[2], value if value == b'C' as u16 || value == b'c' as u16)
-        && rest[3] == BACKSLASH;
-    let normalized = if is_unc {
-        let mut value = Vec::with_capacity(rest.len().saturating_sub(2));
-        value.extend_from_slice(&[BACKSLASH, BACKSLASH]);
-        value.extend_from_slice(&rest[4..]);
-        value
-    } else {
-        rest.to_vec()
-    };
-    PathBuf::from(std::ffi::OsString::from_wide(&normalized))
 }
 
 static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
@@ -1296,6 +1265,7 @@ pub(crate) fn default_exec_shell(config: &Config) -> (String, &'static str, Vec<
                 vec![
                     "-NoLogo".to_owned(),
                     "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
                     "-EncodedCommand".to_owned(),
                 ]
             }
@@ -1615,9 +1585,6 @@ pub(crate) fn build_command_with_options_and_runtime_bind(
         let mut command = Command::new(&shell_bin);
         command.args(&shell_args);
         append_shell_command_text(&mut command, kind, &shell_text);
-        #[cfg(windows)]
-        command.current_dir(windows_process_current_dir(workdir));
-        #[cfg(not(windows))]
         command.current_dir(workdir);
         command
     } else {
@@ -2279,9 +2246,13 @@ mod tests {
             command_payload
         };
         assert!(script.starts_with("$global:LASTEXITCODE = $null\n"));
-        assert!(script.contains("$LASTEXITCODE"));
-        assert!(script.contains("if ($?) { exit 0 }"));
-        assert!(script.contains("if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"));
+        assert!(script.contains("$codexbridge_success = $?"));
+        assert!(script.contains("$codexbridge_exit_code = $LASTEXITCODE"));
+        assert!(script.contains("if ($codexbridge_success) { exit 0 }"));
+        assert!(
+            script
+                .contains("if ($null -ne $codexbridge_exit_code) { exit $codexbridge_exit_code }")
+        );
         assert!(script.ends_with("\nexit 1"));
         assert!(!script.starts_with("& {"));
     }
@@ -2351,7 +2322,15 @@ mod tests {
         assert_eq!(default_shell(), "powershell.exe");
         let (shell, args, _) = shell_command(None, "echo ok").unwrap();
         assert_eq!(shell, "powershell.exe");
-        assert_eq!(args, ["-NoLogo", "-NoProfile", "-EncodedCommand"]);
+        assert_eq!(
+            args,
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand"
+            ]
+        );
     }
 
     #[cfg(windows)]
@@ -2493,7 +2472,12 @@ mod tests {
         let powershell_script = {
             assert_eq!(
                 powershell_args,
-                ["-NoLogo", "-NoProfile", "-EncodedCommand"]
+                [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand"
+                ]
             );
             let bytes = STANDARD.decode(powershell_payload).unwrap();
             let (chunks, remainder) = bytes.as_chunks::<2>();
