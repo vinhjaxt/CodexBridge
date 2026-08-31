@@ -207,8 +207,8 @@ mod tests {
             "multiple rounds of tool calls",
             "inspect -> reason over the evidence -> act with a tool -> inspect the result -> adjust -> verify",
             "Repeat this loop as many times as needed",
-            "execution-window (loop) budget of 512",
-            "the next turn gets a fresh 512 execution-window budget",
+            "execution-window (loop) budget of 9999",
+            "the next turn gets a fresh 9999 execution-window budget",
             "Do not stop within a turn unless the requested tasks are complete or the current execution window is exhausted",
             "Complete coding work inline with CodexBridge tools",
             "Do not invoke, delegate to, or depend on coding agents, subagents, agent CLIs, or agent processes installed on the host",
@@ -219,6 +219,26 @@ mod tests {
             assert!(
                 AGENT_BRIEF.contains(needle),
                 "missing persistence rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_brief_requires_modify_task_memory_handoff() {
+        for needle in [
+            "single active-memory key `project-modification-state`",
+            "After `chatgpt_turn_init` and before doing project work for that modifying task, call `recall` with this key",
+            "understand what modifying work has already been completed in the current project",
+            "before the user-facing response, call `remember` with the same `project-modification-state` key",
+            "current turn's result, verification, and any genuine blocker",
+            "Do not send the user-facing completion response before this remember call has been attempted",
+            "This modify-task handoff protocol applies only when the task will change project state",
+            "for read-only audit, review, investigation, explanation, or planning tasks, do not call `recall` for `project-modification-state`",
+            "Read-only tasks must not update `project-modification-state` with `remember`",
+        ] {
+            assert!(
+                AGENT_BRIEF.contains(needle),
+                "missing modify-task memory handoff rule: {needle}"
             );
         }
     }

@@ -109,6 +109,7 @@ fn windows_junction_components_cannot_escape_capability_paths() {
     );
 
     let resolver = SecurePathResolver;
+    let mut junction_rejection = None;
     for operation in [PathOperation::Existing, PathOperation::Create] {
         let error = resolver
             .resolve_project_path(temp.path(), "linked/secret.txt", operation)
@@ -117,27 +118,42 @@ fn windows_junction_components_cannot_escape_capability_paths() {
             matches!(error.code(), "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE"),
             "junction escape returned unexpected error: {error}"
         );
+        match junction_rejection {
+            Some(expected) => assert_eq!(
+                error.code(),
+                expected,
+                "junction rejection changed across path operations"
+            ),
+            None => junction_rejection = Some(error.code()),
+        }
     }
+    let junction_rejection = junction_rejection.expect("junction operations were checked");
+
+    // A Windows junction is an IO_REPARSE_TAG_MOUNT_POINT. Depending on how the
+    // Rust standard library reports that reparse point through symlink_metadata,
+    // the resolver can classify the same safe rejection as either a canonical
+    // workspace escape or a symlink/reparse escape. Capability operations must
+    // preserve that resolver classification rather than silently following it.
     assert_eq!(
         resolver
             .read_file_bounded(temp.path(), "linked/secret.txt", 1024)
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .read_file_range(temp.path(), "linked/secret.txt", 0, 16)
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .write_file_atomic(temp.path(), "linked/escaped.txt", b"nope")
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
 
     std::fs::write(temp.path().join("source.txt"), b"source").unwrap();
@@ -151,28 +167,28 @@ fn windows_junction_components_cannot_escape_capability_paths() {
             )
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .copy_file_secure(temp.path(), "source.txt", "linked/copied.txt", 1024)
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .move_path_secure(temp.path(), "linked/secret.txt", "moved-from-linked.txt")
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .move_path_secure(temp.path(), "source.txt", "linked/moved.txt")
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert!(temp.path().join("source.txt").is_file());
     assert_eq!(
@@ -180,14 +196,14 @@ fn windows_junction_components_cannot_escape_capability_paths() {
             .create_directory_all(temp.path(), "linked/new/directory")
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
     assert_eq!(
         resolver
             .remove_path_secure(temp.path(), "linked/secret.txt")
             .unwrap_err()
             .code(),
-        "PATH_OUTSIDE_WORKSPACE"
+        junction_rejection
     );
 
     assert!(!outside.path().join("escaped.txt").exists());
