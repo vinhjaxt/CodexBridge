@@ -83,6 +83,48 @@ jobs:
           key: native-${{ matrix.os }}
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Windows PowerShell diagnostics
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        continue-on-error: true
+        env:
+          CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS: '1'
+          RUST_BACKTRACE: '1'
+        run: |
+          Write-Host '=== Windows / PowerShell environment ==='
+          [System.Environment]::OSVersion | Format-List | Out-String | Write-Host
+          $PSVersionTable | Format-List | Out-String | Write-Host
+          Get-Command powershell.exe | Format-List Name,Source,Version | Out-String | Write-Host
+          Get-Command pwsh.exe -ErrorAction SilentlyContinue | Format-List Name,Source,Version | Out-String | Write-Host
+          foreach ($name in @(
+            'PATH','PATHEXT','SystemRoot','WINDIR','ComSpec','USERPROFILE',
+            'HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA','ProgramData',
+            'ProgramFiles','ProgramFiles(x86)','ProgramW6432','SystemDrive',
+            'TEMP','TMP','PSModulePath'
+          )) {
+            Write-Host ("{0}={1}" -f $name, [Environment]::GetEnvironmentVariable($name))
+          }
+
+          Write-Host '=== Direct Windows PowerShell smoke ==='
+          $script = "Write-Output 'codexbridge-direct-stdout'; [Console]::Error.WriteLine('codexbridge-direct-stderr'); exit 0"
+          $bytes = [Text.Encoding]::Unicode.GetBytes($script)
+          $encoded = [Convert]::ToBase64String($bytes)
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
+          Write-Host "direct-powershell-exit=$LASTEXITCODE"
+
+          Write-Host '=== Isolated CodexBridge regressions ==='
+          $tests = @(
+            'sandbox::tests::exec_env_additions_reject_malformed_keys_and_oversized_values',
+            'tools::process::tests::windows_default_powershell_preserves_powershell_command_failure',
+            'tools::process::tests::windows_default_powershell_propagates_native_exit_code_end_to_end',
+            'tools::process::tests::windows_default_powershell_uses_final_success_after_native_failure',
+            'tools::process::tests::windows_non_tty_exec_default_powershell_keeps_stdout_and_stderr_pipes'
+          )
+          foreach ($test in $tests) {
+            Write-Host "--- $test ---"
+            cargo test --all-features $test -- --exact --nocapture --test-threads=1
+            Write-Host "isolated-test-exit=$LASTEXITCODE"
+          }
       - name: Test
         run: cargo test --all-features
       - name: Build bins and examples

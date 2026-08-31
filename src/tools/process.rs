@@ -1191,6 +1191,10 @@ impl ProcessRegistry {
         }
         #[cfg(windows)]
         crate::platform::configure_windows_non_tty_process(&mut command);
+        #[cfg(all(test, windows))]
+        if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+            eprintln!("codexbridge-windows-process spawn-command={command:?}");
+        }
         let mut child = command
             .spawn()
             .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
@@ -2059,6 +2063,12 @@ mod tests {
 
     #[cfg(windows)]
     async fn windows_wait_for_session(session: &Arc<InteractiveSession>) {
+        if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "codexbridge-windows-process wait-start {}",
+                windows_session_diagnostics(session)
+            );
+        }
         tokio::time::timeout(Duration::from_secs(20), async {
             while !session.is_finished() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2067,6 +2077,35 @@ mod tests {
         .await
         .expect("Windows process did not publish completion");
         assert!(wait_for_drains(session, Duration::from_secs(2)).await);
+        if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "codexbridge-windows-process wait-finish {}",
+                windows_session_diagnostics(session)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_session_diagnostics(session: &Arc<InteractiveSession>) -> String {
+        let completion = session.completion();
+        let output = session
+            .output
+            .lock()
+            .map(|mut output| output.render_window(Some(0), true).0)
+            .unwrap_or_else(|_| "<output-lock-poisoned>".to_owned());
+        let requested_signal = session
+            .requested_signal
+            .lock()
+            .map(|signal| *signal)
+            .ok()
+            .flatten();
+        format!(
+            "pid={:?}; elapsed_ms={}; deadline_exceeded={}; drains_remaining={}; requested_signal={requested_signal:?}; completion={completion:?}; output={output:?}",
+            session.pid,
+            session.started.elapsed().as_millis(),
+            session.process_deadline_exceeded.load(Ordering::Relaxed),
+            session.drains_remaining.load(Ordering::Acquire),
+        )
     }
 
     #[cfg(windows)]
@@ -2118,16 +2157,17 @@ mod tests {
     #[cfg(windows)]
     fn assert_windows_exit_success(session: &Arc<InteractiveSession>) {
         let completion = session.completion().expect("hidden process completion");
-        let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
         assert_eq!(
             completion.reason,
             CompletionReason::Exited,
-            "completion={completion:?}; output={output:?}"
+            "{}",
+            windows_session_diagnostics(session)
         );
         assert_eq!(
             completion.exit_code,
             Some(0),
-            "completion={completion:?}; output={output:?}"
+            "{}",
+            windows_session_diagnostics(session)
         );
     }
 
@@ -2280,8 +2320,18 @@ mod tests {
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
         let completion = session.completion().expect("native exit probe completion");
-        assert_eq!(completion.reason, CompletionReason::Exited);
-        assert_eq!(completion.exit_code, Some(37));
+        assert_eq!(
+            completion.reason,
+            CompletionReason::Exited,
+            "{}",
+            windows_session_diagnostics(&session)
+        );
+        assert_eq!(
+            completion.exit_code,
+            Some(37),
+            "{}",
+            windows_session_diagnostics(&session)
+        );
     }
 
     #[cfg(windows)]
@@ -2309,8 +2359,18 @@ mod tests {
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
         let completion = session.completion().expect("native exit probe completion");
-        assert_eq!(completion.reason, CompletionReason::Exited);
-        assert_eq!(completion.exit_code, Some(0));
+        assert_eq!(
+            completion.reason,
+            CompletionReason::Exited,
+            "{}",
+            windows_session_diagnostics(&session)
+        );
+        assert_eq!(
+            completion.exit_code,
+            Some(0),
+            "{}",
+            windows_session_diagnostics(&session)
+        );
         let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
         assert!(
             output.contains("codexbridge-after-native-failure"),
@@ -2329,8 +2389,18 @@ mod tests {
         let (_registry, session) = windows_start_exec(&config, &project, &args).await;
         windows_wait_for_session(&session).await;
         let completion = session.completion().expect("PowerShell failure completion");
-        assert_eq!(completion.reason, CompletionReason::Exited);
-        assert_eq!(completion.exit_code, Some(1));
+        assert_eq!(
+            completion.reason,
+            CompletionReason::Exited,
+            "{}",
+            windows_session_diagnostics(&session)
+        );
+        assert_eq!(
+            completion.exit_code,
+            Some(1),
+            "{}",
+            windows_session_diagnostics(&session)
+        );
         let (output, _, _, _) = session.output.lock().unwrap().render_window(Some(0), true);
         assert!(
             output.contains("codexbridge-powershell-failure"),

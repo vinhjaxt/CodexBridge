@@ -1680,6 +1680,10 @@ async fn execute_prepared(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<ProcessResult> {
+    #[cfg(all(test, windows))]
+    if std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+        eprintln!("codexbridge-windows-sandbox spawn-command={command:?}");
+    }
     let mut child = command
         .spawn()
         .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
@@ -2741,7 +2745,75 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.exit_code, Some(0));
-        assert_eq!(result.stdout.trim(), "forwarded-exactly-42");
+        if cfg!(windows) && std::env::var_os("CODEXBRIDGE_WINDOWS_PROCESS_DIAGNOSTICS").is_some() {
+            let (shell, args, payload) = shell_command(None, command_text).unwrap();
+            #[cfg(windows)]
+            let decoded = {
+                let bytes = STANDARD.decode(&payload).unwrap();
+                let (chunks, remainder) = bytes.as_chunks::<2>();
+                assert!(remainder.is_empty());
+                let utf16 = chunks
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
+                    .collect::<Vec<_>>();
+                String::from_utf16(&utf16).unwrap()
+            };
+            #[cfg(not(windows))]
+            let decoded = payload;
+            eprintln!(
+                "codexbridge-windows-sandbox shell={shell:?}; args={args:?}; script={decoded:?}; exit_code={:?}; timed_out={}; stdout={:?}; stderr={:?}; stdout_bytes={}; stderr_bytes={}; truncated={}",
+                result.exit_code,
+                result.timed_out,
+                result.stdout,
+                result.stderr,
+                result.stdout_bytes,
+                result.stderr_bytes,
+                result.truncated
+            );
+            for name in [
+                "PATH",
+                "PATHEXT",
+                "SystemRoot",
+                "WINDIR",
+                "ComSpec",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "LOCALAPPDATA",
+                "APPDATA",
+                "ProgramData",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "SystemDrive",
+                "TEMP",
+                "TMP",
+                "PSModulePath",
+            ] {
+                eprintln!(
+                    "codexbridge-windows-parent-env {name}={:?}",
+                    std::env::var_os(name)
+                );
+            }
+        }
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "timed_out={}; stdout={:?}; stderr={:?}; stdout_bytes={}; stderr_bytes={}; truncated={}",
+            result.timed_out,
+            result.stdout,
+            result.stderr,
+            result.stdout_bytes,
+            result.stderr_bytes,
+            result.truncated
+        );
+        assert_eq!(
+            result.stdout.trim(),
+            "forwarded-exactly-42",
+            "timed_out={}; exit_code={:?}; stderr={:?}",
+            result.timed_out,
+            result.exit_code,
+            result.stderr
+        );
     }
 }
