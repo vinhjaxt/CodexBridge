@@ -244,7 +244,11 @@ fn windows_pty_command_line(
     } else {
         command.get_args().map(ToOwned::to_owned).collect()
     };
-    let raw_arg = is_cmd.then(|| OsString::from(format!("\"{shell_command_text}\"")));
+    let raw_arg = is_cmd.then(|| {
+        OsString::from(crate::sandbox::windows_cmd_raw_command_tail(
+            shell_command_text,
+        ))
+    });
     WindowsPtyCommandLine {
         program,
         args,
@@ -404,7 +408,7 @@ mod tests {
         use std::os::windows::process::CommandExt as _;
 
         let command_text = r#"echo ok & "C:\Program Files\tool.exe" --probe"#;
-        let expected_raw_arg = format!("\"{command_text}\"");
+        let expected_raw_arg = command_text.to_owned();
         let mut command = tokio::process::Command::new(r"C:\Windows\System32\cmd.exe");
         command.args(["/d", "/s", "/c"]);
         command.as_std_mut().raw_arg(&expected_raw_arg);

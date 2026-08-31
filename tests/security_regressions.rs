@@ -104,11 +104,11 @@ fn windows_junction_components_cannot_escape_capability_paths() {
     let mut cmd = std::process::Command::new(system_root.join("System32/cmd.exe"));
     cmd.args(["/d", "/s", "/c"])
         // cmd.exe does not use the standard Windows argv parser. In particular,
-        // `/s /c` expects the complete command string to be surrounded by one
-        // extra pair of quotes. Rust's normal `.arg()` escaping can backslash-
-        // escape the embedded path quotes and make `mklink` report a syntax
-        // error. Match the production cmd path and pass the command tail verbatim.
-        .raw_arg(format!("\"{command}\""))
+        // Rust's normal `.arg()` escaping can backslash-escape the embedded path
+        // quotes. This command starts with the unquoted `mklink` token, so adding
+        // another outer quote pair is also wrong: cmd.exe can reparse the embedded
+        // quoted arguments. Pass this trusted fixture command verbatim.
+        .raw_arg(&command)
         .current_dir(temp.path());
     let output = cmd.output().unwrap();
     assert!(

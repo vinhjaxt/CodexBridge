@@ -824,15 +824,28 @@ fn append_shell_command_text(command: &mut Command, kind: ShellKind, command_tex
         // reconstructed with CommandLineToArgvW rules. Rust's ordinary `.arg()`
         // encoding quotes a script containing spaces and backslash-escapes every
         // embedded `"`, which changes commands such as `echo ok & "tool.exe"`.
-        // Pass the command tail verbatim and provide the outer quotes that `/s`
-        // removes, leaving the user's command text (and its quotes) intact.
-        command.as_std_mut().raw_arg(format!("\"{command_text}\""));
+        // A leading quoted executable needs one extra outer quote pair so `/s`
+        // removes that pair rather than the executable's own quotes. Commands that
+        // begin with an ordinary token must stay verbatim: wrapping those commands
+        // can make embedded quoted arguments get reparsed incorrectly by cmd.exe.
+        command
+            .as_std_mut()
+            .raw_arg(windows_cmd_raw_command_tail(command_text));
         return;
     }
 
     #[cfg(not(windows))]
     let _ = kind;
     command.arg(command_text);
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_cmd_raw_command_tail(command_text: &str) -> String {
+    if command_text.starts_with('"') {
+        format!("\"{command_text}\"")
+    } else {
+        command_text.to_owned()
+    }
 }
 
 fn valid_shell_executable(shell: &str) -> bool {
@@ -2469,6 +2482,22 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("codexbridge-native-cmd"),
             "{output:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_raw_command_tail_wraps_only_leading_quoted_executables() {
+        let embedded_quotes = r#"mklink /J "linked" "C:\Program Files\target""#;
+        assert_eq!(
+            windows_cmd_raw_command_tail(embedded_quotes),
+            embedded_quotes
+        );
+
+        let leading_quoted_executable = r#""C:\Program Files\tool.exe" --probe"#;
+        assert_eq!(
+            windows_cmd_raw_command_tail(leading_quoted_executable),
+            format!("\"{leading_quoted_executable}\"")
         );
     }
 
