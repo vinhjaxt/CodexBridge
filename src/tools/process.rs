@@ -2437,7 +2437,7 @@ mod tests {
         let config = windows_test_config();
         let project = windows_test_project(&project_dir);
         let args = windows_one_shot_exec_args(
-            "echo codexbridge-hidden-stdout & echo codexbridge-hidden-stderr 1>&2",
+            "echo codexbridge-hidden-stdout&echo codexbridge-hidden-stderr>&2",
             Some("cmd"),
         );
 
