@@ -985,6 +985,15 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
     }
 }
 
+fn is_windows_powershell_5_1_executable(executable: &str) -> bool {
+    Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("powershell.exe")
+        })
+}
+
 static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
 static PODMAN_IN_BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
 static PODMAN_INVOCATION: OnceLock<PodmanInvocation> = OnceLock::new();
@@ -1500,9 +1509,24 @@ fn finalize_process_command(
     interactive: bool,
     timeout: Duration,
     environment: &BTreeMap<String, String>,
+    windows_powershell_5_1: bool,
 ) -> Result<Command> {
     command.env_clear();
     sanitized_base_environment(&mut command, use_bwrap);
+    if cfg!(windows) && windows_powershell_5_1 {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        // `env_clear()` removes PSModulePath. Letting Windows PowerShell 5.1
+        // rebuild it adds CurrentUser and ProgramFiles roots, which can force a
+        // large recursive module scan before core cmdlets such as Write-Output or
+        // Write-Error can auto-load on CI images. A sanitized shell should expose
+        // only its built-in modules by default. Explicit exec env additions are
+        // applied below and can override PSModulePath when extra modules are
+        // intentionally required.
+        command.env(
+            "PSModulePath",
+            format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules"),
+        );
+    }
     if let Some(socket) = &config.container_socket {
         let uri = if use_bwrap {
             "unix:///run/podman.sock".to_owned()
@@ -1624,6 +1648,7 @@ pub(crate) fn build_command_with_options_and_runtime_bind(
         interactive,
         timeout,
         environment,
+        cfg!(windows) && is_windows_powershell_5_1_executable(&shell_bin),
     )?;
     Ok((command, use_bwrap))
 }
@@ -1672,7 +1697,15 @@ pub(crate) fn build_argv_command(
             "no usable exec backend; Bubblewrap is unavailable and native execution is disabled",
         ));
     };
-    finalize_process_command(command, config, use_bwrap, false, timeout, environment)
+    finalize_process_command(
+        command,
+        config,
+        use_bwrap,
+        false,
+        timeout,
+        environment,
+        false,
+    )
 }
 
 async fn execute_prepared(
@@ -2730,6 +2763,19 @@ mod tests {
             "forwarded-exactly-42".to_owned(),
         );
         assert!(build(valid.clone()).is_ok());
+        #[cfg(windows)]
+        {
+            let command = build(valid.clone()).unwrap();
+            let system_root =
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+            let expected = format!(r"{system_root}\System32\WindowsPowerShell\v1.0\Modules");
+            let actual = command.as_std().get_envs().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("PSModulePath")
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            });
+            assert_eq!(actual.as_deref(), Some(expected.as_str()));
+        }
 
         let command_text = if cfg!(windows) {
             "Write-Output $env:CODEXBRIDGE_ENV_FORWARDING_PROBE"
