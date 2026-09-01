@@ -39,7 +39,7 @@ pub(crate) fn pre_init_instructions(config: &Config, upstream: &Aggregator) -> S
     let environment = RuntimeEnvironment::detect(config);
     let mut sections = vec![
         AGENT_BRIEF.to_owned(),
-        "Project lifecycle: for each new user message that needs project-scoped work or a project-state-dependent answer, call `chatgpt_turn_init` before any other project tool. On the first project-bearing turn, optionally pass `project_key` for explicit sharing/rejoin. On later turns, if the nearest preceding assistant final response contains a CodexBridge `[ref:...]`, pass that token as `previous_turn_ref`; a valid reference can resolve the same effective project for a new branch, while an already-bound conversation can recover from a missing, stale, or invalid reference by using its persisted project binding. If an unbound conversation supplies an unusable ref and receives `PROJECT_KEY_REQUIRED`, retry `chatgpt_turn_init` with the intended `project_key`; that failed attempt is non-mutating. Duplicate calls with the same valid `previous_turn_ref` are idempotent and reuse the same server-issued `turn_ref`. A successful result is intentionally minimal: consume `brief` when present, otherwise consume `state_update` when present, and always carry the returned `turn_ref` into the final `[ref:...]` marker and the next project-bearing turn. Active project memory is deliberately small and is always hydrated completely together with the current plan; archive/history is never injected automatically and should be retrieved with `recall` scope=archive only when needed. After a successful call, do not call it again until the user sends another message. Project-specific state, skills, and AGENTS.md content are intentionally disclosed only by the successful turn initialization result.".to_owned(),
+        "Project lifecycle: on every new user message, if the response may depend on project state in any way, or if there is any uncertainty about whether project state is relevant, call `chatgpt_turn_init` exactly once before any project reasoning, project tool call, or project-state-dependent answer. Never use project state, memory, plans, instructions, or repository context carried over from a previous turn as a substitute for turn initialization. On the first project-bearing turn, optionally pass `project_key` for explicit sharing/rejoin. On later turns, if the nearest preceding assistant final response contains a CodexBridge `[ref:...]`, pass that token as `previous_turn_ref`; a valid reference can resolve the same effective project for a new branch, while an already-bound conversation can recover from a missing, stale, or invalid reference by using its persisted project binding. If an unbound conversation supplies an unusable ref and receives `PROJECT_KEY_REQUIRED`, retry `chatgpt_turn_init` with the intended `project_key`; that failed attempt is non-mutating. Duplicate calls with the same valid `previous_turn_ref` are idempotent and reuse the same server-issued `turn_ref`. A successful result is intentionally minimal: consume `brief` when present, otherwise consume `state_update` when present, and always carry the returned `turn_ref` into the final `[ref:...]` marker and the next project-bearing turn. Active project memory is deliberately small and is always hydrated completely together with the current plan; archive/history is never injected automatically and should be retrieved with `recall` scope=archive only when needed. After a successful call, do not call it again until the user sends another message. Project-specific state, skills, and AGENTS.md content are intentionally disclosed only by the successful turn initialization result.".to_owned(),
         environment.render_agent_summary(),
     ];
     if let Some(gateways) = gateway_catalogue(upstream) {
@@ -156,6 +156,17 @@ mod tests {
     fn pre_init_instructions_explain_both_project_states_without_project_data() {
         let config = config();
         let text = pre_init_instructions(&config, &Aggregator::default());
+        assert!(text.contains("if the response may depend on project state in any way"));
+        assert!(
+            text.contains("if there is any uncertainty about whether project state is relevant")
+        );
+        assert!(text.contains(
+            "before any project reasoning, project tool call, or project-state-dependent answer"
+        ));
+        assert!(text.contains("Never use project state, memory, plans, instructions, or repository context carried over from a previous turn as a substitute for turn initialization"));
+        assert!(
+            !text.contains("that needs project-scoped work or a project-state-dependent answer")
+        );
         assert!(text.contains("first project-bearing turn"));
         assert!(text.contains("new branch"));
         assert!(text.contains("chatgpt_turn_init"));
@@ -221,6 +232,50 @@ mod tests {
             assert!(
                 AGENT_BRIEF.contains(needle),
                 "missing persistence rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_brief_requires_turn_initialization_gate() {
+        for needle in [
+            "if the response may depend on project state in any way",
+            "if there is any uncertainty about whether project state is relevant",
+            "before any project reasoning, project tool call, or project-state-dependent answer",
+            "Never use project state, memory, plans, instructions, or repository context carried over from a previous turn as a substitute for turn initialization",
+            "After a successful turn init, do not call it again until the user sends another message",
+            "When the synchronized result contains `brief`, consume it as the authoritative current brief",
+            "when it contains `state_update`, consume that update while retaining the unchanged instruction context",
+        ] {
+            assert!(
+                AGENT_BRIEF.contains(needle),
+                "missing turn initialization gate: {needle}"
+            );
+        }
+        assert!(!AGENT_BRIEF.contains("instructions_changed=true"));
+        assert!(!AGENT_BRIEF.contains("state_changed=true"));
+    }
+
+    #[test]
+    fn agent_brief_requires_modifying_task_termination_gate() {
+        for needle in [
+            "Termination gate for modifying tasks",
+            "A completion response is forbidden unless all of the following are true",
+            "Every implementation item requested by the user is complete",
+            "has run after the last change that could affect that verification",
+            "No failure relevant to the requested work remains unresolved",
+            "contains no `in_progress` or `pending` work that is required to satisfy the user's request",
+            "must have reached a terminal state before final response",
+            "All modified files and relevant resulting diffs have been re-read or reviewed after the final edits",
+            "`project-modification-state` has been updated with the completed work and verification results",
+            "The following are explicitly not valid reasons to stop",
+            "If any termination condition is false, continue working",
+            "genuine external blocker or the actual execution-window budget has been exhausted",
+            "persistence mechanism itself counts as an external blocker only after the required persistence attempt has actually been made",
+        ] {
+            assert!(
+                AGENT_BRIEF.contains(needle),
+                "missing modifying-task termination gate: {needle}"
             );
         }
     }
