@@ -292,10 +292,21 @@ pub(super) fn parse_frontmatter(contents: &str, fallback: &str) -> AppResult<(St
 }
 
 fn home_plugin_roots() -> Vec<PathBuf> {
+    let Some(home) = crate::platform::user_home_dir() else {
+        return Vec::new();
+    };
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    home_plugin_roots_for(&home, &codex_home)
+}
+
+fn home_plugin_roots_for(home: &Path, codex_home: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = crate::platform::user_home_dir()
-        && home.join(".claude").exists()
-    {
+    if codex_home.exists() {
+        roots.push(codex_home.join("plugins/cache"));
+    }
+    if home.join(".claude").exists() {
         roots.push(home.join(".claude/plugins/cache"));
     }
     roots
@@ -812,6 +823,22 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("SKILL.md"), body).unwrap();
         directory
+    }
+
+    #[test]
+    fn home_plugin_roots_include_codex_before_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("custom-codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
+
+        assert_eq!(
+            home_plugin_roots_for(temp.path(), &codex_home),
+            vec![
+                codex_home.join("plugins/cache"),
+                temp.path().join(".claude/plugins/cache"),
+            ]
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ Reporting back:
 #[tool_router(router = agent_router, vis = "pub(crate)")]
 impl AgentHandler {
     #[tool(
-        description = "List Codex-style repo/user and Claude-plugin SKILL.md names and descriptions without loading full bodies. Optional path acts like Codex's current working directory for repo discovery: .agents/skills roots along project-root-to-path ancestry are scanned recursively, with .codex/skills accepted as a lower-precedence compatibility alias. Use the returned catalogue and warnings to select only relevant skills for progressive disclosure."
+        description = "List Codex-style repo/user and Codex/Claude-plugin SKILL.md names and descriptions without loading full bodies. Optional path acts like Codex's current working directory for repo discovery: .agents/skills roots along project-root-to-path ancestry are scanned recursively, with .codex/skills accepted as a lower-precedence compatibility alias. Use the returned catalogue and warnings to select only relevant skills for progressive disclosure."
     )]
     async fn skills_list(
         &self,
@@ -136,7 +136,7 @@ impl AgentHandler {
                 "skills":values,
                 "warnings":warnings,
                 "progressive_disclosure":true,
-                "precedence":["closest repo .agents/skills", "same-level repo .codex/skills compatibility alias", "broader repo skill roots", "~/.agents/skills", "$CODEX_HOME/skills compatibility", "Claude plugin skills", "generated upstream gateway skills"],
+                "precedence":["closest repo .agents/skills", "same-level repo .codex/skills compatibility alias", "broader repo skill roots", "~/.agents/skills", "$CODEX_HOME/skills compatibility", "Codex plugin skills", "Claude plugin skills", "generated upstream gateway skills"],
             });
             Ok((structured_result_with_text(value.clone(), text), value))
         }).await
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_home_plugins_are_namespaced_and_use_latest_version() {
+    fn home_plugins_are_namespaced_and_use_latest_version() {
         let project_dir = tempfile::tempdir().unwrap();
         let plugin_cache = tempfile::tempdir().unwrap();
         for version in ["1.2.0", "1.10.0"] {
