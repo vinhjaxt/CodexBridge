@@ -702,8 +702,19 @@ async fn bounded_read<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[cfg(unix)]
-pub(crate) fn process_limits(command: &mut Command, timeout: Duration) {
+pub(crate) fn process_limits(
+    command: &mut Command,
+    timeout: Duration,
+    nofile_limit: Option<u64>,
+) -> Result<()> {
     let cpu_seconds = timeout.as_secs().saturating_add(2).max(2);
+    let nofile_limit = nofile_limit
+        .map(|limit| {
+            libc::rlim_t::try_from(limit).map_err(|_| {
+                AppError::config("EXEC_RLIMIT_NOFILE exceeds the platform rlimit range")
+            })
+        })
+        .transpose()?;
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -713,28 +724,40 @@ pub(crate) fn process_limits(command: &mut Command, timeout: Duration) {
                 rlim_cur: cpu_seconds,
                 rlim_max: cpu_seconds.saturating_add(1),
             };
-            let nofile = libc::rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
             // RLIMIT_NPROC is counted per real UID on Linux, not per child
             // process tree. Applying a small value here can make an otherwise
             // idle project unable to fork when the daemon UID is shared with
             // platform/background processes. Process fan-out must instead be
             // bounded by the configured process concurrency and the outer
             // container/cgroup PID limit.
-            for (resource, limit) in [(libc::RLIMIT_CPU, cpu), (libc::RLIMIT_NOFILE, nofile)] {
-                if libc::setrlimit(resource, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(nofile_limit) = nofile_limit {
+                let nofile = libc::rlimit {
+                    rlim_cur: nofile_limit,
+                    rlim_max: nofile_limit,
+                };
+                // EXEC_RLIMIT_NOFILE is a best-effort child override. A daemon
+                // may inherit a lower hard limit than the configured value, and
+                // failure to tighten/raise this optional limit must not prevent
+                // the requested command from running.
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
             }
             Ok(())
         });
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn process_limits(_command: &mut Command, _timeout: Duration) {}
+pub(crate) fn process_limits(
+    _command: &mut Command,
+    _timeout: Duration,
+    _nofile_limit: Option<u64>,
+) -> Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellKind {
@@ -1576,7 +1599,7 @@ fn finalize_process_command(
         }
         command.env(key, value);
     }
-    process_limits(&mut command, timeout);
+    process_limits(&mut command, timeout, config.exec_rlimit_nofile)?;
     command
         .kill_on_drop(true)
         .stdin(if interactive {
@@ -1818,6 +1841,75 @@ mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
     use crate::project::ProjectKey;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_limits_inherit_host_nofile_by_default_and_apply_override() {
+        fn shell_limit(value: libc::rlim_t) -> String {
+            if value == libc::RLIM_INFINITY {
+                "unlimited".to_owned()
+            } else {
+                value.to_string()
+            }
+        }
+
+        async fn child_nofile(nofile_limit: Option<u64>) -> String {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("printf '%s\\n%s\\n' \"$(ulimit -Sn)\" \"$(ulimit -Hn)\"");
+            process_limits(&mut command, Duration::from_secs(30), nofile_limit).unwrap();
+            let output = command.output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        }
+
+        let mut host = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut host) },
+            0
+        );
+
+        let inherited = child_nofile(None).await;
+        assert_eq!(
+            inherited,
+            format!(
+                "{}\n{}\n",
+                shell_limit(host.rlim_cur),
+                shell_limit(host.rlim_max)
+            )
+        );
+
+        if host.rlim_max == libc::RLIM_INFINITY || host.rlim_max >= 32 {
+            let configured = child_nofile(Some(32)).await;
+            assert_eq!(configured, "32\n32\n");
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf TARGET_RAN");
+        unsafe {
+            command.pre_exec(|| {
+                let nofile = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        process_limits(&mut command, Duration::from_secs(30), Some(65)).unwrap();
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "an unappliable optional NOFILE override must not block execution: {output:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "TARGET_RAN");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

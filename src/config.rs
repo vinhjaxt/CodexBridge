@@ -80,6 +80,7 @@ pub struct Config {
     pub status_interval: Duration,
     pub exec_default_timeout: Duration,
     pub exec_max_timeout: Duration,
+    pub exec_rlimit_nofile: Option<u64>,
     pub sandbox_backend: String,
     pub allow_unsandboxed_exec: bool,
     pub allowed_hosts: Vec<String>,
@@ -421,6 +422,16 @@ impl ConfigBuilder {
             .map_err(|_| AppError::config(format!("{name} must be a positive integer")))
     }
 
+    fn optional_u64_value(&self, name: &str) -> Result<Option<u64>> {
+        self.optional_value(name)
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| AppError::config(format!("{name} must be a positive integer")))
+            })
+            .transpose()
+    }
+
     fn bool_value(&self, name: &str, default: bool) -> Result<bool> {
         self.value(name, if default { "true" } else { "false" })
             .parse()
@@ -579,6 +590,7 @@ impl ConfigBuilder {
             exec_max_timeout: Duration::from_millis(
                 self.usize_value("EXEC_MAX_TIMEOUT_MS", 3_600_000)? as u64,
             ),
+            exec_rlimit_nofile: self.optional_u64_value("EXEC_RLIMIT_NOFILE")?,
             sandbox_backend: self.value("MCP_EXEC_SANDBOX", "auto"),
             allow_unsandboxed_exec: self.bool_value("MCP_ALLOW_UNSANDBOXED_EXEC", true)?,
             allowed_hosts: self
@@ -638,7 +650,8 @@ impl Config {
                 "max_write_bytes": self.limits.write_bytes,
                 "max_process_output_bytes": self.limits.process_output_bytes,
                 "exec_default_timeout_ms": self.exec_default_timeout.as_millis(),
-                "exec_max_timeout_ms": self.exec_max_timeout.as_millis()
+                "exec_max_timeout_ms": self.exec_max_timeout.as_millis(),
+                "exec_rlimit_nofile": self.exec_rlimit_nofile
             },
             "output": {
                 "file_bytes": self.output.file_bytes,
@@ -713,6 +726,11 @@ impl Config {
         if self.exec_default_timeout > self.exec_max_timeout {
             return Err(AppError::config(
                 "EXEC_DEFAULT_TIMEOUT_MS cannot exceed EXEC_MAX_TIMEOUT_MS",
+            ));
+        }
+        if self.exec_rlimit_nofile == Some(0) {
+            return Err(AppError::config(
+                "EXEC_RLIMIT_NOFILE must be greater than zero",
             ));
         }
         if let Some((name, _)) = [
@@ -1066,6 +1084,25 @@ mod tests {
         let error = ConfigBuilder::from_map(environment).build().unwrap_err();
         assert_eq!(error.code(), "CONFIG_ERROR");
         assert!(error.message().contains("EXEC_DEFAULT_TIMEOUT_MS"));
+    }
+
+    #[test]
+    fn exec_rlimit_nofile_defaults_to_inherit_and_validates_overrides() {
+        let config = ConfigBuilder::from_map(base_environment()).build().unwrap();
+        assert_eq!(config.exec_rlimit_nofile, None);
+
+        let mut environment = base_environment();
+        environment.insert("EXEC_RLIMIT_NOFILE".to_owned(), "4096".to_owned());
+        let config = ConfigBuilder::from_map(environment).build().unwrap();
+        assert_eq!(config.exec_rlimit_nofile, Some(4096));
+
+        for value in ["0", "not-a-number"] {
+            let mut environment = base_environment();
+            environment.insert("EXEC_RLIMIT_NOFILE".to_owned(), value.to_owned());
+            let error = ConfigBuilder::from_map(environment).build().unwrap_err();
+            assert_eq!(error.code(), "CONFIG_ERROR", "{value}");
+            assert!(error.message().contains("EXEC_RLIMIT_NOFILE"), "{value}");
+        }
     }
 
     #[test]

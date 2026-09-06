@@ -241,6 +241,8 @@ The effective backend and default shell are included in the `exec_command` tool 
 
 CodexBridge intentionally does **not** set Linux `RLIMIT_NPROC`. That limit is accounted per real UID across the whole host/user namespace rather than per spawned command, so a value such as 128 can prevent Podman, Cargo, or a compiler from creating threads when unrelated platform processes share the daemon UID. Command concurrency is bounded by CodexBridge's global/per-project process semaphores; production deployments should bound total process/thread fan-out with the outer container/VM cgroup PID limit (for example Podman's `--pids-limit`) instead of a child `RLIMIT_NPROC`.
 
+On Unix, CodexBridge also leaves `RLIMIT_NOFILE` unchanged by default, so spawned commands inherit the daemon/host soft and hard open-file limits. Set `EXEC_RLIMIT_NOFILE` to a positive integer to request both the soft and hard `RLIMIT_NOFILE` for spawned commands, including PTY sessions. This override is best-effort: if the daemon's inherited hard limit or another platform constraint prevents applying the requested value, CodexBridge still runs the target command with the effective inherited/current limit.
+
 ## Authentication
 
 Authentication is always enabled. If `MCP_AUTH_TOKEN` is not supplied, CodexBridge creates and persists one under `<workspace>/.metadata/auth-token`. Explicit tokens must be 16-512 bytes; path/either mode also rejects path separators in the token.
@@ -270,6 +272,7 @@ No general application config file is read. For normal use, none of these are re
 | `LOG_ROOT` | `<workspace>/.metadata/logs` | Audit log directory |
 | `EXEC_DEFAULT_TIMEOUT_MS` | `120000` | Default command timeout |
 | `EXEC_MAX_TIMEOUT_MS` | `3600000` | Maximum requested command timeout (1 hour); operators can lower it for stricter workloads |
+| `EXEC_RLIMIT_NOFILE` | inherit host | Optional Unix child soft+hard `RLIMIT_NOFILE`; unset preserves the daemon/host limits |
 | `MAX_CONCURRENT_TOOL_CALLS` | `64` | Global tool-call concurrency |
 | `MAX_CONCURRENT_CPU_TASKS` | max(CPU, 2) | Global blocking/CPU-heavy task concurrency |
 | `MAX_CONCURRENT_PROCESSES` | min(CPU, 8) | Global process concurrency |

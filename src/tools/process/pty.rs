@@ -175,10 +175,24 @@ fn portable_pty_size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
+#[cfg(unix)]
+fn pty_shell_resource_limit_script(timeout: Duration, nofile_limit: Option<u64>) -> String {
+    let mut resource_limits = format!("ulimit -t {}", timeout.as_secs().saturating_add(2).max(2));
+    if let Some(nofile_limit) = nofile_limit {
+        resource_limits.push_str(&format!("; ulimit -n {nofile_limit}"));
+    }
+    resource_limits.push_str("; exec \"$@\"");
+    resource_limits
+}
+
 #[cfg(not(windows))]
-fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsString> {
+fn pty_argv(
+    command: &tokio::process::Command,
+    timeout: Duration,
+    nofile_limit: Option<u64>,
+) -> Vec<OsString> {
     #[cfg(not(unix))]
-    let _ = timeout;
+    let _ = (timeout, nofile_limit);
     let command = command.as_std();
     let original: Vec<OsString> = std::iter::once(command.get_program().to_os_string())
         .chain(command.get_args().map(ToOwned::to_owned))
@@ -192,9 +206,19 @@ fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsStrin
                 timeout.as_secs().saturating_add(2).max(2),
                 timeout.as_secs().saturating_add(3).max(3)
             )),
-            OsString::from("--nofile=256:256"),
             OsString::from("--"),
         ];
+        if let Some(nofile_limit) = nofile_limit {
+            // Keep the CPU guard in prlimit, but apply the optional NOFILE
+            // override inside the child shell so an inherited hard limit below
+            // the configured value does not prevent the target from running.
+            argv.extend([
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(format!("ulimit -n {nofile_limit}; exec \"$@\"")),
+                OsString::from("pty-nofile-limit"),
+            ]);
+        }
         argv.extend(original);
         return argv;
     }
@@ -203,10 +227,7 @@ fn pty_argv(command: &tokio::process::Command, timeout: Duration) -> Vec<OsStrin
         let mut argv = vec![
             OsString::from("/bin/sh"),
             OsString::from("-c"),
-            OsString::from(format!(
-                "ulimit -t {}; ulimit -n 256; exec \"$@\"",
-                timeout.as_secs().saturating_add(2).max(2)
-            )),
+            OsString::from(pty_shell_resource_limit_script(timeout, nofile_limit)),
             OsString::from("pty-resource-limits"),
         ];
         argv.extend(original);
@@ -288,13 +309,14 @@ fn windows_conpty_current_dir(path: &std::path::Path) -> std::path::PathBuf {
 pub(super) fn spawn_pty_process(
     command: &tokio::process::Command,
     timeout: Duration,
+    nofile_limit: Option<u64>,
     rows: u16,
     cols: u16,
     shell_command_text: &str,
 ) -> AppResult<PtyProcess> {
     let _ = shell_command_text;
     let command_std = command.as_std();
-    let argv = pty_argv(command, timeout);
+    let argv = pty_argv(command, timeout, nofile_limit);
     let mut builder = CommandBuilder::from_argv(argv);
     builder.env_clear();
     for (key, value) in command_std.get_envs() {
@@ -339,11 +361,12 @@ pub(super) fn spawn_pty_process(
 pub(super) fn spawn_pty_process(
     command: &tokio::process::Command,
     timeout: Duration,
+    nofile_limit: Option<u64>,
     rows: u16,
     cols: u16,
     shell_command_text: &str,
 ) -> AppResult<PtyProcess> {
-    let _ = timeout;
+    let _ = (timeout, nofile_limit);
     let command_std = command.as_std();
     let command_line = windows_pty_command_line(command, shell_command_text);
     let mut builder = conpty_oxide::blocking::Command::new(&command_line.program);
@@ -392,7 +415,7 @@ mod tests {
     fn pty_wrapper_does_not_apply_uid_wide_nproc_limit() {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg("true");
-        let argv = pty_argv(&command, Duration::from_secs(30));
+        let argv = pty_argv(&command, Duration::from_secs(30), None);
         let rendered = argv
             .iter()
             .map(|value| value.to_string_lossy())
@@ -400,6 +423,71 @@ mod tests {
             .join(" ");
         assert!(!rendered.contains("--nproc"));
         assert!(!rendered.contains("ulimit -u"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn pty_wrapper_inherits_nofile_by_default_and_applies_override() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("true");
+
+        let inherited = pty_argv(&command, Duration::from_secs(30), None)
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!inherited.contains("--nofile="));
+        assert!(!inherited.contains("ulimit -n"));
+
+        let configured = pty_argv(&command, Duration::from_secs(30), Some(123))
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            configured.contains("ulimit -n 123"),
+            "configured nofile limit missing from PTY wrapper: {configured}"
+        );
+        assert!(
+            !configured.contains("--nofile=123:123"),
+            "NOFILE must be best-effort rather than a fail-closed prlimit option: {configured}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pty_shell_resource_limit_wrapper_runs_target_when_nofile_override_fails() {
+        use std::os::unix::process::CommandExt as _;
+
+        let script = pty_shell_resource_limit_script(Duration::from_secs(30), Some(65));
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &script,
+            "pty-resource-limits",
+            "/bin/sh",
+            "-c",
+            "printf TARGET_RAN",
+        ]);
+        unsafe {
+            command.pre_exec(|| {
+                let nofile = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("TARGET_RAN"),
+            "failed optional NOFILE override must still run the target command: {output:?}"
+        );
     }
 
     #[cfg(windows)]

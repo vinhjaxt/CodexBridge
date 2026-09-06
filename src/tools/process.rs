@@ -1182,6 +1182,7 @@ impl ProcessRegistry {
                     args,
                     command,
                     timeout,
+                    config.exec_rlimit_nofile,
                     registry_permit,
                     global_process_permit,
                     project_process_permit,
@@ -1323,6 +1324,7 @@ impl ProcessRegistry {
         args: &ExecCommandArgs,
         command: tokio::process::Command,
         timeout: Duration,
+        nofile_limit: Option<u64>,
         registry_permit: OwnedSemaphorePermit,
         global_process_permit: OwnedSemaphorePermit,
         project_process_permit: OwnedSemaphorePermit,
@@ -1331,7 +1333,14 @@ impl ProcessRegistry {
         let (rows, cols) = terminal_dimensions(args.rows, args.cols)?;
         let shell_command_text = args.command.clone();
         let pty = tokio::task::spawn_blocking(move || {
-            spawn_pty_process(&command, timeout, rows, cols, &shell_command_text)
+            spawn_pty_process(
+                &command,
+                timeout,
+                nofile_limit,
+                rows,
+                cols,
+                &shell_command_text,
+            )
         })
         .await
         .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
@@ -2775,6 +2784,7 @@ mod tests {
                 &args,
                 command,
                 Duration::from_secs(5),
+                None,
                 registry_permit,
                 global_permit,
                 project_permit,
@@ -2909,6 +2919,7 @@ mod tests {
                 &args,
                 command,
                 Duration::from_secs(5),
+                config.exec_rlimit_nofile,
                 registry_permit,
                 global_permit,
                 project_permit,
