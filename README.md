@@ -64,7 +64,7 @@ Task: Work directly in the current project folder and complete the user's reques
 Before changing anything, inspect relevant files, code, tests, and current worktree, understand the context. Use `srcwalk` as the primary tool for navigating, finding, and reading source code.
 
 For any task that modifies project state (create/update/delete files, code, config, tests, docs, etc.), use `TODO.agent.md` as the durable execution checklist:
-- Before editing, first inspect `TODO.agent.md`. If unfinished items exist, reconcile them with the current repository and resume them before making a new plan.
+- Before editing, first inspect `TODO.agent.md` and compare tasks status with tool `recall({"include_plan":true,"key":"_plan_readback_"})` results. If unfinished items exist, reconcile them with the current repository and resume them before making a new plan.
 - Plan the work end to end before implementation: concrete edits, affected areas code paths, dependencies/callers/callees, risks/edge cases, functional-conflict/regression checks, post-edit implementation review, targeted verification, and E2E testing.
 - Write the plan to `TODO.agent.md`: summary what user asks, what you will do, granular checkbox tasks, including separate items for implementation, re-reading/reviewing modified code and diff; checking whether changes conflict with or regress other functions, modules, APIs, flows, side effects, invariants, tests, or concurrent/user changes; tests/checks; E2E verification; and final completion confirmation.
 - Keep `TODO.agent.md` current. Tick an item only after its work and evidence are complete. If a turn is interrupted, token-limited, or resumed later, unchecked items become the first source of truth for remaining work.
