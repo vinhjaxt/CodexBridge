@@ -5,11 +5,11 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use chrono::Utc;
-use dashmap::DashMap;
+use chrono::{DateTime, Utc};
+use dashmap::{DashMap, mapref::entry::Entry};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -51,6 +51,19 @@ pub struct ProjectActivity {
     pub last_successful_operation: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ProjectLastToolCall {
+    observed_at: Instant,
+    wall_clock: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaleProjectToolCall {
+    pub(crate) project_key: String,
+    pub(crate) last_tool_call_at: String,
+    pub(crate) idle_for: Duration,
+}
+
 struct AuditInner {
     sender: mpsc::Sender<AuditEnvelope>,
     queue_bytes: Arc<Semaphore>,
@@ -61,6 +74,7 @@ struct AuditInner {
     running: DashMap<String, RunningTool>,
     project_activity: DashMap<String, ProjectActivity>,
     project_activity_lock: Mutex<()>,
+    last_tool_calls: DashMap<String, ProjectLastToolCall>,
     cancellation: CancellationToken,
     writer: Mutex<Option<JoinHandle<()>>>,
 }
@@ -277,6 +291,7 @@ const ANSI_RED: &str = "\x1b[31m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_BLUE: &str = "\x1b[34m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
 
 fn console_color(value: &str, color: &str) -> String {
     format!("{color}{value}{ANSI_RESET}")
@@ -1069,6 +1084,26 @@ fn console_line(inner: &AuditInner, event: &Value) -> Option<String> {
             let safe = console_scrub_pretty(event, &inner.auth_token);
             console_plan(&safe)
         }
+        "project_stuck" => {
+            let safe = console_scrub_pretty(event, &inner.auth_token);
+            let last_tool_call = console_optional_string_field(&safe, "last_tool_call_at")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let idle_for_seconds = safe
+                .get("idle_for_seconds")
+                .and_then(Value::as_u64)
+                .map(|seconds| format!("{seconds}s"))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let plan = console_plan(&safe)
+                .unwrap_or_else(|| format!("    {}", console_color("plan unavailable", ANSI_GRAY)));
+            Some(format!(
+                "[{}] {} {} last_tool_call={} idle={}\n{plan}",
+                console_color(&project, ANSI_MAGENTA),
+                console_color("!!", ANSI_RED),
+                console_color("PROJECT STUCK/HALTED", ANSI_RED),
+                console_color(&last_tool_call, ANSI_YELLOW),
+                console_color(&idle_for_seconds, ANSI_YELLOW),
+            ))
+        }
         _ => None,
     }
 }
@@ -1165,6 +1200,7 @@ impl AuditLogger {
             running: DashMap::new(),
             project_activity: DashMap::new(),
             project_activity_lock: Mutex::new(()),
+            last_tool_calls: DashMap::new(),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         });
@@ -1217,6 +1253,63 @@ impl AuditLogger {
                 }));
             }
         }
+    }
+
+    fn record_project_tool_call_at(
+        &self,
+        project_key: &str,
+        observed_at: Instant,
+        wall_clock: DateTime<Utc>,
+    ) {
+        self.0.last_tool_calls.insert(
+            project_key.to_owned(),
+            ProjectLastToolCall {
+                observed_at,
+                wall_clock,
+            },
+        );
+    }
+
+    pub(crate) fn record_project_tool_call(&self, project: &ProjectContext) {
+        self.record_project_tool_call_at(
+            project.effective_project_key.as_str(),
+            Instant::now(),
+            Utc::now(),
+        );
+    }
+
+    pub(crate) fn take_stale_project_tool_calls(
+        &self,
+        now: Instant,
+        stale_after: Duration,
+    ) -> Vec<StaleProjectToolCall> {
+        let keys = self
+            .0
+            .last_tool_calls
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut stale = Vec::new();
+
+        for key in keys {
+            let Entry::Occupied(entry) = self.0.last_tool_calls.entry(key.clone()) else {
+                continue;
+            };
+            let Some(idle_for) = now.checked_duration_since(entry.get().observed_at) else {
+                continue;
+            };
+            if idle_for <= stale_after {
+                continue;
+            }
+            let (_, activity) = entry.remove_entry();
+            stale.push(StaleProjectToolCall {
+                project_key: key,
+                last_tool_call_at: activity.wall_clock.to_rfc3339(),
+                idle_for,
+            });
+        }
+
+        stale
     }
 
     pub fn tool_started(
@@ -1423,6 +1516,7 @@ mod tests {
             running: DashMap::new(),
             project_activity: DashMap::new(),
             project_activity_lock: Mutex::new(()),
+            last_tool_calls: DashMap::new(),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         }
@@ -1476,6 +1570,91 @@ mod tests {
         assert_eq!(bounded["truncated"], true);
         assert_eq!(bounded["event"], "tool_result");
         assert!(serde_json::to_vec(&bounded).unwrap().len() < 4608);
+    }
+
+    #[test]
+    fn last_tool_call_map_refreshes_evicts_after_five_minutes_and_readds() {
+        let logger = AuditLogger(Arc::new(console_test_inner()));
+        let started = Instant::now();
+        let wall_clock = Utc::now();
+        logger.record_project_tool_call_at("project-a", started, wall_clock);
+
+        assert!(
+            logger
+                .take_stale_project_tool_calls(
+                    started + Duration::from_secs(5 * 60),
+                    Duration::from_secs(5 * 60),
+                )
+                .is_empty(),
+            "exactly five minutes is not older than the threshold"
+        );
+
+        let refreshed_at = started + Duration::from_secs(4 * 60);
+        let refreshed_wall_clock = wall_clock + chrono::Duration::minutes(4);
+        logger.record_project_tool_call_at("project-a", refreshed_at, refreshed_wall_clock);
+        assert!(
+            logger
+                .take_stale_project_tool_calls(
+                    started + Duration::from_secs(6 * 60),
+                    Duration::from_secs(5 * 60),
+                )
+                .is_empty(),
+            "a refresh must reset the stale age"
+        );
+
+        let stale = logger.take_stale_project_tool_calls(
+            refreshed_at + Duration::from_secs(5 * 60 + 1),
+            Duration::from_secs(5 * 60),
+        );
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].project_key, "project-a");
+        assert_eq!(
+            stale[0].last_tool_call_at,
+            refreshed_wall_clock.to_rfc3339()
+        );
+        assert_eq!(stale[0].idle_for, Duration::from_secs(5 * 60 + 1));
+        assert!(!logger.0.last_tool_calls.contains_key("project-a"));
+
+        logger.record_project_tool_call_at(
+            "project-a",
+            refreshed_at + Duration::from_secs(5 * 60 + 2),
+            refreshed_wall_clock + chrono::Duration::seconds(5 * 60 + 2),
+        );
+        assert!(logger.0.last_tool_calls.contains_key("project-a"));
+    }
+
+    #[test]
+    fn project_stuck_console_line_highlights_project_timestamp_and_plan() {
+        let inner = console_test_inner();
+        let line = console_line(
+            &inner,
+            &json!({
+                "event":"project_stuck",
+                "project":{"effective_key":"project-a"},
+                "last_tool_call_at":"2026-10-03T06:00:00+00:00",
+                "idle_for_seconds":301,
+                "plan":{
+                    "items":[
+                        {"step":"implement watchdog","status":"in_progress"},
+                        {"step":"verify tests","status":"pending"}
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(line.contains("\x1b[35mproject-a\x1b[0m"), "{line:?}");
+        assert!(
+            line.contains("\x1b[31mPROJECT STUCK/HALTED\x1b[0m"),
+            "{line:?}"
+        );
+        assert!(
+            line.contains("\x1b[33m2026-10-03T06:00:00+00:00\x1b[0m"),
+            "{line:?}"
+        );
+        assert!(line.contains("implement watchdog"), "{line:?}");
+        assert!(line.contains("\x1b[33min_progress\x1b[0m"), "{line:?}");
+        assert!(line.contains("\x1b[90mpending\x1b[0m"), "{line:?}");
     }
 
     #[test]
@@ -1575,6 +1754,7 @@ mod tests {
             running: DashMap::new(),
             project_activity: DashMap::new(),
             project_activity_lock: Mutex::new(()),
+            last_tool_calls: DashMap::new(),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         };
@@ -1776,6 +1956,7 @@ mod tests {
             running: DashMap::new(),
             project_activity: DashMap::new(),
             project_activity_lock: Mutex::new(()),
+            last_tool_calls: DashMap::new(),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         };
@@ -1834,6 +2015,7 @@ mod tests {
             running: DashMap::new(),
             project_activity: DashMap::new(),
             project_activity_lock: Mutex::new(()),
+            last_tool_calls: DashMap::new(),
             cancellation: CancellationToken::new(),
             writer: Mutex::new(None),
         };

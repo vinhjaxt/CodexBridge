@@ -27,13 +27,16 @@ use tokio_util::sync::CancellationToken;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use crate::{
-    audit::AuditLogger,
+    audit::{AuditLogger, StaleProjectToolCall},
     config::{AuthMode, BindAddress, Config},
     error::{AppError, Result},
     project::ProjectResolver,
-    storage::Storage,
+    storage::{PlanRecord, Storage},
     tools::{AgentHandler, SharedState},
 };
+
+const PROJECT_ACTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const PROJECT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 
 enum BoundListener {
     Tcp(tokio::net::TcpListener),
@@ -332,6 +335,64 @@ async fn session_maintenance(
     }
 }
 
+fn plan_has_unfinished_work(plan: &PlanRecord) -> bool {
+    plan.items
+        .iter()
+        .any(|item| matches!(item.status.as_str(), "pending" | "in_progress"))
+}
+
+fn sweep_project_activity(
+    storage: &Storage,
+    audit: &AuditLogger,
+    now: Instant,
+    stale_after: Duration,
+) {
+    for stale in audit.take_stale_project_tool_calls(now, stale_after) {
+        inspect_stale_project(storage, audit, stale);
+    }
+}
+
+fn inspect_stale_project(storage: &Storage, audit: &AuditLogger, stale: StaleProjectToolCall) {
+    match storage.plan_get(&stale.project_key) {
+        Ok(Some(plan)) if plan_has_unfinished_work(&plan) => {
+            audit.emit(json!({
+                "event":"project_stuck",
+                "project":{"effective_key":stale.project_key},
+                "last_tool_call_at":stale.last_tool_call_at,
+                "idle_for_seconds":stale.idle_for.as_secs(),
+                "plan":plan,
+            }));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            audit.emit(json!({
+                "event":"project_activity_watchdog_error",
+                "project":{"effective_key":stale.project_key},
+                "last_tool_call_at":stale.last_tool_call_at,
+                "error":{"code":error.code(),"message":error.message()},
+            }));
+        }
+    }
+}
+
+async fn project_activity_watchdog(
+    storage: Storage,
+    audit: AuditLogger,
+    cancellation: CancellationToken,
+    check_interval: Duration,
+    stale_after: Duration,
+) {
+    let mut interval = tokio::time::interval(check_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = interval.tick() => sweep_project_activity(&storage, &audit, Instant::now(), stale_after),
+        }
+    }
+}
+
 #[derive(Default)]
 struct DashTimestamps(dashmap::DashMap<String, Instant>);
 impl DashTimestamps {
@@ -458,6 +519,13 @@ pub async fn run(config: Config) -> Result<()> {
         audit.clone(),
         session_activity,
     ));
+    let project_activity_watchdog = tokio::spawn(project_activity_watchdog(
+        shared.storage.clone(),
+        audit.clone(),
+        cancellation.child_token(),
+        PROJECT_ACTIVITY_CHECK_INTERVAL,
+        PROJECT_STALE_AFTER,
+    ));
     let process_cleanup = {
         let interactive = shared.interactive.clone();
         let ct = cancellation.child_token();
@@ -503,6 +571,7 @@ pub async fn run(config: Config) -> Result<()> {
     shared.interactive.shutdown();
     tracing::info!("CodexBridge shutdown started");
     let _ = tokio::time::timeout(Duration::from_secs(10), maintenance).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), project_activity_watchdog).await;
     let _ = tokio::time::timeout(Duration::from_secs(10), process_cleanup).await;
     if let Some(status_task) = status_task {
         let _ = status_task.await;
@@ -537,6 +606,7 @@ pub async fn run(config: Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::LogConfig;
+    use crate::storage::PlanItemRecord;
     use tower::ServiceExt;
 
     #[cfg(unix)]
@@ -612,6 +682,74 @@ mod tests {
             timestamps.age("transport-a", started + Duration::from_secs(15)),
             Some(Duration::from_secs(5))
         );
+    }
+
+    #[tokio::test]
+    async fn stale_project_logs_only_when_plan_has_unfinished_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        storage
+            .plan_set(
+                "stuck-project",
+                Some("watchdog regression".to_owned()),
+                vec![PlanItemRecord {
+                    step: "finish implementation".to_owned(),
+                    status: "in_progress".to_owned(),
+                }],
+            )
+            .unwrap();
+        storage
+            .plan_set(
+                "done-project",
+                None,
+                vec![PlanItemRecord {
+                    step: "already done".to_owned(),
+                    status: "completed".to_owned(),
+                }],
+            )
+            .unwrap();
+
+        let log_root = directory.path().join("logs");
+        let audit = AuditLogger::new(
+            LogConfig {
+                root: log_root.clone(),
+                queue_capacity: 16,
+                queue_max_bytes: 64 * 1024,
+                console_param_bytes: 256,
+                console_result_bytes: 256,
+                file_event_bytes: 4096,
+                max_file_bytes: 1024 * 1024,
+                max_files: 1,
+            },
+            "secret-token".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        for project_key in ["stuck-project", "done-project", "no-plan-project"] {
+            inspect_stale_project(
+                &storage,
+                &audit,
+                StaleProjectToolCall {
+                    project_key: project_key.to_owned(),
+                    last_tool_call_at: "2026-10-03T06:00:00+00:00".to_owned(),
+                    idle_for: Duration::from_secs(301),
+                },
+            );
+        }
+        audit.shutdown().await;
+
+        let log = std::fs::read_to_string(log_root.join("rust-agent.log")).unwrap();
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "project_stuck")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{log}");
+        assert_eq!(events[0]["project"]["effective_key"], "stuck-project");
+        assert_eq!(events[0]["last_tool_call_at"], "2026-10-03T06:00:00+00:00");
+        assert_eq!(events[0]["idle_for_seconds"], 301);
+        assert_eq!(events[0]["plan"]["items"][0]["status"], "in_progress");
     }
 
     #[test]

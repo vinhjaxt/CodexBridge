@@ -325,6 +325,7 @@ impl SharedState {
         identity: &RequestIdentity,
     ) -> AppResult<(ProjectContext, OwnedSemaphorePermit, OwnedSemaphorePermit)> {
         let project = self.resolver.resolve_initialized(identity)?;
+        self.audit.record_project_tool_call(&project);
         let (project_tools, _, _) = self
             .project_permits
             .get(project.effective_project_key.as_str())?;
@@ -464,6 +465,7 @@ impl AgentHandler {
             Ok(project) => project,
             Err(error) => return Ok(error_result(&error)),
         };
+        self.shared.audit.record_project_tool_call(&project);
         let (project_tools, _, _) = match self
             .shared
             .project_permits
@@ -512,6 +514,7 @@ impl AgentHandler {
             Ok(project) => project,
             Err(error) => return Ok(error_result(&error)),
         };
+        self.shared.audit.record_project_tool_call(&project);
         let (project_tools, _, _) = match self
             .shared
             .project_permits
@@ -814,6 +817,7 @@ impl AgentHandler {
                 return Ok(error_result(&error));
             }
         };
+        shared.audit.record_project_tool_call(&prepared.project);
         let audit_project = prepared.project.clone();
         let result: AppResult<CallToolResult> = async {
             let (project_tools, _, _) = shared
@@ -2014,6 +2018,64 @@ mod tests {
             "a {retained_bytes}-byte process result still amplified beyond the JSON-escaping budget: {} wire bytes",
             wire.len()
         );
+    }
+
+    #[tokio::test]
+    async fn native_tool_run_records_project_last_tool_call() {
+        use std::{
+            collections::BTreeMap,
+            time::{Duration, Instant},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let project_root = workspace.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let config = Arc::new(
+            crate::config::ConfigBuilder::from_map(BTreeMap::from([
+                ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+                ("WORKSPACE_ROOT".to_owned(), workspace.display().to_string()),
+            ]))
+            .build()
+            .unwrap(),
+        );
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage.clone()).unwrap();
+        let audit = AuditLogger::new(config.logs.clone(), config.auth_token.clone())
+            .await
+            .unwrap();
+        let shared = SharedState::new(
+            config,
+            resolver,
+            storage,
+            audit,
+            crate::upstream::Aggregator::default(),
+        );
+        let handler = AgentHandler::new(shared.clone());
+        let project = ProjectContext {
+            native_project_key: crate::project::ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: crate::project::ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root,
+            metadata_root: directory.path().join("metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+
+        handler
+            .run(Ok(project), "recall", json!({}), |_| async move {
+                Ok(json!({"ok":true}))
+            })
+            .await
+            .unwrap();
+
+        let stale = shared.audit.take_stale_project_tool_calls(
+            Instant::now() + Duration::from_secs(301),
+            Duration::from_secs(300),
+        );
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].project_key, "effective");
+        shared.audit.shutdown().await;
     }
 
     #[tokio::test]
