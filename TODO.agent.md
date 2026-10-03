@@ -96,3 +96,16 @@
     7. **REVIEW/VERIFY** ✅ — Targeted post-edit proof remains keeper 1/1 and `tools::tests` 44/44. Broader final gate exits 0: fmt, clippy with `-D warnings`, all-target/all-feature tests (library 424 passed / 1 intentionally ignored / 0 failed plus all shown integration/main/example targets), and bins/examples build.
     8. **REVIEW/VERIFY** ✅ — Separate same-process review fallback found no correctness, lost-contract, vacuous-test, source-trust, validation-gap, or cleanup finding; no repository review helper or permitted second-model/subagent review was used.
     9. **REVIEW/VERIFY** ✅ — Final pre-reconciliation status is only `TODO.agent.md` and `src/tools/mod.rs` modified; task prefix `tmp-ta83-` was cleaned to zero remaining containers. Persisted plan and project-modification handoff are reconciled immediately after this checklist readback.
+
+# Watchdog environment override (2026-10-03)
+
+- [x] Honor `CODEXBRIDGE_INTERRUPT_IGNORE=plan` for stale-project warnings.
+  - Acceptance: exact env value `plan` emits `project_stuck` for missing, empty, and completed plans; unset/other values retain pending/in-progress filtering; idle eviction and payload remain unchanged.
+  - Affected: `src/server.rs` and this checklist. Risk: accidental broad warning behavior or test env races; use injected boolean in the testable inspection boundary.
+  - AUDIT (2): Existing sweep reads canonical persisted plan after eviction; no-plan and completed-only previously silent. Override is read at sweep time and only changes emission filtering.
+  - IMPLEMENT (3): Added exact-value environment check at sweep and passed override into inspection; preserved the original predicate without override. Added regression for all three formerly silent plan states.
+  - REVIEW/VERIFY (4): complete: cargo fmt --check, clippy all-targets/features -D warnings, full test suite (426 library tests), build bins/examples passed in ephemeral Rust containers.
+- [x] Final integration for watchdog override.
+  - AUDIT (2): Confirmed original five-minute threshold and refresh paths unchanged in reviewed diff.
+  - IMPLEMENT (3): No test/build failures required corrections.
+  - REVIEW/VERIFY (4): reviewed srcwalk diff; full fmt/clippy/test gate and separate fmt/build gate exited 0; git diff --check clean; temporary containers exited with --rm.

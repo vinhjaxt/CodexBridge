@@ -348,19 +348,30 @@ fn sweep_project_activity(
     stale_after: Duration,
 ) {
     for stale in audit.take_stale_project_tool_calls(now, stale_after) {
-        inspect_stale_project(storage, audit, stale);
+        inspect_stale_project(
+            storage,
+            audit,
+            stale,
+            std::env::var_os("CODEXBRIDGE_INTERRUPT_IGNORE").as_deref()
+                == Some(std::ffi::OsStr::new("plan")),
+        );
     }
 }
 
-fn inspect_stale_project(storage: &Storage, audit: &AuditLogger, stale: StaleProjectToolCall) {
+fn inspect_stale_project(
+    storage: &Storage,
+    audit: &AuditLogger,
+    stale: StaleProjectToolCall,
+    ignore_plan: bool,
+) {
     match storage.plan_get(&stale.project_key) {
-        Ok(Some(plan)) if plan_has_unfinished_work(&plan) => {
+        Ok(plan) if ignore_plan || plan.as_ref().is_some_and(plan_has_unfinished_work) => {
             audit.emit(json!({
                 "event":"project_stuck",
                 "project":{"effective_key":stale.project_key},
                 "last_tool_call_at":stale.last_tool_call_at,
                 "idle_for_seconds":stale.idle_for.as_secs(),
-                "plan":plan,
+                    "plan":plan,
             }));
         }
         Ok(_) => {}
@@ -735,6 +746,7 @@ mod tests {
                     last_tool_call_at: "2026-10-03T06:00:00+00:00".to_owned(),
                     idle_for: Duration::from_secs(301),
                 },
+                false,
             );
         }
         audit.shutdown().await;
@@ -750,6 +762,62 @@ mod tests {
         assert_eq!(events[0]["last_tool_call_at"], "2026-10-03T06:00:00+00:00");
         assert_eq!(events[0]["idle_for_seconds"], 301);
         assert_eq!(events[0]["plan"]["items"][0]["status"], "in_progress");
+    }
+
+    #[tokio::test]
+    async fn ignore_plan_reports_completed_empty_and_missing_plans() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        storage
+            .plan_set(
+                "completed",
+                None,
+                vec![PlanItemRecord {
+                    step: "done".to_owned(),
+                    status: "completed".to_owned(),
+                }],
+            )
+            .unwrap();
+        storage.plan_set("empty", None, vec![]).unwrap();
+        let log_root = directory.path().join("logs");
+        let audit = AuditLogger::new(
+            LogConfig {
+                root: log_root.clone(),
+                queue_capacity: 16,
+                queue_max_bytes: 64 * 1024,
+                console_param_bytes: 256,
+                console_result_bytes: 256,
+                file_event_bytes: 4096,
+                max_file_bytes: 1024 * 1024,
+                max_files: 1,
+            },
+            "secret-token".to_owned(),
+        )
+        .await
+        .unwrap();
+        for key in ["completed", "empty", "missing"] {
+            inspect_stale_project(
+                &storage,
+                &audit,
+                StaleProjectToolCall {
+                    project_key: key.to_owned(),
+                    last_tool_call_at: "2026-10-03T06:00:00+00:00".to_owned(),
+                    idle_for: Duration::from_secs(301),
+                },
+                true,
+            );
+        }
+        audit.shutdown().await;
+        let log = std::fs::read_to_string(log_root.join("rust-agent.log")).unwrap();
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "project_stuck")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3, "{log}");
+        assert_eq!(events[0]["plan"]["items"][0]["status"], "completed");
+        assert_eq!(events[1]["plan"]["items"].as_array().unwrap().len(), 0);
+        assert!(events[2]["plan"].is_null());
     }
 
     #[test]
