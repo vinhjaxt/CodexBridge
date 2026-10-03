@@ -109,3 +109,57 @@
   - AUDIT (2): Confirmed original five-minute threshold and refresh paths unchanged in reviewed diff.
   - IMPLEMENT (3): No test/build failures required corrections.
   - REVIEW/VERIFY (4): reviewed srcwalk diff; full fmt/clippy/test gate and separate fmt/build gate exited 0; git diff --check clean; temporary containers exited with --rm.
+
+# Exec default timeout (2026-10-03)
+
+- [x] Raise the built-in `EXEC_DEFAULT_TIMEOUT_MS` default to five minutes.
+  - Acceptance: change only the built-in default from `120_000` ms to `300_000` ms; preserve env override precedence, `EXEC_MAX_TIMEOUT_MS=3_600_000`, validation, and process timeout semantics.
+  - Affected: `src/config.rs` and this checklist only. Risk is limited to unintended adjacent config changes.
+  - AUDIT (2): Current source defines the built-in at `ConfigBuilder::build`; `EXEC_DEFAULT_TIMEOUT_MS` env values still override it, and the existing max/default validation is separate.
+  - AUDIT (2): Starting worktree is clean; no default-value-specific test exists, so focused config tests plus source/diff review are sufficient for this one-literal behavior change.
+  - IMPLEMENT (3): Changed only the built-in `EXEC_DEFAULT_TIMEOUT_MS` fallback in `ConfigBuilder::build` from `120_000` to `300_000` ms.
+  - IMPLEMENT (3): preserve `EXEC_MAX_TIMEOUT_MS` and all timeout enforcement logic unchanged.
+  - IMPLEMENT (3): do not add unrelated source, test, or configuration changes.
+  - REVIEW/VERIFY (4): Re-read the changed config region; `srcwalk review` reports one changed production symbol (`ConfigBuilder::build`) and no other source hunk.
+  - REVIEW/VERIFY (4): Ephemeral `docker.io/library/rust:latest` container ran `cargo test config::tests:: --lib -j1`: 20 passed, 0 failed.
+  - REVIEW/VERIFY (4): The same container ran `cargo fmt --all --check` successfully before the focused tests; final diff/whitespace check is part of integration below.
+  - REVIEW/VERIFY (4): Functional acceptance is satisfied; final checklist/plan reconciliation proceeds in the integration task.
+
+- [x] Final integration for exec default timeout.
+  - Depends on: five-minute default task.
+  - Acceptance: final worktree contains exactly the requested functional change, required focused checks pass, and no task-owned process/container remains.
+  - AUDIT (2): Final combined-state review shows only `TODO.agent.md` and `src/config.rs` modified; the production diff is exactly one literal replacement at `ConfigBuilder::build`.
+  - AUDIT (2): `EXEC_MAX_TIMEOUT_MS` remains `3_600_000`; env/override precedence, validation, and process timeout enforcement are unchanged.
+  - IMPLEMENT (3): No correction was required after review or focused tests.
+  - IMPLEMENT (3): No extra functional changes were added; no tests or other source files were modified.
+  - IMPLEMENT (3): Cleanup block for prefix `tmp-tmo5-` completed; final container listing is empty and no task-owned volume/network/image was created.
+  - REVIEW/VERIFY (4): Re-read all of `src/config.rs` in bounded source ranges and reviewed the final `srcwalk review`; no adjacent behavior change found.
+  - REVIEW/VERIFY (4): Final focused evidence remains `cargo fmt --all --check` plus `cargo test config::tests:: --lib -j1` (20 passed, 0 failed); `git diff --check` exits 0.
+  - REVIEW/VERIFY (4): Persisted plan/handoff is reconciled after this checklist update.
+  - REVIEW/VERIFY (4): Completion readback follows immediately before final response.
+
+# Exec default timeout — 30 minutes (2026-10-03)
+
+- [x] Raise the built-in `EXEC_DEFAULT_TIMEOUT_MS` default from five to thirty minutes.
+  - Acceptance: change only the built-in fallback from `300_000` ms to `1_800_000` ms; preserve env override precedence, `EXEC_MAX_TIMEOUT_MS=3_600_000`, validation, and process timeout semantics.
+  - Affected: `src/config.rs` and this checklist only. Risk: unintended adjacent config edits.
+  - AUDIT (2): Current source still has the prior `300_000` ms fallback in `ConfigBuilder::build`; max timeout remains `3_600_000` ms.
+  - AUDIT (2): Starting worktree contains only the prior timeout/checklist changes from the immediately preceding task; no unrelated files are dirty.
+  - IMPLEMENT (3): Changed only the built-in fallback in `ConfigBuilder::build` from `300_000` ms to `1_800_000` ms.
+  - IMPLEMENT (3): preserve max timeout and environment/override behavior unchanged.
+  - IMPLEMENT (3): make no unrelated source/test/config changes.
+  - REVIEW/VERIFY (4): Re-read the changed config region; `srcwalk review` reports the same single production symbol/hunk and `EXEC_MAX_TIMEOUT_MS` remains `3_600_000` ms.
+  - REVIEW/VERIFY (4): Ephemeral Rust container ran `cargo fmt --all --check` and `cargo test config::tests:: --lib -j1`; 20 tests passed, 0 failed.
+  - REVIEW/VERIFY (4): `git diff --check` passes; functional acceptance is satisfied and final reconciliation proceeds below.
+
+- [x] Final integration for 30-minute exec default timeout.
+  - Depends on: thirty-minute default task.
+  - Acceptance: final production diff reflects the requested 30-minute default only; focused checks pass; no task-owned process/container remains.
+  - AUDIT (2): Final combined-state review shows only `TODO.agent.md` and `src/config.rs` modified; the production diff is exactly one literal replacement from HEAD (`120_000` to `1_800_000`).
+  - AUDIT (2): `EXEC_MAX_TIMEOUT_MS` remains `3_600_000`; environment/override precedence, validation, diagnostic reporting, and process timeout semantics are unchanged.
+  - IMPLEMENT (3): No correction was required after final review or focused tests.
+  - IMPLEMENT (3): No extra functional changes or tests were added.
+  - IMPLEMENT (3): Cleanup block for prefix `tmp-tmo30-` completed; final container listing is empty and no task-owned volumes/networks/images remain.
+  - REVIEW/VERIFY (4): Re-read `src/config.rs` across the complete file after the final source edit and reviewed `srcwalk review`; no adjacent behavior change found.
+  - REVIEW/VERIFY (4): `cargo fmt --all --check` passed; `cargo test config::tests:: --lib -j1` passed 20/20; final `git diff --check` passed.
+  - REVIEW/VERIFY (4): Persisted plan/handoff reconciliation and completion readback follow immediately.

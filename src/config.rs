@@ -585,7 +585,7 @@ impl ConfigBuilder {
                 self.usize_value("STATUS_INTERVAL_SECS", 0)? as u64
             ),
             exec_default_timeout: Duration::from_millis(
-                self.usize_value("EXEC_DEFAULT_TIMEOUT_MS", 120_000)? as u64,
+                self.usize_value("EXEC_DEFAULT_TIMEOUT_MS", 1_800_000)? as u64,
             ),
             exec_max_timeout: Duration::from_millis(
                 self.usize_value("EXEC_MAX_TIMEOUT_MS", 3_600_000)? as u64,
