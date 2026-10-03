@@ -1575,21 +1575,6 @@ mod tests {
     }
 
     #[test]
-    fn every_public_tool_has_an_output_schema() {
-        let router = AgentHandler::native_router();
-        for name in PUBLIC_TOOL_NAMES {
-            let route = router
-                .map
-                .get(*name)
-                .unwrap_or_else(|| panic!("missing tool {name}"));
-            assert!(
-                route.attr.output_schema.is_some(),
-                "missing output schema for {name}"
-            );
-        }
-    }
-
-    #[test]
     fn public_tool_names_are_valid_mcp_identifiers() {
         for name in PUBLIC_TOOL_NAMES {
             assert!(

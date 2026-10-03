@@ -42,3 +42,57 @@
     5. **IMPLEMENT** ✅ — All task containers used `--rm`; final `podman ps -a --filter name=tmp-wdg3c7-` returned no matching resources. Final worktree contains only `src/audit.rs`, `src/server.rs`, `src/tools/mod.rs`, and this checklist.
     6. **REVIEW/VERIFY** ✅ — Re-read all modified source files in full, reviewed the complete source diff and final `srcwalk review`, and confirmed `git diff --check` exits 0 against the initially clean worktree.
     7. **REVIEW/VERIFY** ✅ — Integrated regression gate remains valid (exit 0); final container/resource check is empty and no task command session remains running.
+
+# Test audit — native tool contract coverage
+
+- [x] Prune redundant output-schema coverage at the native tool-contract owner.
+  - **Acceptance criteria**
+    - Apply `/shared/SKILL-TEST-AUDIT.md` in audit mode without broad speculative cleanup.
+    - Remove only tests whose failure is already caught by a stronger test at the same owner boundary.
+    - Preserve all independent public MCP schema, registry, protocol, security, platform, persistence, and lifecycle contracts.
+    - Do not add or preserve production seams solely to support implementation-coupled tests.
+  - **Candidate evidence**
+    - Candidate: `tools::tests::every_public_tool_has_an_output_schema` in `src/tools/mod.rs`.
+    - Actual failure detected: any `PUBLIC_TOOL_NAMES` route has `output_schema == None`.
+    - Stronger keeper: `tools::tests::every_public_tool_has_object_input_and_output_contracts` iterates the same public routes and requires every output schema to resolve to `type == "object"`; a missing output schema produces `None` and fails the same assertion.
+    - Owner: `AgentHandler::native_router` composes `NativeToolRegistry::build` and assigns `typed_output_schema`; no test-only production seam is involved.
+    - History: the duplicate test dates to initial commit `be84038`; no dedicated bug-regression history was found.
+    - Deletion unlocked: one redundant unit test only; no production/support deletion.
+    - Risk: loss of the duplicate test's specialized failure message. Functional regression detection remains at the same owner boundary.
+    - Focused validation: run both candidate and keeper before deletion; after deletion run the keeper plus the full `tools::tests` owner suite.
+  - **Retained false positive**
+    - `windows_taskkill_program_for_test` is a test-only seam, but it currently supports a Windows security/platform invariant that `taskkill.exe` is launched by absolute System32 path. Native Windows runtime proof is unavailable locally, so this audit will not weaken or rewrite that contract speculatively.
+  - **Affected paths**
+    - `src/tools/mod.rs`: delete only the redundant output-schema-presence test.
+    - `TODO.agent.md`: durable audit evidence and verification results.
+  - **Risks**
+    - Accidentally dropping the only proof that all public tools expose an output schema.
+    - Expanding a narrow audit into unrelated test cleanup.
+    - Treating cross-compile evidence as native Windows runtime proof.
+  - **Phases**
+    1. **AUDIT** ✅ — Read the requested skill completely from the available path `/shared/SKILL-TEST-AUDIT.md`; starting worktree was clean; persisted project plan was empty; root instructions and `srcwalk guide` were consumed.
+    2. **AUDIT** ✅ — Inspected the native registry/schema owner and overlapping tests. Baseline container proof: candidate 1/1 pass and stronger keeper 1/1 pass in `docker.io/library/rust:latest`. Candidate evidence above satisfies the skill's deletion fields.
+    3. **IMPLEMENT** ✅ — Deleted only `every_public_tool_has_an_output_schema` from `src/tools/mod.rs`.
+    4. **IMPLEMENT** ✅ — Preserved all neighboring contract tests and production schema/registry code unchanged; current diff has no production-code hunk.
+    5. **IMPLEMENT** ✅ — `srcwalk review` shows the only source hunk is the removed test; no production seam or support helper becomes unused because the candidate exercised `AgentHandler::native_router` directly.
+    6. **REVIEW/VERIFY** ✅ — Post-edit container proof: stronger keeper 1/1 passed, then full `tools::tests` owner suite passed 44/44 with 0 failures.
+    7. **REVIEW/VERIFY** ✅ — Final `tmp-ta83-gate` container exited 0 after `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -j1 -- -D warnings`, `cargo test --all-targets --all-features -j1`, and `cargo build --bins --examples --all-features -j1`. Library result: 424 passed, 1 intentionally ignored live-Podman probe, 0 failed; all integration/main/example targets shown by Cargo passed. Host `git diff --check` also exited 0.
+    8. **REVIEW/VERIFY** ✅ — No repository review helper exists. Per skill fallback, performed a separate fresh review pass over the complete final diff for correctness, lost-contract, false-positive, vacuous-test, source-trust, validation-gap, and cleanup risks; no actionable finding. This was not independently executed by a second model/process.
+    9. **REVIEW/VERIFY** ✅ — `git diff --numstat`: `src/tools/mod.rs` 0 additions / 15 deletions (test-only), `TODO.agent.md` metadata only. Cleanup block for prefix `tmp-ta83-` completed and confirmed zero remaining task containers; no task-owned volumes/networks/images were created.
+
+- [x] Final integration verification for test audit.
+  - **Depends on**: redundant output-schema coverage task.
+  - **Acceptance criteria**
+    - Final repository state retains one strong owner-boundary proof for every public tool's object input/output contract.
+    - No audit edit weakens unrelated tests or production behavior.
+    - Required checks are bound to the final worktree state and no task-owned process/container/resource remains.
+  - **Phases**
+    1. **AUDIT** ✅ — Final ledger satisfies the retention bar: one same-owner duplicate was removed; the stronger public object-schema keeper remains; the Windows taskkill test seam was retained because it protects a distinct platform/security invariant that was not safely replaceable without native Windows runtime proof.
+    2. **AUDIT** ✅ — Re-read the surviving keeper after all edits: it still iterates every `PUBLIC_TOOL_NAMES` route returned by `AgentHandler::native_router` and fails when either input/output contract does not resolve to an object. Registry/schema production code remains untouched.
+    3. **IMPLEMENT** ✅ — Final review found no in-scope correction beyond the single intended deletion, so no late source edit was required.
+    4. **IMPLEMENT** ✅ — Unrelated production and test behavior is untouched; final worktree contains only `src/tools/mod.rs` plus this audit checklist.
+    5. **IMPLEMENT** ✅ — Not applicable after the full gate: no Rust source changed after that gate, so its evidence was not invalidated by later checklist-only edits.
+    6. **REVIEW/VERIFY** ✅ — Complete final diff from the clean starting worktree is one 15-line unit-test deletion plus audit metadata; `git diff --check` exits 0.
+    7. **REVIEW/VERIFY** ✅ — Targeted post-edit proof remains keeper 1/1 and `tools::tests` 44/44. Broader final gate exits 0: fmt, clippy with `-D warnings`, all-target/all-feature tests (library 424 passed / 1 intentionally ignored / 0 failed plus all shown integration/main/example targets), and bins/examples build.
+    8. **REVIEW/VERIFY** ✅ — Separate same-process review fallback found no correctness, lost-contract, vacuous-test, source-trust, validation-gap, or cleanup finding; no repository review helper or permitted second-model/subagent review was used.
+    9. **REVIEW/VERIFY** ✅ — Final pre-reconciliation status is only `TODO.agent.md` and `src/tools/mod.rs` modified; task prefix `tmp-ta83-` was cleaned to zero remaining containers. Persisted plan and project-modification handoff are reconciled immediately after this checklist readback.
