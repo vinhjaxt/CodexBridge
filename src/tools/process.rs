@@ -46,15 +46,14 @@ use crate::{
 use std::os::unix::fs::PermissionsExt;
 
 const MIN_YIELD_MS: u64 = 250;
-const MAX_YIELD_MS: u64 = 30_000;
+const MAX_YIELD_MS: u64 = 120_000;
 // Keep the initial MCP request comfortably below common client/proxy request
 // deadlines. Long-running commands remain resident and are continued with
 // write_stdin instead of risking a transport-level timeout at the boundary.
 const MAX_INITIAL_YIELD_MS: u64 = 20_000;
-// Follow-up polls are MCP requests too. Keep them under the same conservative
-// transport budget as the initial request; callers can repeat write_stdin for
-// longer-running processes instead of holding one connector request open.
-const MAX_POLL_YIELD_MS: u64 = MAX_INITIAL_YIELD_MS;
+// Follow-up polls may wait longer than the initial exec call, while still
+// remaining bounded so callers can repeat write_stdin for longer processes.
+const MAX_POLL_YIELD_MS: u64 = 40_000;
 const TIMEOUT_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 const PODMAN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PODMAN_CIDFILE_PREFIX: &str = "cid.";
@@ -1904,7 +1903,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY or SIGINT on Unix; hidden non-TTY Windows processes have no console and reject interrupt, so use terminate or kill for those sessions. terminate uses SIGTERM on Unix or taskkill tree termination on Windows with a forced fallback when graceful termination is unavailable; kill forcefully ends the tree. wait_for_exit_ms/yield_time_ms are bounded to a transport-safe poll window; repeat write_stdin for longer waits instead of holding one MCP request open. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output/status when it fits in that poll window. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
+        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill. interrupt sends Ctrl-C to a PTY or SIGINT on Unix; hidden non-TTY Windows processes have no console and reject interrupt, so use terminate or kill for those sessions. terminate uses SIGTERM on Unix or taskkill tree termination on Windows with a forced fallback when graceful termination is unavailable; kill forcefully ends the tree. wait_for_exit_ms/yield_time_ms are bounded poll waits; repeat write_stdin for longer waits instead of holding one MCP request open. When waiting to poll a running session, do not spend an extra tool call on shell/bash sleep before write_stdin: write_stdin already performs the requested wait via wait_for_exit_ms/yield_time_ms while also returning current process output and terminal status. Combine signal with wait_for_exit_ms to wait for terminal completion and drain final output/status when it fits in that poll window. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
     )]
     async fn write_stdin(
         &self,
@@ -4257,15 +4256,11 @@ mod tests {
     }
 
     #[test]
-    fn initial_yield_is_below_common_transport_deadline() {
+    fn yield_limits_match_process_tool_contract() {
+        assert_eq!(MIN_YIELD_MS, 250);
         assert_eq!(MAX_INITIAL_YIELD_MS, 20_000);
-        assert_eq!(MAX_YIELD_MS, 30_000);
-    }
-
-    #[test]
-    fn regression_poll_yield_is_below_common_transport_deadline() {
-        assert_eq!(MAX_POLL_YIELD_MS, MAX_INITIAL_YIELD_MS);
-        assert_eq!(MAX_POLL_YIELD_MS, 20_000);
+        assert_eq!(MAX_POLL_YIELD_MS, 40_000);
+        assert_eq!(MAX_YIELD_MS, 120_000);
     }
 
     #[test]

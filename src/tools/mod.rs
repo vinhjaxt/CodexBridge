@@ -1906,6 +1906,18 @@ mod tests {
     }
 
     #[test]
+    fn write_stdin_description_avoids_redundant_sleep_tool_calls() {
+        let router = AgentHandler::native_router();
+        let description = router
+            .map
+            .get("write_stdin")
+            .and_then(|route| route.attr.description.as_deref())
+            .unwrap_or("");
+        assert!(description.contains("do not spend an extra tool call on shell/bash sleep"));
+        assert!(description.contains("write_stdin already performs the requested wait"));
+    }
+
+    #[test]
     fn apply_patch_input_schema_is_only_codex_patch_input() {
         let router = AgentHandler::native_router();
         let schema = &router.map.get("apply_patch").unwrap().attr.input_schema;

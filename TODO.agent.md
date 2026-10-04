@@ -163,3 +163,49 @@
   - REVIEW/VERIFY (4): Re-read `src/config.rs` across the complete file after the final source edit and reviewed `srcwalk review`; no adjacent behavior change found.
   - REVIEW/VERIFY (4): `cargo fmt --all --check` passed; `cargo test config::tests:: --lib -j1` passed 20/20; final `git diff --check` passed.
   - REVIEW/VERIFY (4): Persisted plan/handoff reconciliation and completion readback follow immediately.
+
+# write_stdin poll/yield defaults (2026-10-03)
+
+- [x] Adjust write_stdin yield ceilings and polling guidance.
+  - Acceptance: keep `MIN_YIELD_MS=250`; set `MAX_YIELD_MS=120_000`; set `MAX_POLL_YIELD_MS=40_000`; keep `MAX_INITIAL_YIELD_MS=20_000` unchanged; update the public `write_stdin` description to explicitly prohibit using shell/bash `sleep` instead of `write_stdin` wait/polling.
+  - Affected: `src/tools/process.rs`, focused description regression in `src/tools/mod.rs`, and this checklist. Preserve process lifetime timeout semantics and all unrelated tool contracts.
+  - AUDIT (2): Current constants are `250`, `30_000`, `20_000`, with poll max aliased to initial max; existing tests assert 30s/20s and must be updated coherently.
+  - AUDIT (2): Current public `write_stdin` description explains repeated polling but does not explicitly forbid shell sleep; starting worktree is clean.
+  - IMPLEMENT (3): Set `MAX_YIELD_MS=120_000` and `MAX_POLL_YIELD_MS=40_000`; kept `MIN_YIELD_MS=250` and `MAX_INITIAL_YIELD_MS=20_000`; updated the adjacent poll-bound comment.
+  - IMPLEMENT (3): Updated the public `write_stdin` description to explicitly forbid shell/bash sleep as a wait/poll substitute and added a direct native-router description regression assertion.
+  - IMPLEMENT (3): preserve initial exec yield cap, process execution deadlines, input/signal/replay semantics, and unrelated public schemas.
+  - REVIEW/VERIFY (4): Re-read both modified Rust source files across their complete contents (including the previously truncated `src/tools/mod.rs` window) and reviewed the changed regions plus `srcwalk review`; no adjacent behavior change found.
+  - REVIEW/VERIFY (4): Ephemeral `rust:latest` container: `cargo fmt --all --check` passed; process tests passed 57/57 runnable with 1 intentional live-Podman ignore; write_stdin description regression passed; public-description bound regression passed; `cargo clippy --lib --all-features -- -D warnings` passed.
+  - REVIEW/VERIFY (4): `git diff --check` passed before verification; final diff/cleanup/plan reconciliation proceeds in integration below.
+
+- [x] Final integration for write_stdin poll/yield defaults.
+  - Depends on: yield/description task.
+  - Acceptance: final diff implements only the requested limits/guidance plus focused tests; all targeted checks pass; no task-owned process/container remains.
+  - AUDIT (2): Final combined-state review shows only `TODO.agent.md`, `src/tools/process.rs`, and the focused `src/tools/mod.rs` regression changed; production behavior changes are limited to the requested yield constants/comment and `write_stdin` description.
+  - AUDIT (2): `MAX_INITIAL_YIELD_MS` remains `20_000`; `ProcessRegistry::start` execution-deadline selection/enforcement is unchanged, so the existing process lifetime timeout policy is preserved.
+  - IMPLEMENT (3): No corrections were required after source review, focused tests, or clippy.
+  - IMPLEMENT (3): No unrelated production/schema changes were added; the only `src/tools/mod.rs` change is the focused description regression test.
+  - IMPLEMENT (3): Cleanup for prefix `tmp-yield40-` completed; final container listing is empty and no task-owned volume/network/image remains.
+  - REVIEW/VERIFY (4): Final `srcwalk review` and constant discovery confirm `MIN_YIELD_MS=250`, `MAX_YIELD_MS=120_000`, `MAX_INITIAL_YIELD_MS=20_000`, and `MAX_POLL_YIELD_MS=40_000` with the expected clamp call sites.
+  - REVIEW/VERIFY (4): Focused evidence remains fmt pass, process tests 57/57 runnable pass with 1 intentional ignored live-Podman test, two description regressions pass, clippy `--lib --all-features -D warnings` pass, and final `git diff --check` pass.
+  - REVIEW/VERIFY (4): Persisted plan/handoff reconciliation and completion readback follow immediately.
+
+# write_stdin polling efficiency wording (2026-10-03)
+
+- [x] Refine the public write_stdin guidance to explain why shell sleep is wasteful.
+  - Acceptance: make clear that `write_stdin` itself performs the requested wait while polling, so a separate shell/bash `sleep` before polling consumes an extra tool call without adding useful waiting behavior; preserve all runtime semantics and yield constants.
+  - Affected: `src/tools/process.rs`, focused regression wording in `src/tools/mod.rs`, and this checklist only.
+  - AUDIT (2): Existing description prohibits shell/bash sleep but motivates it mainly by output/status collection rather than explicitly by avoiding a redundant tool call.
+  - AUDIT (2): Starting worktree contains only the immediately preceding yield/description task changes; preserve them exactly apart from this wording refinement.
+  - IMPLEMENT (3): Description now states that an extra shell/bash `sleep` before `write_stdin` wastes a tool call because `write_stdin` itself performs the requested wait via `wait_for_exit_ms`/`yield_time_ms` while returning process output/status.
+  - IMPLEMENT (3): Focused regression renamed/updated to assert both the redundant-tool-call wording and the fact that `write_stdin` already performs the wait.
+  - IMPLEMENT (3): preserve all constants, clamp behavior, schemas, and process lifetime semantics.
+  - REVIEW/VERIFY (4): Re-read both changed regions and `srcwalk review`; no runtime/control-flow change beyond the prior yield-limit task.
+  - REVIEW/VERIFY (4): Ephemeral `rust:latest`: `cargo fmt --all --check`, focused description regression, public-description bound regression, and `cargo clippy --lib --all-features -- -D warnings` all passed; `git diff --check` passed.
+
+- [x] Final integration for write_stdin polling efficiency wording.
+  - Depends on: wording refinement task.
+  - Acceptance: only wording/test/checklist change relative to the preceding state; focused verification and diff checks pass.
+  - AUDIT (2): Final review confirms the yield constants remain `250`, `120_000`, `20_000`, and `40_000`; this follow-up changed only the public description wording, its focused regression wording/name, and this checklist relative to the preceding state.
+  - IMPLEMENT (3): No correction was required after focused tests/review; runtime polling, execution timeout, schema, and clamp behavior remain unchanged.
+  - REVIEW/VERIFY (4): Final `srcwalk review`, literal discovery of both efficiency phrases, `git diff --check`, and task-container absence all pass; focused fmt/tests/clippy evidence remains valid after the final wording edit.
