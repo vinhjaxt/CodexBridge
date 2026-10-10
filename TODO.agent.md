@@ -237,3 +237,30 @@
   - **REVIEW/VERIFY (4)**: Read behavioral source and tests after edits, inspected final `srcwalk review` and complete `git diff` (8 files), with no unrelated production changes or hidden creation paths found.
   - **REVIEW/VERIFY (4)**: Executed required cleanup for `tmp-gate10-`; final Podman containers/volumes/networks/images all empty. `git diff --check` passed; only intended 8 files modified. No running task sessions remain.
   - **REVIEW/VERIFY (4)**: Reconciled checklist. Persistence plan and project handoff are cleared/recorded after this integration entry readback; no further required implementation/test remains.
+
+# Restore chatgpt_turn_init public description (2026-10-10)
+
+- [x] Restore the exact previous public tool description.
+  - **Acceptance**: The `chatgpt_turn_init` description matches the user-supplied text byte-for-byte; no arguments, schemas, handler flow, runtime config, or other tool descriptions change.
+  - **Affected**: `src/tools/mod.rs` description only; `TODO.agent.md` audit notes. Risk: accidental changes to quoted text or unrelated source.
+  - **AUDIT (2)**: Initial worktree was clean; the native fallback gate is already committed in HEAD. `srcwalk show src/tools/mod.rs:756-762` confirms the added fallback wording is contained in the single description string. `_plan_readback_` was empty. This is metadata-only; runtime behavior and API shape are unchanged.
+  - **AUDIT (2)**: Use the user-provided exact string as the expected output and compare it literally after editing. Review the scoped diff and run formatting plus a focused public-description contract test; broader runtime tests are not required for unchanged code paths.
+  - **IMPLEMENT (3)**: Replaced precisely the `chatgpt_turn_init` public description with the user-supplied original string.
+  - **IMPLEMENT (3)**: Direct source comparison of the string is exact: 1,140 characters; no signature, route/handler, runtime logic, or config edits.
+  - **IMPLEMENT (3)**: Public documentation for the native fallback gate remains unchanged; user explicitly requested only the tool description to be restored.
+  - **REVIEW/VERIFY (4)**: Direct literal comparison of the `chatgpt_turn_init` description against the user's quoted text returned exact_match=true (1,140 characters). `srcwalk show src/tools/mod.rs:756-762` confirms that string is the only touched Rust line.
+  - **REVIEW/VERIFY (4)**: Ephemeral Podman `rust:latest` container exited 0 for `rustup component add rustfmt`, `cargo fmt --all --check`, and `cargo test --lib -j1 init_schema_exposes_turn_reference_chain` (1/1 passed).
+  - **REVIEW/VERIFY (4)**: `srcwalk review` identifies only one non-functional string edit in `src/tools/mod.rs:759`; `git diff --check` is clean; function signatures/control flow are unchanged. No broader runtime suite needed for unchanged logic.
+  - **REVIEW/VERIFY (4)**: `podman ps -a --filter name=tmp-desc1010-` shows no retained task containers; only `src/tools/mod.rs` and this checklist differ from HEAD.
+- [x] Final integration for restored init description.
+  - **Depends on**: Description restoration.
+  - **Acceptance**: Combined worktree preserves previous fallback implementation and only reverts the requested description change; formatting, focused contract check, and diff review pass.
+  - **AUDIT (2)**: Combined repository diff from HEAD contains only one `src/tools/mod.rs` description replacement and checklist metadata; existing fallback implementation, docs, config, handlers, and tests are preserved.
+  - **AUDIT (2)**: This string metadata change does not modify Rust control flow or function signatures, so focused tool schema coverage, exact-text comparison, and formatting suffice; full runtime/E2E retesting would duplicate unaffected behavior proof.
+  - **IMPLEMENT (3)**: No further code edits required after the exact-text assertion and focused test.
+  - **IMPLEMENT (3)**: No additional configs, descriptions, or public tools changed.
+  - **IMPLEMENT (3)**: Ephemeral task container exited with `--rm`; none remained.
+  - **REVIEW/VERIFY (4)**: The final Rust description equals the user's supplied original verbatim; exact_match=true and length=1,140.
+  - **REVIEW/VERIFY (4)**: Podman `rust:latest` cargo fmt and focused `init_schema_exposes_turn_reference_chain` passed, exit code 0.
+  - **REVIEW/VERIFY (4)**: Final `srcwalk review` identifies the single unchanged-behavior `src/tools/mod.rs:759` description hunk; `git diff --check` passed.
+  - **REVIEW/VERIFY (4)**: Task-owned containers absent; persisted plan cleared after this integration checklist readback.
