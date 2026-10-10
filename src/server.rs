@@ -435,7 +435,8 @@ pub async fn run(config: Config) -> Result<()> {
             .join(".metadata")
             .join("agent.sqlite3"),
     )?;
-    let resolver = ProjectResolver::new(config.workspace_root.clone(), storage.clone())?;
+    let resolver = ProjectResolver::new(config.workspace_root.clone(), storage.clone())?
+        .with_native_project_fallback(config.allow_native_project_fallback);
     let audit = AuditLogger::new(config.logs.clone(), config.auth_token.clone()).await?;
     // Upstreams are opt-in through MCP_UPSTREAM_CONFIG. Native tools remain a
     // fixed contract; direct/gateway routes are added only after explicit

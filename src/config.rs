@@ -72,6 +72,7 @@ pub struct Config {
     pub auth_token: String,
     pub auth_mode: AuthMode,
     pub workspace_root: PathBuf,
+    pub allow_native_project_fallback: bool,
     pub limits: Limits,
     pub output: OutputLimits,
     pub logs: LogConfig,
@@ -577,6 +578,8 @@ impl ConfigBuilder {
                 search_bytes: self.usize_value("OUTPUT_SEARCH_BYTES", 512 * 1024)?,
             },
             workspace_root,
+            allow_native_project_fallback: self
+                .bool_value("CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK", false)?,
             max_sessions: self.usize_value("MAX_LEGACY_MCP_SESSIONS", 1024)?,
             session_idle: Duration::from_secs(
                 self.usize_value("MCP_SESSION_IDLE_SECS", 3600)? as u64
@@ -634,6 +637,7 @@ impl Config {
             "config_source": self.config_source,
             "bind": self.bind.to_string(),
             "workspace_root": self.workspace_root.display().to_string(),
+              "allow_native_project_fallback": self.allow_native_project_fallback,
             "log_root": self.logs.root.display().to_string(),
             "auth": self.auth_mode.as_str(),
             "init_required": true,
@@ -796,6 +800,48 @@ mod tests {
         assert_eq!(config.bind.to_string(), "127.0.0.1:3103");
         assert_eq!(config.output.file_bytes, 65536);
         assert_eq!(config.output.results, 500);
+    }
+
+    #[test]
+    fn native_project_fallback_is_disabled_by_default_and_requires_boolean_override() {
+        let environment =
+            BTreeMap::from([("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned())]);
+        let defaults = ConfigBuilder::from_map(environment.clone())
+            .build()
+            .unwrap();
+        assert!(!defaults.allow_native_project_fallback);
+        assert_eq!(
+            defaults.diagnostic_summary()["allow_native_project_fallback"],
+            false
+        );
+
+        let enabled = ConfigBuilder::from_map(environment.clone())
+            .override_value("CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK", "true")
+            .build()
+            .unwrap();
+        assert!(enabled.allow_native_project_fallback);
+
+        let env_enabled = ConfigBuilder::from_map(BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            (
+                "CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK".to_owned(),
+                "true".to_owned(),
+            ),
+        ]))
+        .override_value("CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK", "false")
+        .build()
+        .unwrap();
+        assert!(!env_enabled.allow_native_project_fallback);
+
+        let error = ConfigBuilder::from_map(environment)
+            .override_value("CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK", "yes")
+            .build()
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK")
+        );
     }
 
     #[test]

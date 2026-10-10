@@ -25,11 +25,15 @@ fn same_subject_and_conversation_have_stable_native_identity_after_reopen() {
     let request = identity("user", "conversation", None);
     let first_key = {
         let storage = Storage::open(&database).unwrap();
-        let resolver = ProjectResolver::new(workspace.clone(), storage).unwrap();
+        let resolver = ProjectResolver::new(workspace.clone(), storage)
+            .unwrap()
+            .with_native_project_fallback(true);
         resolver.resolve(&request).unwrap().native_project_key
     };
     let storage = Storage::open(&database).unwrap();
-    let resolver = ProjectResolver::new(workspace, storage).unwrap();
+    let resolver = ProjectResolver::new(workspace, storage)
+        .unwrap()
+        .with_native_project_fallback(true);
     assert_eq!(
         resolver.resolve(&request).unwrap().native_project_key,
         first_key
@@ -40,7 +44,9 @@ fn same_subject_and_conversation_have_stable_native_identity_after_reopen() {
 fn changing_subject_or_conversation_changes_native_identity() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage).unwrap();
+    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage)
+        .unwrap()
+        .with_native_project_fallback(true);
     let baseline = resolver
         .resolve(&identity("user-a", "conversation-a", None))
         .unwrap()
@@ -65,7 +71,9 @@ fn changing_subject_or_conversation_changes_native_identity() {
 fn transport_session_id_never_changes_project_identity() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage).unwrap();
+    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage)
+        .unwrap()
+        .with_native_project_fallback(true);
     let stateless = resolver
         .resolve(&identity("user", "conversation", None))
         .unwrap();
@@ -99,7 +107,9 @@ fn alias_length_boundary_is_explicit() {
 fn joining_alias_changes_only_effective_identity_not_native_identity() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage).unwrap();
+    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage)
+        .unwrap()
+        .with_native_project_fallback(true);
     let owner_request = identity("owner", "one", None);
     let joiner_request = identity("joiner", "two", None);
     let owner_native = resolver.resolve(&owner_request).unwrap().native_project_key;
@@ -122,7 +132,9 @@ fn joining_alias_changes_only_effective_identity_not_native_identity() {
 fn resolve_initialized_fails_before_commit_and_succeeds_after_commit() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage).unwrap();
+    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage)
+        .unwrap()
+        .with_native_project_fallback(true);
     let request = identity("user", "conversation", None);
     let prepared = resolver.prepare_initialize(&request, None).unwrap();
     assert_eq!(

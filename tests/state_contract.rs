@@ -223,7 +223,9 @@ fn preexisting_directory_without_alias_is_not_treated_as_existing_project_bindin
 fn unrelated_effective_projects_keep_memory_isolated() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::open(&temp.path().join("state.sqlite3")).unwrap();
-    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage.clone()).unwrap();
+    let resolver = ProjectResolver::new(temp.path().join("workspace"), storage.clone())
+        .unwrap()
+        .with_native_project_fallback(true);
     let first = resolver
         .initialize(&identity("user", "one"), None)
         .unwrap()

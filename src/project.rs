@@ -67,6 +67,7 @@ pub struct ProjectResolver {
     workspace_root: Arc<PathBuf>,
     metadata_root: Arc<PathBuf>,
     storage: Storage,
+    allow_native_project_fallback: bool,
     alias_pattern: Arc<Regex>,
     initialized_cache: Arc<DashMap<String, ProjectContext>>,
 }
@@ -89,6 +90,13 @@ fn derive_subject_key(subject: &str) -> String {
     hasher.update(b"chatgpt-subject\0");
     hasher.update(subject.as_bytes());
     encode_project_key(hasher.finalize().into())
+}
+
+fn native_project_fallback_rejected() -> AppError {
+    AppError::new(
+        "PROJECT_KEY_REQUIRED",
+        "new conversation requires project_key or a valid same-subject previous_turn_ref; automatic native project creation is disabled (CODEXBRIDGE_ALLOW_NATIVE_PROJECT_FALLBACK=false)",
+    )
 }
 
 impl ProjectResolver {
@@ -124,11 +132,17 @@ impl ProjectResolver {
             workspace_root: Arc::new(workspace_root),
             metadata_root: Arc::new(metadata_root),
             storage,
+            allow_native_project_fallback: false,
             alias_pattern: Arc::new(
                 Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$").expect("static alias regex"),
             ),
             initialized_cache: Arc::new(DashMap::new()),
         })
+    }
+
+    pub fn with_native_project_fallback(mut self, enabled: bool) -> Self {
+        self.allow_native_project_fallback = enabled;
+        self
     }
 
     pub fn storage(&self) -> &Storage {
@@ -157,10 +171,11 @@ impl ProjectResolver {
     pub fn resolve(&self, identity: &RequestIdentity) -> Result<ProjectContext> {
         let native =
             derive_native_project_key(&identity.openai_subject, &identity.openai_conversation_id);
-        let effective = self
-            .storage
-            .effective_binding(native.as_str())?
-            .unwrap_or_else(|| native.as_str().to_owned());
+        let binding = self.storage.effective_binding(native.as_str())?;
+        if binding.is_none() && !self.allow_native_project_fallback {
+            return Err(native_project_fallback_rejected());
+        }
+        let effective = binding.unwrap_or_else(|| native.as_str().to_owned());
         let project = self.context(native, ProjectKey::new(effective)?, identity)?;
         self.ensure_layout(&project)?;
         Ok(project)
@@ -281,6 +296,13 @@ impl ProjectResolver {
             self.validate_alias(alias)?;
         }
         let expected_binding = self.storage.effective_binding(native.as_str())?;
+        if !self.allow_native_project_fallback
+            && expected_binding.is_none()
+            && inherited_effective.is_none()
+            && requested_alias.is_none()
+        {
+            return Err(native_project_fallback_rejected());
+        }
         let expected_alias_binding = if let Some(alias) = requested_alias.as_deref() {
             self.storage.effective_for_alias(alias)?
         } else {
@@ -576,7 +598,9 @@ mod tests {
     fn transport_session_never_changes_chatgpt_project_identity() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
-        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage)
+            .unwrap()
+            .with_native_project_fallback(true);
         let stateless = resolver.resolve(&identity("usr", "conv", None)).unwrap();
         let legacy_a = resolver
             .resolve(&identity("usr", "conv", Some("SESSION_A")))
@@ -598,7 +622,9 @@ mod tests {
             .join("lexical")
             .join("..")
             .join("workspace");
-        let resolver = ProjectResolver::new(workspace, storage).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage)
+            .unwrap()
+            .with_native_project_fallback(true);
         let project = resolver.resolve(&identity("usr", "conv", None)).unwrap();
         assert_eq!(
             project.project_root,
@@ -614,7 +640,9 @@ mod tests {
     fn conversations_and_users_are_isolated() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
-        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage)
+            .unwrap()
+            .with_native_project_fallback(true);
         let a = resolver
             .resolve(&identity("usr_a", "conv_1", None))
             .unwrap();
@@ -668,7 +696,9 @@ mod tests {
     fn aliases_are_case_insensitive_so_windows_paths_cannot_collide() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
-        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage)
+            .unwrap()
+            .with_native_project_fallback(true);
 
         let (first, joined) = resolver
             .initialize(&identity("usr-a", "conv-a", None), Some("ReleaseProject"))
@@ -700,7 +730,9 @@ mod tests {
         let request = identity("usr", "conv", None);
         {
             let storage = Storage::open(&database).unwrap();
-            let resolver = ProjectResolver::new(workspace.clone(), storage).unwrap();
+            let resolver = ProjectResolver::new(workspace.clone(), storage)
+                .unwrap()
+                .with_native_project_fallback(true);
             assert_eq!(
                 resolver.resolve_initialized(&request).unwrap_err().code(),
                 "TURN_NOT_INITIALIZED"
@@ -719,10 +751,137 @@ mod tests {
     }
 
     #[test]
+    fn native_fallback_gate_rejects_without_creating_or_binding_a_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace.clone(), storage.clone()).unwrap();
+
+        for request in [
+            identity("usr", "fresh-stateless", None),
+            identity("usr", "fresh-legacy", Some("mcp-session")),
+        ] {
+            let key =
+                derive_native_project_key(&request.openai_subject, &request.openai_conversation_id);
+            assert_eq!(
+                resolver.resolve_initialized(&request).unwrap_err().code(),
+                "TURN_NOT_INITIALIZED"
+            );
+            assert_eq!(
+                resolver.resolve(&request).unwrap_err().code(),
+                "PROJECT_KEY_REQUIRED"
+            );
+            for error in [
+                resolver.prepare_initialize(&request, None).unwrap_err(),
+                resolver
+                    .prepare_turn_initialize(&request, None, None)
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.code(), "PROJECT_KEY_REQUIRED");
+                assert!(error.message().contains("project_key"));
+            }
+            assert!(!workspace.join(key.as_str()).exists());
+            assert!(
+                !workspace
+                    .join(".metadata/projects")
+                    .join(key.as_str())
+                    .exists()
+            );
+            assert_eq!(storage.effective_binding(key.as_str()).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn native_fallback_gate_preserves_named_init_continuation_and_valid_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let resolver = ProjectResolver::new(workspace, storage.clone()).unwrap();
+        let initial = identity("usr", "conv-a", None);
+        let named = resolver
+            .prepare_turn_initialize(&initial, Some("named-project"), None)
+            .unwrap();
+        resolver
+            .commit_initialize_with_turn_ref(&named, "r_parent", "I", "S", "brief", None)
+            .unwrap();
+        assert!(named.project.project_root.is_dir());
+
+        let continued = resolver
+            .prepare_turn_initialize(&initial, None, None)
+            .unwrap();
+        assert_eq!(
+            continued.project.effective_project_key.as_str(),
+            "named-project"
+        );
+
+        let branch = identity("usr", "conv-b", None);
+        let inherited = resolver
+            .prepare_turn_initialize(&branch, None, Some("r_parent"))
+            .unwrap();
+        assert_eq!(
+            inherited.project.effective_project_key.as_str(),
+            "named-project"
+        );
+        resolver
+            .commit_initialize_with_turn_ref(&inherited, "r_child", "I", "S", "brief", None)
+            .unwrap();
+        assert_eq!(
+            storage
+                .effective_binding(inherited.project.native_project_key.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("named-project")
+        );
+
+        let unrelated = identity("different-user", "conv-c", None);
+        assert_eq!(
+            resolver
+                .prepare_turn_initialize(&unrelated, None, Some("r_parent"))
+                .unwrap_err()
+                .code(),
+            "PROJECT_KEY_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn native_fallback_opt_in_creates_private_project_and_later_strict_init_reuses_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
+        let request = identity("usr", "conv", None);
+        let permissive = ProjectResolver::new(workspace.clone(), storage.clone())
+            .unwrap()
+            .with_native_project_fallback(true);
+        let private = permissive
+            .prepare_turn_initialize(&request, None, None)
+            .unwrap();
+        assert_eq!(
+            private.project.native_project_key,
+            private.project.effective_project_key
+        );
+        permissive
+            .commit_initialize_with_turn_ref(&private, "r_private", "I", "S", "brief", None)
+            .unwrap();
+        assert!(private.project.project_root.is_dir());
+
+        let strict = ProjectResolver::new(workspace, storage).unwrap();
+        assert_eq!(
+            strict
+                .prepare_turn_initialize(&request, None, None)
+                .unwrap()
+                .project
+                .effective_project_key,
+            private.project.effective_project_key
+        );
+    }
+
+    #[test]
     fn prepare_distinguishes_new_existing_and_joined_projects() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.sqlite3")).unwrap();
-        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage).unwrap();
+        let resolver = ProjectResolver::new(directory.path().join("workspace"), storage)
+            .unwrap()
+            .with_native_project_fallback(true);
         let first = identity("usr_a", "conv_a", None);
         let second = identity("usr_b", "conv_b", None);
 
